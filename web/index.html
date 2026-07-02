@@ -1,0 +1,3351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nym maestro</title>
+<style>
+  :root{
+    --bg:#fbfaf7; --surface:#ffffff; --surface-2:#f3f1ea; --line:#e4e1d7;
+    --text:#26251f; --muted:#76746a; --faint:#a3a097;
+    --accent:#0f6e56; --accent-soft:#e1f5ee;
+    --ok:#1d7a4d; --ok-soft:#e6f3ea; --warn:#9a6a0b; --warn-soft:#faeeda;
+    --danger:#a3322d; --danger-soft:#f8e9e7;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    --r:8px;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#1a1916; --surface:#242220; --surface-2:#2c2a26; --line:#37352f;
+      --text:#e9e6dd; --muted:#a3a097; --faint:#76746a;
+      --accent:#5dcaa5; --accent-soft:#143a30;
+      --ok:#6fce93; --ok-soft:#16331f; --warn:#e0a93a; --warn-soft:#3a2c0c;
+      --danger:#e88a82; --danger-soft:#3a1714;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5}
+  .wrap{max-width:1040px;margin:0 auto;padding:28px 24px 80px}
+  header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:22px}
+  .brand{display:inline-flex;align-items:center;gap:11px}
+  .brand-mark{flex:none}
+  .brand-name{font-size:20px;font-weight:600;letter-spacing:-0.01em;line-height:1}
+  .health{display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);background:var(--surface-2);padding:6px 11px;border-radius:var(--r)}
+  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;background:var(--faint);flex:none}
+  .dot.ok{background:var(--ok)} .dot.warn{background:var(--warn)} .dot.bad{background:var(--danger)}
+  .metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:20px}
+  .metric{background:var(--surface-2);border-radius:var(--r);padding:13px 15px;
+    border:1px solid transparent;transition:background .2s,border-color .2s}
+  .metrics.ok .metric{background:var(--accent-soft);border-color:var(--accent)}
+  .metrics.bad .metric{background:var(--danger-soft);border-color:var(--danger)}
+  .metrics.ok .metric .v{color:var(--accent)}
+  .metrics.bad .metric .v{color:var(--danger)}
+  .metric .k{font-size:13px;color:var(--muted)}
+  .metric .v{font-size:25px;font-weight:600;margin-top:1px}
+  .mapviz{background:var(--surface-2);border-radius:var(--r);border:1px solid var(--line);padding:12px 14px;margin-bottom:18px}
+  .mapviz-head{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+  .mapviz-title{font-size:13px;font-weight:600}
+  .mapviz-hint{font-size:12px;color:var(--muted)}
+  .mapviz-toggle{font-size:12px;padding:3px 9px}
+  .mapviz-body{position:relative;width:100%}
+  .mapviz.collapsed .mapviz-body{display:none}
+  .mapviz-body{display:flex;gap:10px;align-items:stretch}
+  .map-stage{position:relative;flex:1;min-width:0}
+  .map-list{width:300px;flex-shrink:0;display:flex;flex-direction:column;background:var(--surface);
+    border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  .map-list-head{padding:8px 10px;font-size:12px;font-weight:600;border-bottom:1px solid var(--line);
+    color:var(--muted);display:flex;align-items:center;justify-content:space-between;gap:6px}
+  .map-sort{display:flex;gap:4px}
+  .map-sort button{font-size:11px;padding:2px 7px;border-radius:5px;border:1px solid var(--line);
+    background:transparent;color:var(--muted);cursor:pointer}
+  .map-sort button.on{background:var(--surface-2);color:var(--text);border-color:var(--accent)}
+  .map-row .meta{min-width:0}
+  .map-list-rows{overflow-y:auto;max-height:480px}
+  .map-row{display:grid;grid-template-columns:10px 1fr auto;gap:8px;padding:7px 10px;
+    border-bottom:1px solid var(--line);align-items:start;font-size:12px}
+  .map-row:hover{background:var(--surface-2)}
+  .map-row .swatch{width:8px;height:8px;border-radius:2px;margin-top:3px}
+  .map-row .ip{font-family:var(--mono,monospace);word-break:break-all;line-height:1.35}
+  .map-row .host{color:var(--muted);font-size:11px;word-break:break-all}
+  .map-row .nums{text-align:right;white-space:nowrap;line-height:1.4}
+  .map-row .rate{font-weight:600}
+  .map-row .sub{color:var(--muted);font-size:11px}
+  .map-row .rnode{display:inline-block;background:var(--surface-2);border:1px solid var(--line);
+    border-radius:4px;padding:0 5px;font-size:10px;font-weight:600;color:var(--text);margin-right:2px}
+  .map-row.up .swatch{background:var(--accent)} .map-row.up .rate{color:var(--accent)}
+  .map-row.down .swatch{background:#d9933a} .map-row.down .rate{color:#d9933a}
+  .map-row.both .swatch{background:#a779e0} .map-row.both .rate{color:#a779e0}
+  .map-row.client .swatch{background:#5bbcd6} .map-row.client .rate{color:#5bbcd6}
+  .map-row.wg .swatch{background:#9b8cff} .map-row.wg .rate{color:#9b8cff}
+  #map-svg{width:100%;height:auto;display:block;background:var(--surface);border-radius:8px;cursor:grab;touch-action:none}
+  #map-svg:active{cursor:grabbing}
+  .map-ctl{position:absolute;top:8px;right:8px;display:flex;flex-direction:column;gap:4px;z-index:4}
+  .map-ctl button{width:28px;height:28px;padding:0;font-size:16px;line-height:1;display:flex;
+    align-items:center;justify-content:center;background:var(--surface);border:1px solid var(--line);
+    border-radius:6px;color:var(--text);cursor:pointer;box-shadow:0 1px 4px rgba(0,0,0,.2)}
+  .map-ctl button:hover{background:var(--surface-2);border-color:var(--accent)}
+  .map-land{fill:var(--surface-2);stroke:var(--line);stroke-width:0.5;vector-effect:non-scaling-stroke}
+  .map-grat{stroke:var(--line);stroke-width:0.5;fill:none;vector-effect:non-scaling-stroke;opacity:.5}
+  .map-node{cursor:pointer}
+  .map-node circle{stroke:var(--surface);stroke-width:1.5;vector-effect:non-scaling-stroke}
+  .map-node.sel circle{stroke:var(--accent);stroke-width:2.5}
+  .map-peer{fill:var(--text);stroke:transparent;stroke-width:11px;vector-effect:non-scaling-stroke;paint-order:stroke;cursor:pointer}
+  .map-peer.up{fill:var(--accent)}
+  .map-peer.down{fill:#d9933a}
+  .map-peer.both{fill:#a779e0}
+  @keyframes mapflow{to{stroke-dashoffset:-16}}
+  .map-link{stroke-width:1.4;vector-effect:non-scaling-stroke;fill:none;opacity:.75;stroke-dasharray:5 5;animation:mapflow .9s linear infinite}
+  .map-link.up{stroke:var(--accent);animation-direction:reverse}
+  .map-link.down{stroke:#d9933a}
+  .map-link.both{stroke:#a779e0;stroke-dasharray:2 5}
+  .map-filters{display:flex;gap:10px;align-items:center;font-size:12px;color:var(--muted)}
+  .map-geo{font-size:12px;padding:3px 6px;border-radius:6px;background:var(--surface);
+    color:var(--text);border:1px solid var(--line);cursor:pointer}
+  .map-filters label{display:inline-flex;align-items:center;gap:4px;cursor:pointer;user-select:none}
+  .map-filters input{accent-color:var(--accent);cursor:pointer}
+  .map-clients{cursor:pointer}
+  .map-clients circle{fill:var(--surface-2);stroke:var(--muted);stroke-width:1;vector-effect:non-scaling-stroke}
+  .map-clients text{fill:var(--text);dominant-baseline:middle;font-weight:600;pointer-events:none}
+  .map-client{fill:#5bbcd6;stroke:var(--surface);stroke-width:8px;vector-effect:non-scaling-stroke;paint-order:stroke;cursor:pointer}
+  .map-link.client{stroke:#5bbcd6;stroke-dasharray:3 6;animation-direction:reverse;opacity:.6}
+  .map-legend{position:absolute;left:8px;bottom:8px;display:flex;gap:12px;flex-wrap:wrap;
+    background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:5px 9px;
+    font-size:11px;color:var(--muted);z-index:4}
+  .map-legend span{display:inline-flex;align-items:center;gap:5px}
+  .map-legend i{width:16px;border-top:2px dashed currentColor;display:inline-block}
+  .map-legend .up{color:var(--accent)}
+  .map-legend .down{color:#d9933a}
+  .map-legend .both{color:#a779e0}
+  .map-legend .clients{color:#5bbcd6}
+  .fleet-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(232px,1fr));gap:10px;margin:10px 0}
+  .fcard{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:11px 13px;min-height:84px}
+  .fcard-k{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);font-weight:600}
+  .fcard-sub{text-transform:none;letter-spacing:0;font-weight:400;opacity:.8}
+  .fcard-v{font-size:22px;font-weight:700;margin-top:6px;font-variant-numeric:tabular-nums}
+  .fcard-split{font-size:12px;margin-top:3px;font-variant-numeric:tabular-nums;color:var(--muted)}
+  .fcard-split b{font-weight:600}
+  .fcard-split .wg{color:#9b8cff}
+  .fcard-split .mix{color:#5bbcd6}
+  .detail-cards .fcard-k .wg{color:#9b8cff}
+  .detail-cards .fcard-k .mix{color:#5bbcd6}
+  .detail-cards .dc-accent-wg{border-left:3px solid #9b8cff}
+  .dcard-rate.cli{color:#5bbcd6} .dcard-rate.pin{color:#6ee7b7} .dcard-rate.pout{color:#d9933a}
+  .dcard-sub.cli{color:#5bbcd6}
+  .fcard-foot{font-size:11px;color:var(--muted);margin-top:4px}
+  .fcard-rows{margin-top:6px;display:flex;flex-direction:column;gap:3px}
+  .fcrow{display:flex;justify-content:space-between;gap:8px;font-size:12px;font-variant-numeric:tabular-nums}
+  .fcrow .cc{font-weight:600}
+  .fcrow .v{color:var(--muted)}
+  .cc-toggle{display:flex;gap:4px}
+  .cc-toggle button{font-size:10px;padding:1px 6px;border-radius:5px;border:1px solid var(--line);
+    background:transparent;color:var(--muted);cursor:pointer;text-transform:none;letter-spacing:0;font-weight:500}
+  .cc-toggle button#cc-wg.on{background:var(--surface-2);color:var(--accent,#6ee7b7);border-color:var(--accent,#6ee7b7)}
+  .cc-toggle button#cc-mix.on{background:var(--surface-2);color:var(--info,#7dd3fc);border-color:var(--info,#7dd3fc)}
+  .detail-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:10px;margin:0 0 10px}
+  .dcard-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:8px}
+  .dcard-lbl{font-size:11px;color:var(--muted);margin-bottom:2px}
+  .dcard-rate{font-size:16px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.2}
+  .dcard-rate.sm{font-size:15px}
+  .dcard-rate.comb{color:var(--text);font-weight:800}
+  .dcard-comb{padding-left:10px;border-left:1px solid var(--line)}
+  .dcard-tot{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+  .dcard-sub{font-size:10px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin-top:10px}
+  .cc-cols{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:6px}
+  .cc-hd{font-size:10px;text-transform:uppercase;letter-spacing:.04em;font-weight:600;color:var(--muted);margin-bottom:4px}
+  .cc-hd.wg{color:#9b8cff} .cc-hd.mix{color:#5bbcd6}
+  @media(max-width:720px){.fleet-cards{grid-template-columns:1fr}}
+  .map-legend .wg{color:#9b8cff}
+  .map-wg{fill:#9b8cff;stroke:var(--surface);stroke-width:8px;vector-effect:non-scaling-stroke;paint-order:stroke;cursor:pointer}
+  .map-link.wg{stroke:#9b8cff;stroke-dasharray:3 6;animation-direction:reverse;opacity:.6}
+  .map-tip{position:absolute;pointer-events:none;display:none;background:var(--surface);border:1px solid var(--line);
+    border-radius:8px;padding:8px 24px 8px 10px;font-size:12px;line-height:1.5;box-shadow:0 4px 16px rgba(0,0,0,.25);z-index:5;max-width:240px}
+  .map-tip-x{position:absolute;top:2px;right:3px;border:none;background:transparent;color:var(--text);
+    font-size:17px;line-height:1;cursor:pointer;pointer-events:auto;padding:2px 6px;border-radius:5px;opacity:.65}
+  .map-tip-x:hover{opacity:1;background:var(--surface-2)}
+  .map-tip .mt-name{font-weight:600;font-size:13px}
+  .map-tip .mt-sub{color:var(--muted)}
+  .bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:6px}
+  .bar .spacer{flex:1}
+  .bar-wallet{margin-top:-2px;margin-bottom:6px;padding-top:10px;border-top:1px dashed var(--line)}
+  .bar-label{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--faint);font-weight:700;margin-right:2px}
+  .bar-note{font-size:12px;color:var(--warn)}
+  .actions-note{font-size:12px;color:var(--faint);margin:0 0 14px}
+  .viewopts{display:flex;align-items:center;gap:12px;font-size:12px;color:var(--muted);margin:0 0 12px;flex-wrap:wrap}
+  .viewopts label{display:inline-flex;align-items:center;gap:5px;cursor:pointer}
+  .viewopts .vo-sep{margin-left:8px}
+  .viewopts select{background:var(--surface-2);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:3px 7px;font-size:12px}
+  button{font-family:var(--sans);font-size:13px;display:inline-flex;align-items:center;gap:6px;
+    padding:7px 12px;border-radius:var(--r);border:1px solid var(--line);background:var(--surface);
+    color:var(--text);cursor:pointer}
+  button:hover{background:var(--surface-2)}
+  button:disabled{opacity:.45;cursor:default}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.primary:hover{filter:brightness(.96)}
+  button.ghost{border-color:transparent;background:transparent;color:var(--muted);padding:5px 8px}
+  button.ghost:hover{background:var(--surface-2);color:var(--text)}
+  input,textarea,select{font-family:var(--sans);font-size:14px;width:100%;padding:8px 10px;border:1px solid var(--line);
+    border-radius:var(--r);background:var(--surface);color:var(--text)}
+  input:focus,textarea:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+  .filter{position:relative;max-width:240px}
+  table{width:100%;border-collapse:collapse;background:var(--surface);border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+  th{font-size:12px;font-weight:500;color:var(--muted);text-align:left;padding:10px 12px;border-bottom:1px solid var(--line)}
+  th.sortable{cursor:pointer;user-select:none;white-space:nowrap}
+  th.sortable:hover{color:var(--text)}
+  .sort-arrow{color:var(--accent);font-size:10px}
+  td{padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:middle}
+  tr:last-child td{border-bottom:none}
+  .name{font-weight:600}
+  .sub{font-family:var(--mono);font-size:12px;color:var(--muted);margin-top:2px}
+  .mono{font-family:var(--mono);font-size:13px}
+  .pill{display:inline-flex;align-items:center;gap:4px;font-size:12px;padding:2px 8px;border-radius:var(--r);
+    background:var(--surface-2);color:var(--muted);white-space:nowrap}
+  .pill.ok{background:var(--ok-soft);color:var(--ok)}
+  .pill.warn{background:var(--warn-soft);color:var(--warn)}
+  .pill.info{background:var(--accent-soft);color:var(--accent)}
+  .pill.warn{background:var(--warn-soft);color:var(--warn);cursor:help}
+  .pill.bad{background:var(--danger-soft);color:var(--danger)}
+  .pill.muted{background:var(--surface-2);color:var(--muted)}
+  .faint{color:var(--faint)}
+  .row-actions{display:flex;gap:2px;justify-content:flex-end}
+  .empty{text-align:center;padding:48px 20px;color:var(--muted)}
+  .empty h3{color:var(--text);font-weight:600;margin:0 0 6px}
+  .overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:center;justify-content:center;padding:20px;z-index:20}
+  .overlay.open{display:flex}
+  body:has(.overlay.open){overflow:hidden}
+  .flag{font-size:15px;line-height:1}
+  .f2b-status{margin-bottom:16px}
+  .f2b-node{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid var(--line);font-size:13px}
+  .f2b-node:last-child{border-bottom:none}
+  .f2b-node .nm{font-weight:600;min-width:54px}
+  .f2b-node .mono{font-family:var(--mono)}
+  /* wallet list: single shared grid so columns align across rows */
+  .w-selall{display:flex;align-items:center;gap:8px;font-weight:600;padding:8px 2px;font-size:13px;border-bottom:1px solid var(--line)}
+  .w-selall input{width:auto}
+  .wgrid{display:grid;grid-template-columns:20px 56px minmax(150px,max-content) max-content max-content;
+         align-items:center;column-gap:12px;font-size:13px}
+  .wgrid .wc{padding:8px 0;border-bottom:1px solid var(--line);min-height:20px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  .wgrid .wc:nth-last-child(-n+5){border-bottom:none}
+  .wgrid input.wsel{width:auto;margin:0}
+  .wgrid .wname{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}
+  .wgrid .waddr{font-family:var(--mono);color:var(--muted);white-space:nowrap}
+  .f2b-ips{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 2px;padding-left:62px}
+  .f2b-ip{display:inline-flex;align-items:center;gap:6px;background:var(--surface-2);border-radius:6px;padding:2px 6px;font-family:var(--mono);font-size:12px}
+  .f2b-ip button{padding:1px 6px;font-size:11px;border-radius:5px}
+  .f2b-form .f2b-row{display:flex;gap:12px;margin-bottom:12px}
+  .f2b-form label{display:block;font-size:13px;color:var(--muted);margin-bottom:10px}
+  .f2b-form .f2b-row label{flex:1;margin-bottom:0}
+  .f2b-check{display:flex!important;align-items:center;gap:8px}
+  .f2b-check input{width:auto}
+  .f2b-warn{font-size:12px;color:var(--danger);background:var(--danger-soft);border-radius:var(--r);padding:9px 11px;margin:4px 0 0;line-height:1.45}
+  .ssh-steps{margin:0 0 14px;padding-left:20px;font-size:13px;color:var(--muted);line-height:1.6}
+  .ssh-key{background:var(--surface-2);border-radius:var(--r);padding:12px 14px;margin-bottom:14px}
+  .ssh-k{font-size:12px;color:var(--muted);margin-bottom:6px}
+  #ssh-pub{font-family:var(--mono);font-size:12px;resize:vertical}
+  #ssh-cmd{margin-top:8px;word-break:break-all}
+  .ssh-extra{display:block;font-size:13px;color:var(--muted);margin-top:12px}
+  .ssh-note{font-size:12.5px;color:var(--muted);line-height:1.5;margin-bottom:14px}
+  .ssh-note code{font-family:var(--mono);background:var(--surface-2);padding:1px 5px;border-radius:4px;font-size:12px}
+  .ssh-note pre{font-family:var(--mono);background:var(--surface-2);border-radius:8px;padding:10px 12px;margin:8px 0 0;
+    white-space:pre;overflow-x:auto;font-size:12px;color:var(--text)}
+  .ssh-results:not(:empty){margin:0 0 14px}
+  .ssh-sum{font-size:13px;font-weight:600;margin-bottom:8px}
+  .spark{display:block;cursor:pointer}
+  .spark-wrap{display:inline-flex;align-items:center;min-width:84px;cursor:pointer}
+  .spark-na{color:var(--faint);font-family:var(--mono);font-size:12px}
+  .tput-pop{position:absolute;z-index:30;background:var(--surface);border:1px solid var(--line);border-radius:10px;
+    padding:12px;box-shadow:0 10px 30px rgba(0,0,0,.28);width:380px;display:none}
+  .tput-pop.open{display:block}
+  .tput-head{display:flex;gap:9px;margin-bottom:10px}
+  .tput-stat{background:var(--surface-2);border-radius:8px;padding:7px 10px;flex:1}
+  .tput-stat .k{font-size:11px;color:var(--muted)}
+  .tput-stat .v{font-size:16px;font-weight:600;font-family:var(--mono);margin-top:1px}
+  .tput-empty{color:var(--muted);font-size:13px;padding:26px 10px;text-align:center;line-height:1.5}
+  .tput-cap{color:var(--muted);font-size:11px;margin-top:7px;line-height:1.4}
+  .tput-grid{stroke:var(--line);stroke-width:1}
+  .tput-axis{fill:var(--muted);font-family:var(--mono);font-size:10px}
+  .tput-area{fill:var(--accent-soft);stroke:none}
+  .tput-line{fill:none;stroke:var(--accent);stroke-width:1.5}
+  .tput-guide{stroke:var(--faint);stroke-dasharray:3 3}
+  .tput-dot{fill:var(--accent)}
+  .tput-tipbg{fill:var(--surface-2);stroke:var(--line)}
+  .tput-tip{fill:var(--text);font-family:var(--mono);font-size:11px}
+  .modal{background:var(--surface);border:1px solid var(--line);border-radius:12px;width:100%;max-width:460px;padding:22px 24px;max-height:calc(100vh - 40px);overflow-y:auto}
+  .modal h2{margin:0 0 16px;font-size:17px;font-weight:600}
+  .field{margin-bottom:13px}
+  .field label{display:block;font-size:13px;color:var(--muted);margin-bottom:5px}
+  .field .hint{font-size:12px;color:var(--faint);margin-top:4px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:13px}
+  .checkrow{display:flex;align-items:center;gap:8px;margin:4px 0 2px}
+  .checkrow input{width:auto}
+  .modal-actions{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;
+    position:sticky;bottom:0;background:var(--surface);margin:20px -24px 0;padding:14px 24px 0;border-top:1px solid var(--line)}
+  .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--text);color:var(--bg);
+    padding:10px 16px;border-radius:var(--r);font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:30}
+  .toast.show{opacity:1}
+  .toast.bad{background:var(--danger)}
+  .modal.wide{max-width:640px}
+  .flagrow{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+  .flagrow input{font-family:var(--mono);font-size:13px}
+  .flagrow .fname{flex:0 0 44%}
+  .flagrow .fval{flex:1}
+  .codebox{font-family:var(--mono);font-size:12px;white-space:pre-wrap;word-break:break-word;
+    background:var(--surface-2);border:1px solid var(--line);border-radius:var(--r);
+    padding:12px;max-height:340px;overflow:auto;color:var(--text)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <svg class="brand-mark" width="34" height="34" viewBox="0 0 48 48" fill="none" aria-hidden="true">
+        <g stroke="var(--accent)" stroke-width="1" opacity="0.5">
+          <line x1="24" y1="24" x2="39" y2="24"/>
+          <line x1="24" y1="24" x2="31.5" y2="11"/>
+          <line x1="24" y1="24" x2="16.5" y2="11"/>
+          <line x1="24" y1="24" x2="9" y2="24"/>
+          <line x1="24" y1="24" x2="16.5" y2="37"/>
+          <line x1="24" y1="24" x2="31.5" y2="37"/>
+        </g>
+        <g fill="var(--accent)">
+          <circle cx="39" cy="24" r="2.3"/>
+          <circle cx="31.5" cy="11" r="2.3" opacity="0.6"/>
+          <circle cx="16.5" cy="11" r="2.3"/>
+          <circle cx="9" cy="24" r="2.3" opacity="0.6"/>
+          <circle cx="16.5" cy="37" r="2.3"/>
+          <circle cx="31.5" cy="37" r="2.3" opacity="0.6"/>
+          <circle cx="24" cy="24" r="3.6"/>
+        </g>
+      </svg>
+      <span class="brand-name">nym maestro</span>
+    </div>
+    <div class="health"><span id="hdot" class="dot"></span><span id="htext">connecting…</span></div>
+  </header>
+
+  <div class="metrics">
+    <div class="metric"><div class="k">Nodes</div><div class="v" id="m-total">—</div></div>
+    <div class="metric"><div class="k">Online</div><div class="v" id="m-online">—</div></div>
+    <div class="metric"><div class="k">Offline</div><div class="v" id="m-offline">—</div></div>
+  </div>
+
+  <div class="mapviz" id="mapviz">
+    <div class="mapviz-head">
+      <span class="mapviz-title">Network map</span>
+      <select class="map-geo" id="map-node-sel" onchange="focusNode(this.value)" title="Show one node, or all">
+        <option value="">all nodes</option>
+      </select>
+      <span class="mapviz-hint" id="map-hint">hover a node for live peers · click to pin</span>
+      <span class="spacer"></span>
+      <select class="map-geo" id="map-geo" onchange="setGeoip(this.value)" title="IP location source — resolves peer/client IPs to a place on the map">
+        <option value="off">locate: off</option>
+        <option value="ipapi">locate: ip-api</option>
+        <option value="mmdb">locate: offline</option>
+      </select>
+      <span class="map-filters">
+        <label title="a remote dialed your mix port 1789 — 3rd mixnode → your exit gateway → clearnet"><input type="checkbox" id="flt-up" checked onchange="setMapFilter('up', this.checked)"> exit&nbsp;·&nbsp;1789&nbsp;in</label>
+        <label title="you dialed a remote mix port 1789 — entry gateway forwarding to the 1st mixnode"><input type="checkbox" id="flt-down" checked onchange="setMapFilter('down', this.checked)"> entry&nbsp;·&nbsp;1789&nbsp;out</label>
+        <label title="inbound to your client websocket on 9000/9001 — mixnet / VPN clients"><input type="checkbox" id="flt-clients" checked onchange="setMapFilter('clients', this.checked)"> clients&nbsp;·&nbsp;9000</label>
+        <label title="WireGuard dVPN clients on 51822"><input type="checkbox" id="flt-wg" checked onchange="setMapFilter('wg', this.checked)"> wg&nbsp;·&nbsp;51822</label>
+      </span>
+      <button class="mapviz-toggle" id="map-toggle" onclick="toggleMap()">hide</button>
+    </div>
+    <div class="mapviz-body" id="map-body">
+      <div class="map-list" id="map-list">
+        <div class="map-list-head" id="map-list-head">hover or pick a node to list its connections</div>
+        <div class="map-list-rows" id="map-list-rows"></div>
+      </div>
+      <div class="map-stage">
+        <div class="map-ctl">
+          <button onclick="zoomMap(0.7)" title="Zoom in" aria-label="Zoom in">+</button>
+          <button onclick="zoomMap(1/0.7)" title="Zoom out" aria-label="Zoom out">&minus;</button>
+          <button onclick="resetMap()" title="Reset view" aria-label="Reset view">&#10226;</button>
+        </div>
+        <div class="map-legend">
+          <span class="up"><i></i> in 1789</span>
+          <span class="down"><i></i> out 1789</span>
+          <span class="both"><i></i> both</span>
+          <span class="clients"><i></i> clients</span>
+          <span class="wg"><i></i> wg</span>
+        </div>
+        <svg id="map-svg" viewBox="0 0 1000 500" preserveAspectRatio="xMidYMid meet"></svg>
+        <div class="map-tip" id="map-tip"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="fleet-cards" id="fleet-cards">
+    <div class="fcard">
+      <div class="fcard-k">Total traffic <span class="fcard-sub">all ports</span></div>
+      <div class="fcard-v" id="fc-all">—</div>
+      <div class="fcard-foot" id="fc-all-foot">—</div>
+    </div>
+    <div class="fcard">
+      <div class="fcard-k">Total exit traffic <span class="fcard-sub" id="fc-scope">all nodes</span></div>
+      <div class="fcard-v" id="fc-traffic">—</div>
+      <div class="fcard-split" id="fc-traffic-split"></div>
+      <div class="fcard-foot" id="fc-traffic-foot">—</div>
+    </div>
+    <div class="fcard">
+      <div class="fcard-k"><span title="On-wire client activity by country, from live connections. WG ranks by dVPN clients (51822); Mixnet by mixnet clients (9000). Bytes are on-wire session bytes — for mixnet that's sphinx incl. cover, so a country here can exceed the mixnet EXIT total (different planes). Node-to-node relay (1789) is excluded." style="cursor:help">Top traffic · country</span></div>
+      <div class="cc-cols">
+        <div>
+          <div class="cc-hd wg">WG · 51822</div>
+          <div class="fcard-rows" id="fc-countries-wg"><div class="fcard-foot">no data yet</div></div>
+        </div>
+        <div>
+          <div class="cc-hd mix">Mixnet · 9000</div>
+          <div class="fcard-rows" id="fc-countries-mix"><div class="fcard-foot">no data yet</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="detail-cards" id="detail-cards">
+    <div class="fcard dc-accent-wg">
+      <div class="fcard-k"><span class="wg">WireGuard</span> <span class="fcard-sub" id="dc-wg-scope">all nodes</span> <span class="fcard-sub" style="opacity:.6">· nymwg</span></div>
+      <div class="dcard-grid">
+        <div>
+          <div class="dcard-lbl"><i class="ti ti-arrow-down-right"></i> IN · uploads</div>
+          <div class="dcard-rate" id="dc-wg-in-rate">—</div>
+          <div class="dcard-tot" id="dc-wg-in-tot">—</div>
+        </div>
+        <div>
+          <div class="dcard-lbl"><i class="ti ti-arrow-up-right"></i> OUT · downloads</div>
+          <div class="dcard-rate" id="dc-wg-out-rate">—</div>
+          <div class="dcard-tot" id="dc-wg-out-tot">—</div>
+        </div>
+        <div class="dcard-comb">
+          <div class="dcard-lbl">Σ combined</div>
+          <div class="dcard-rate comb" id="dc-wg-comb-rate">—</div>
+          <div class="dcard-tot" id="dc-wg-comb-tot">—</div>
+        </div>
+      </div>
+      <div class="fcard-foot" id="dc-wg-foot" title="nymwg is the WireGuard tunnel interface. IN = rx (decrypted packets from clients, their uploads) · OUT = tx (packets to clients, their downloads). Combined = IN + OUT. Real kernel counters — no double-count: a 1 GB download shows ~1 GB on OUT, not 2 GB.">IN = nymwg rx · OUT = nymwg tx · Σ = in + out · real counters</div>
+    </div>
+
+    <div class="fcard">
+      <div class="fcard-k">Mixnet <span class="fcard-sub" id="dc-mix-scope">all nodes</span></div>
+
+      <div class="dcard-sub cli">clients · 9000 · sphinx to/from clients</div>
+      <div class="dcard-grid">
+        <div>
+          <div class="dcard-lbl"><i class="ti ti-arrow-down-right"></i> IN · received</div>
+          <div class="dcard-rate sm cli" id="dc-cli-in-rate">—</div>
+          <div class="dcard-tot" style="opacity:.6">rate only*</div>
+        </div>
+        <div>
+          <div class="dcard-lbl"><i class="ti ti-arrow-up-right"></i> OUT · sent</div>
+          <div class="dcard-rate sm cli" id="dc-cli-out-rate">—</div>
+          <div class="dcard-tot" style="opacity:.6">rate only*</div>
+        </div>
+        <div class="dcard-comb">
+          <div class="dcard-lbl">Σ combined</div>
+          <div class="dcard-rate sm comb" id="dc-cli-comb-rate">—</div>
+          <div class="dcard-tot" style="opacity:.6">rate only*</div>
+        </div>
+      </div>
+
+      <div class="dcard-sub">relay · 1789 · sphinx to/from nodes</div>
+      <div class="dcard-grid">
+        <div>
+          <div class="dcard-lbl"><i class="ti ti-arrow-down-right"></i> IN · received</div>
+          <div class="dcard-rate sm pin" id="dc-peer-in-rate">—</div>
+          <div class="dcard-tot" style="opacity:.6">rate only*</div>
+        </div>
+        <div>
+          <div class="dcard-lbl"><i class="ti ti-arrow-up-right"></i> OUT · sent</div>
+          <div class="dcard-rate sm pout" id="dc-peer-out-rate">—</div>
+          <div class="dcard-tot" style="opacity:.6">rate only*</div>
+        </div>
+        <div class="dcard-comb">
+          <div class="dcard-lbl">Σ combined</div>
+          <div class="dcard-rate sm comb" id="dc-peer-comb-rate">—</div>
+          <div class="dcard-tot" style="opacity:.6">rate only*</div>
+        </div>
+      </div>
+
+      <div class="dcard-sub">exit · nymtun0 · to/from internet</div>
+      <div class="dcard-grid">
+        <div>
+          <div class="dcard-lbl"><i class="ti ti-arrow-down-right"></i> IN · uploads</div>
+          <div class="dcard-rate sm" id="dc-exit-in-rate">—</div>
+          <div class="dcard-tot" id="dc-exit-in-tot">—</div>
+        </div>
+        <div>
+          <div class="dcard-lbl"><i class="ti ti-arrow-up-right"></i> OUT · downloads</div>
+          <div class="dcard-rate sm" id="dc-exit-out-rate">—</div>
+          <div class="dcard-tot" id="dc-exit-out-tot">—</div>
+        </div>
+        <div class="dcard-comb">
+          <div class="dcard-lbl">Σ combined</div>
+          <div class="dcard-rate sm comb" id="dc-exit-comb-rate">—</div>
+          <div class="dcard-tot" id="dc-exit-comb-tot">—</div>
+        </div>
+      </div>
+      <div class="fcard-foot" id="dc-mix-foot" title="Colors match the map. clients · 9000 (cyan) = sphinx to/from mixnet clients; relay · 1789 (green in / orange out) = node-to-node sphinx. Both are on-wire: real live rate from ss, but no since-restart total (*), and sphinx-padded + cover-inflated. exit · nymtun0 (neutral — not a map line) = decrypted payload to/from the internet, real counters, no double-count. Σ combined = in + out.">colors match the map · Σ = in + out · *on-wire has no cumulative · exit is real counters</div>
+    </div>
+  </div>
+
+  <div class="bar">
+    <button id="btn-upgrade" onclick="openUpgrade()" disabled>Upgrade</button>
+    <button id="btn-restart" onclick="restartSelected()" disabled>Restart</button>
+    <button id="btn-toggle" onclick="openToggle()" disabled>Toggle</button>
+    <button id="btn-backup" onclick="runBackup()" disabled>Backup</button>
+    <button id="btn-fail2ban" onclick="openFail2ban()" disabled>Fail2ban</button>
+    <button id="btn-ssh" onclick="openSsh()" disabled>SSH keys</button>
+    <button id="btn-extra-blocks" onclick="openExtraBlocks()" disabled title="Install/verify NYM-EXIT abuse blocklist">Extra blocks</button>
+    <button disabled>Run…</button>
+    <button id="btn-update-agent" onclick="openAgentUpdate()" disabled title="Push the local agent to selected nodes">Update agent</button>
+    <span class="spacer"></span>
+    <div class="filter"><input id="filter" type="text" placeholder="filter nodes" autocomplete="off"></div>
+    <button class="primary" onclick="openModal('add')">Add node</button>
+    <button id="refresh-btn" onclick="refresh()" title="Poll agents now">Refresh</button>
+  </div>
+  <div class="bar bar-wallet">
+    <span class="bar-label">Wallets</span>
+    <button id="btn-w-query" onclick="openWallets('query')" title="Query balances & pending operator rewards">Query wallets</button>
+    <button id="btn-w-redeem" onclick="openWallets('redeem')" title="Withdraw (claim) pending operator rewards into the wallet balance">Withdraw rewards</button>
+    <button id="btn-w-send" onclick="openWallets('send')" title="Send NYM from a wallet">Send NYM</button>
+    <button id="btn-w-manage" onclick="openWalletManage()" title="Add, import, export or delete wallets">Manage wallets</button>
+    <span class="spacer"></span>
+    <span class="bar-note" id="w-cli-note"></span>
+  </div>
+  <p class="actions-note" id="sel-note">Select one or more nodes to act on them.</p>
+
+  <div class="viewopts">
+    <span>Interfaces:</span>
+    <label><input type="checkbox" id="dev-nymtun0" checked onchange="renderTable()"> nymtun0</label>
+    <label><input type="checkbox" id="dev-nymwg" checked onchange="renderTable()"> nymwg</label>
+  </div>
+
+  <div id="tablewrap"></div>
+</div>
+
+<div class="overlay" id="overlay">
+  <div class="modal">
+    <h2 id="modal-title">Add node</h2>
+    <div class="field">
+      <label for="f-node_id">Node id</label>
+      <input id="f-node_id" placeholder="id used at nym-node init">
+      <div class="hint" id="f-node_id-hint">The id you initialised the node with. Cannot be changed later.</div>
+    </div>
+    <div class="grid2">
+      <div class="field"><label for="f-name">Name</label><input id="f-name" placeholder="CH01"></div>
+      <div class="field"><label for="f-ip">IP address</label><input id="f-ip" placeholder="51.83.0.0"></div>
+    </div>
+    <div class="grid2">
+      <div class="field"><label for="f-hostname">Hostname</label><input id="f-hostname" placeholder="optional"></div>
+      <div class="field"><label for="f-agent_port">Agent port</label><input id="f-agent_port" type="number" value="8443"></div>
+    </div>
+    <div class="field">
+      <label for="f-notes">Notes</label>
+      <input id="f-notes" placeholder="optional">
+    </div>
+    <div class="checkrow"><input id="f-enabled" type="checkbox" checked><label for="f-enabled" style="margin:0">Enabled</label></div>
+    <div class="modal-actions">
+      <button class="ghost" id="modal-delete" style="display:none">Delete node</button>
+      <span class="spacer" style="flex:1"></span>
+      <button class="ghost" onclick="closeModal()">Cancel</button>
+      <button class="primary" id="modal-save" onclick="saveNode()">Save</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<div class="overlay" id="toggle-overlay">
+  <div class="modal">
+    <h2 id="toggle-title">Toggle</h2>
+    <p class="hint" id="toggle-sub" style="margin-top:-8px"></p>
+    <div class="field">
+      <label for="t-mode">Mode</label>
+      <select id="t-mode">
+        <option value="">leave unchanged</option>
+        <option value="exit-gateway">exit-gateway</option>
+        <option value="entry-gateway">entry-gateway</option>
+        <option value="mixnode">mixnode</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="t-wg">WireGuard</label>
+      <select id="t-wg">
+        <option value="">leave unchanged</option>
+        <option value="true">enabled (true)</option>
+        <option value="false">disabled (false)</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="t-accept">Operator terms flag</label>
+      <select id="t-accept">
+        <option value="">leave unchanged</option>
+        <option value="present">present</option>
+        <option value="absent">absent</option>
+      </select>
+      <div class="hint">--accept-operator-terms-and-conditions</div>
+    </div>
+    <div id="toggle-current" class="codebox" style="display:none;margin-top:4px"></div>
+    <div class="checkrow" style="margin-top:14px">
+      <input id="toggle-restart" type="checkbox">
+      <label for="toggle-restart" style="margin:0">Restart service after applying</label>
+    </div>
+    <p class="hint">Without a restart, changes are written to the unit file and take effect on the next restart.</p>
+    <div class="modal-actions">
+      <span class="spacer" style="flex:1"></span>
+      <button class="ghost" onclick="closeToggle()">Cancel</button>
+      <button class="primary" id="toggle-apply" onclick="applyToggle()">Apply</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="sf-overlay">
+  <div class="modal wide">
+    <h2 id="sf-title">Unit file</h2>
+    <p class="hint" id="sf-sub" style="margin-top:-8px"></p>
+    <div class="codebox" id="sf-content">loading…</div>
+    <div class="modal-actions">
+      <span class="spacer" style="flex:1"></span>
+      <button class="ghost" onclick="copySF()">Copy</button>
+      <button class="primary" onclick="closeSF()">Close</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="au-overlay">
+  <div class="modal">
+    <h2>Update agent</h2>
+    <p class="hint" id="au-sub" style="margin-top:-8px"></p>
+    <div class="checkrow" style="margin-top:6px">
+      <input id="au-restart" type="checkbox" checked>
+      <label for="au-restart" style="margin:0">Restart agent after push</label>
+    </div>
+    <p class="hint">The pushed agent is syntax-checked and the current one is backed up before it is replaced. Without a restart it takes effect on the next agent restart.</p>
+    <div class="modal-actions">
+      <span class="spacer" style="flex:1"></span>
+      <button class="ghost" onclick="closeAU()">Cancel</button>
+      <button class="primary" id="au-apply" onclick="applyAgentUpdate()">Push</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="up-overlay">
+  <div class="modal wide">
+    <h2 id="up-title">Upgrade nym-node</h2>
+    <p class="hint" id="up-sub" style="margin-top:-8px"></p>
+    <div class="field">
+      <label for="up-url">nym-node release URL</label>
+      <input id="up-url" placeholder="https://github.com/nymtech/nym/releases/download/.../nym-node">
+      <div class="hint">Downloaded to each node; verified with --version before replacing the binary named in the unit file.</div>
+    </div>
+    <div class="checkrow" style="margin-top:4px">
+      <input id="up-ntm" type="checkbox" onchange="document.getElementById('ntm-box').style.display=this.checked?'block':'none'">
+      <label for="up-ntm" style="margin:0">Re-pull and run NTM (network tunnel manager)</label>
+    </div>
+    <div id="ntm-box" style="display:none;margin-top:6px">
+      <div class="field">
+        <label for="up-ntm-url">NTM script URL</label>
+        <input id="up-ntm-url" placeholder="https://raw.githubusercontent.com/.../network_tunnel_manager.sh">
+      </div>
+      <div class="field">
+        <label for="up-ntm-args">NTM arguments</label>
+        <input id="up-ntm-args" placeholder="e.g. apply_iptables_rules">
+      </div>
+      <div class="field">
+        <label for="up-ntm-path">Install NTM to (optional)</label>
+        <input id="up-ntm-path" placeholder="/etc/nym-maestro-agent/network_tunnel_manager.sh (default)">
+        <div class="hint">Blank keeps it in the maestro directory. Set a path (e.g. /root/nym/network-tunnel-manager.sh) to overwrite your node's own copy.</div>
+      </div>
+      <p class="hint">Runs the pulled script as root with these arguments on each node. Output is captured and shown below.</p>
+    </div>
+    <div class="checkrow" style="margin-top:4px">
+      <input id="up-restart" type="checkbox">
+      <label for="up-restart" style="margin:0">Restart service after swapping the binary</label>
+    </div>
+    <p class="hint">The old binary is backed up to &lt;dir&gt;/old/ before it is replaced.</p>
+    <div class="modal-actions">
+      <span class="spacer" style="flex:1"></span>
+      <button class="ghost" onclick="closeUp()">Cancel</button>
+      <button class="primary" id="up-apply" onclick="applyUpgrade()">Upgrade</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="res-overlay">
+  <div class="modal wide">
+    <h2 id="res-title">Results</h2>
+    <div id="res-body"></div>
+    <div class="modal-actions">
+      <span class="spacer" style="flex:1"></span>
+      <button class="primary" onclick="closeRes()">Close</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="tput-overlay">
+  <div class="modal wide">
+    <h2 id="tput-title">Throughput · last 24h</h2>
+    <div id="tput-modal-body"></div>
+    <div class="modal-actions">
+      <span class="spacer" style="flex:1"></span>
+      <button class="primary" onclick="closeTput()">Close</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="ssh-overlay">
+  <div class="modal wide">
+    <h2>SSH key access</h2>
+    <ol class="ssh-steps">
+      <li>Install maestro's public key on the selected node(s).</li>
+      <li>Verify a key login actually works.</li>
+      <li>Disable password login — maestro blocks this on any node it can't verify first.</li>
+    </ol>
+    <div class="ssh-key">
+      <div class="ssh-k">maestro public key (private key stays on this Mac)</div>
+      <textarea id="ssh-pub" readonly rows="2"></textarea>
+      <div class="sub" id="ssh-cmd"></div>
+      <label class="ssh-extra">Also install another public key (optional)
+        <input id="ssh-extra" placeholder="paste an existing pubkey line, e.g. ssh-ed25519 AAAA… you@mac"></label>
+    </div>
+    <div class="ssh-note">
+      <b>The key lives at a non-default path</b>, so a plain <code>ssh hermes@host</code> will <b>ignore it and ask for a password</b>.
+      Either log in with <code>-i</code> (the connect line above), or add this once to <code>~/.ssh/config</code> so plain
+      <code>ssh &lt;host&gt;</code> uses it automatically:
+      <pre id="ssh-config-snip"></pre>
+    </div>
+    <div id="ssh-status" class="f2b-status"></div>
+    <div id="ssh-results" class="ssh-results"></div>
+    <p class="f2b-warn">Disabling password login is gated: maestro verifies a key login on each node first and
+      skips any that fail, so you can't be locked out. Keep one SSH session open as a backup the first time.</p>
+    <div class="modal-actions">
+      <button onclick="closeSsh()">Close</button>
+      <span class="spacer" style="flex:1"></span>
+      <button id="ssh-install" onclick="sshInstall()">Install key</button>
+      <button id="ssh-verify" onclick="sshVerify()">Verify login</button>
+      <button id="ssh-enable" onclick="sshHarden('on')">Re-enable password</button>
+      <button class="primary" id="ssh-disable" onclick="sshHarden('off')">Disable password</button>
+    </div>
+  </div>
+</div>
+
+<div class="tput-pop" id="tput-pop"
+     onmouseenter="tputPopHold(true)" onmouseleave="tputPopHold(false)"></div>
+
+<div class="overlay" id="f2b-overlay">
+  <div class="modal wide">
+    <h2>Fail2ban · SSH brute-force protection</h2>
+    <div id="f2b-status" class="f2b-status"></div>
+    <div class="f2b-form">
+      <div class="f2b-row">
+        <label>Max retries<input id="f2b-maxretry" type="number" value="5" min="1" max="100"></label>
+        <label>Find window<input id="f2b-findtime" value="10m"></label>
+        <label>Ban time<input id="f2b-bantime" value="1h"></label>
+      </div>
+      <label class="f2b-check"><input id="f2b-increment" type="checkbox" checked>
+        Escalating bans — double each repeat offence, up to 1 week</label>
+      <label>Whitelisted IPs (ignoreip)
+        <input id="f2b-ignoreip" placeholder="space-separated, e.g. 203.0.113.7 198.51.100.0/24"></label>
+      <p class="f2b-warn">Add your admin/management IP above or a failed SSH login can lock you out.
+        Loopback is always whitelisted. Installs fail2ban if missing (~1&nbsp;min) and manages only the sshd jail.</p>
+    </div>
+    <div class="modal-actions">
+      <span class="spacer" style="flex:1"></span>
+      <button onclick="closeF2b()">Close</button>
+      <button class="primary" id="f2b-apply" onclick="applyF2b()">Install &amp; apply</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="eb-overlay">
+  <div class="modal wide">
+    <h2>Extra blocks · NYM-EXIT abuse blocklist</h2>
+    <div id="eb-status" class="f2b-status"></div>
+    <div class="f2b-form">
+      <label>Blocklist URL
+        <input id="eb-url" placeholder="leave blank for the default list"></label>
+      <label class="f2b-check"><input id="eb-restart" type="checkbox">
+        Restart nym-node now to apply &amp; verify the on-restart re-application (brief service blip)</label>
+      <p class="f2b-warn">The blocks live in the <span class="mono">NYM-EXIT</span> chain, which nym-node rebuilds
+        on start — so a oneshot unit re-applies them after each start. <b>Install only</b> applies the list to the
+        running chain immediately (no restart) and enables the unit; tick the box to also restart nym-node and confirm
+        the full flush-and-reapply, or restart later and use <b>Verify</b>. Verification checks the REJECT rules are
+        present in the chain (the authoritative signal — a from-node ping wouldn't traverse the exit forward path).
+        IPv4 goes in <span class="mono">iptables NYM-EXIT</span>; IPv6 entries are applied to
+        <span class="mono">ip6tables NYM-EXIT</span> when the node has a v6 exit chain (set
+        <span class="mono">MAESTRO_NYM_EXIT6</span> on the agent if yours is named differently).</p>
+    </div>
+    <div class="modal-actions">
+      <button id="eb-remove" class="ghost" onclick="ebRemove()" style="margin-right:auto">Remove</button>
+      <button onclick="closeExtraBlocks()">Close</button>
+      <button id="eb-verify" onclick="ebVerify()">Verify</button>
+      <button class="primary" id="eb-install" onclick="ebInstall()">Install</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="w-overlay">
+  <div class="modal wide">
+    <h2>Wallets · balances, rewards &amp; transfers</h2>
+    <p class="sub" id="w-intro">Keys stay on this machine (<span class="mono" id="w-dir"></span>) and are decrypted only for the operation you run — nothing is sent to the nodes. Flow: <b>Query</b> operator rewards → <b>Withdraw</b> them into the wallet balance → <b>Send</b> from the balance.</p>
+    <div id="w-list" class="f2b-status"></div>
+    <div class="f2b-form">
+      <label>Wallet password
+        <input id="w-pass" type="password" autocomplete="off" placeholder="decrypts the selected wallets"></label>
+      <div id="w-send-fields" style="display:none">
+        <label>Receiver address
+          <input id="w-receiver" autocomplete="off" placeholder="n1…"></label>
+        <div class="f2b-row">
+          <label>Amount in NYM (sent from each selected wallet)
+            <input id="w-amount" type="number" min="0" step="0.000001" placeholder="e.g. 100"></label>
+          <label class="f2b-check" style="align-self:end;padding-bottom:10px"><input id="w-sendmax" type="checkbox" onchange="wToggleMax()">
+            Send max</label>
+        </div>
+        <p class="f2b-warn">Send is <b>irreversible</b>. The same amount is sent from <b>each</b> selected wallet to the receiver.
+          <b>Send max</b> sends the floor of the balance in whole NYM and keeps the sub-1-NYM remainder for the network fee.</p>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button onclick="openWalletManage()" class="ghost">Manage wallets…</button>
+      <button onclick="openRewardsFiles()" class="ghost" style="margin-right:auto" title="Browse and download the dated CoinTracking CSV for each withdrawal">Rewards CSV ⭳</button>
+      <button onclick="closeWallets()">Close</button>
+      <button id="w-btn-query" onclick="wQuery()">Query</button>
+      <button id="w-btn-redeem" onclick="wRedeem()">Withdraw rewards</button>
+      <button id="w-btn-send" class="primary" onclick="wSend()">Send…</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="wm-overlay">
+  <div class="modal">
+    <h2>Manage wallets</h2>
+    <div id="wm-list" class="f2b-status"></div>
+    <div class="f2b-form">
+      <label>Name
+        <input id="wm-name" autocomplete="off" placeholder="e.g. AT01"></label>
+      <label>Mnemonic (12/24 words)
+        <textarea id="wm-mnemonic" rows="2" autocomplete="off" placeholder="word word word …" style="width:100%;font-family:var(--mono);font-size:12px"></textarea></label>
+      <label>Password
+        <input id="wm-pass" type="password" autocomplete="off" placeholder="encrypts the mnemonic at rest"></label>
+      <p class="f2b-warn">The mnemonic is encrypted with AES-256 (openssl, PBKDF2) into
+        <span class="mono">&lt;wallet_dir&gt;/&lt;name&gt;.enc</span>. Keep this password — it can't be recovered.</p>
+    </div>
+    <div class="modal-actions">
+      <button onclick="closeWalletManage()">Close</button>
+      <button class="primary" onclick="wmAdd()">Add wallet</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let nodes = [];
+let editingId = null;
+
+async function api(path, opts){
+  const res = await fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts));
+  if(res.status === 204) return null;
+  const body = await res.json().catch(()=>({}));
+  if(!res.ok) throw new Error(body.error || ('request failed ('+res.status+')'));
+  return body;
+}
+
+function toast(msg, bad){
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.className = 'toast show' + (bad ? ' bad' : '');
+  setTimeout(()=>{ t.className = 'toast'; }, 2600);
+}
+
+async function health(){
+  const dot = document.getElementById('hdot'), txt = document.getElementById('htext');
+  try{
+    const h = await api('/api/health');
+    dot.className = 'dot ok'; txt.textContent = 'orchestrator ' + h.version;
+  }catch(e){
+    dot.className = 'dot bad'; txt.textContent = 'orchestrator unreachable';
+  }
+}
+
+async function load(){
+  try{
+    nodes = await api('/api/nodes');
+    renderMetrics(); renderTable(); renderMap();
+    if(listMode === 'all') renderAggList();
+  }catch(e){ toast(e.message, true); }
+}
+
+async function refresh(){
+  const btn = document.getElementById('refresh-btn');
+  btn.disabled = true; btn.textContent = 'Polling…';
+  try{
+    const r = await api('/api/refresh', {method:'POST'});
+    toast('Polled ' + r.polled + ' · ' + r.reachable + ' online');
+  }catch(e){ toast(e.message, true); }
+  btn.disabled = false; btn.textContent = 'Refresh';
+  await load();
+}
+
+function renderMetrics(){
+  const total = nodes.length;
+  const online = nodes.filter(n => n.status && n.status.reachable).length;
+  const offline = nodes.filter(n => n.enabled && (!n.status || !n.status.reachable)).length;
+  document.getElementById('m-total').textContent = total;
+  document.getElementById('m-online').textContent = online;
+  document.getElementById('m-offline').textContent = offline;
+  const row = document.querySelector('.metrics');
+  if(row) row.className = 'metrics' + (total === 0 ? '' : (offline === 0 ? ' ok' : ' bad'));
+}
+
+// ===== network map ========================================================
+// country centroids as [lng, lat]
+const ISO2_CENTROID = {
+  AT:[14.55,47.52], BE:[4.47,50.5], BG:[25.49,42.73], CH:[8.23,46.8], CZ:[15.47,49.82],
+  DE:[10.45,51.17], DK:[9.5,56.0], EE:[25.0,58.6], ES:[-3.75,40.46], FI:[25.75,64.0],
+  FR:[2.21,46.23], GB:[-1.5,52.5], GR:[21.82,39.07], HR:[15.2,45.1], HU:[19.5,47.16],
+  IE:[-8.24,53.41], IS:[-19.0,64.96], IT:[12.57,41.87], LT:[23.88,55.17], LU:[6.13,49.82],
+  LV:[24.6,56.88], MD:[28.37,47.41], NL:[5.29,52.13], NO:[8.47,60.47], PL:[19.13,51.92],
+  PT:[-8.22,39.4], RO:[24.97,45.94], RS:[21.0,44.02], SE:[15.0,62.0], SI:[14.99,46.15],
+  SK:[19.7,48.67], UA:[31.17,49.0], RU:[90.0,61.52], TR:[35.24,38.96], CY:[33.43,35.13],
+  GE:[43.36,42.32], KZ:[66.92,48.02], IL:[34.85,31.05], AE:[53.85,23.42], ZA:[24.0,-29.0],
+  US:[-98.5,39.0], CA:[-106.0,56.13], MX:[-102.55,23.63], BR:[-51.93,-14.24], AR:[-63.6,-38.42],
+  CL:[-71.54,-35.68], CO:[-74.3,4.57], AU:[133.78,-25.27], NZ:[174.0,-41.0], JP:[138.25,36.2],
+  KR:[127.77,35.91], CN:[104.2,35.86], HK:[114.11,22.4], TW:[121.0,23.7], SG:[103.82,1.35],
+  IN:[78.96,20.59], ID:[113.92,-0.79], VN:[108.28,14.06], TH:[100.99,15.87], MY:[101.98,4.21],
+  PH:[121.77,12.88]
+};
+
+let mapWorld = null, mapHidden = false, mapPinned = null;
+let mapVB = {x: 0, y: 0, w: 1000, h: 500};
+let mapJustDragged = false;
+let mapActiveUid = null;
+let mapFocusUid = null;
+const mapFilter = {up: true, down: true, clients: true, wg: true};
+const peerCache = {};
+const W_MAP = 1000, H_MAP = 500;
+const MAP_MINW = W_MAP / 9;   // up to ~9x zoom
+
+function lonlat(lng, lat){ return [ (lng + 180) / 360 * W_MAP, (90 - lat) / 180 * H_MAP ]; }
+function nodeCC(n){
+  // trust the operator's 2-letter naming (CH01 -> CH) when it's a known country;
+  // fall back to the announced hosting country from topology only if the name isn't one
+  const pfx = (n.name || '').slice(0, 2).toUpperCase();
+  if(ISO2_CENTROID[pfx]) return pfx;
+  return n.cc || pfx;
+}
+function hashStr(s){ let h = 2166136261; for(let i = 0; i < s.length; i++){ h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return (h >>> 0); }
+
+function decodeTopo(topo, name){
+  const tr = topo.transform, arcs = topo.arcs;
+  const dec = arcs.map(arc => { let x = 0, y = 0; return arc.map(d => { x += d[0]; y += d[1];
+    return tr ? [x * tr.scale[0] + tr.translate[0], y * tr.scale[1] + tr.translate[1]] : [x, y]; }); });
+  const ring = idxs => { const r = []; idxs.forEach((idx, k) => {
+    const a = idx < 0 ? dec[~idx].slice().reverse() : dec[idx];
+    r.push(...(k === 0 ? a : a.slice(1))); }); return r; };
+  const polys = [];
+  (topo.objects[name].geometries || []).forEach(g => {
+    if(g.type === 'Polygon') polys.push(g.arcs.map(ring));
+    else if(g.type === 'MultiPolygon') g.arcs.forEach(p => polys.push(p.map(ring)));
+  });
+  return polys;
+}
+
+async function loadWorld(){
+  try{
+    const r = await fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json');
+    if(!r.ok) throw new Error('map fetch failed');
+    mapWorld = decodeTopo(await r.json(), 'countries');
+  }catch(e){ mapWorld = null; }
+}
+
+function geoLayer(){
+  if(mapWorld){
+    let d = '';
+    for(const poly of mapWorld) for(const r of poly){
+      if(r.length < 2) continue;
+      d += 'M' + r.map(p => { const xy = lonlat(p[0], p[1]); return xy[0].toFixed(1) + ' ' + xy[1].toFixed(1); }).join('L') + 'Z';
+    }
+    return `<path class="map-land" d="${d}"/>`;
+  }
+  let g = '';
+  for(let lat = -60; lat <= 80; lat += 20){ const a = lonlat(-180, lat), b = lonlat(180, lat);
+    g += `<line class="map-grat" x1="${a[0]}" y1="${a[1].toFixed(1)}" x2="${b[0]}" y2="${b[1].toFixed(1)}"/>`; }
+  for(let lng = -150; lng <= 150; lng += 30){ const a = lonlat(lng, 85), b = lonlat(lng, -60);
+    g += `<line class="map-grat" x1="${a[0].toFixed(1)}" y1="${a[1]}" x2="${b[0].toFixed(1)}" y2="${b[1]}"/>`; }
+  return g;
+}
+
+// my-node positions, with same-country nodes spread on a small ring
+function nodePositions(){
+  const byCC = {};
+  nodes.forEach(n => { const cc = nodeCC(n); (byCC[cc] = byCC[cc] || []).push(n); });
+  const pos = {};
+  for(const cc in byCC){
+    const group = byCC[cc].slice().sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+    const c = ISO2_CENTROID[cc];
+    if(!c){ group.forEach(n => pos[n.uid] = null); continue; }
+    const base = lonlat(c[0], c[1]);
+    if(group.length === 1){ pos[group[0].uid] = base; continue; }
+    const R = 2.6;
+    group.forEach((n, i) => { const ang = (2 * Math.PI * i) / group.length - Math.PI / 2;
+      pos[n.uid] = [base[0] + R * Math.cos(ang), base[1] + R * Math.sin(ang)]; });
+  }
+  return pos;
+}
+
+function nodeMapColor(n){ return (n.status && n.status.reachable) ? 'var(--ok)' : 'var(--danger)'; }
+
+function syncNodeSelect(){
+  const sel = document.getElementById('map-node-sel'); if(!sel) return;
+  const want = ['"">all nodes'].concat(nodes.slice().sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+    .map(n => `"${n.uid}">${n.name}`)).join('|');
+  if(sel._sig !== want){
+    sel._sig = want;
+    const cur = mapFocusUid || '';
+    sel.innerHTML = '<option value="">all nodes</option>' +
+      nodes.slice().sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+        .map(n => `<option value="${n.uid}">${n.name}</option>`).join('');
+    sel.value = cur;
+  }
+}
+
+let listMode = 'all';   // 'all' (every node, node-tagged) or a node uid
+
+function applySelection(){
+  // keep table checkboxes, bulk bar and cards in sync with `selected`
+  if(typeof renderTable === 'function') renderTable();
+  if(typeof syncSelAll === 'function') syncSelAll();
+  if(typeof updateBulk === 'function') updateBulk();   // updateBulk re-renders the cards
+}
+function selectOnly(uid){ selected.clear(); selected.add(uid); applySelection(); }
+function selectAllNodes(){ selected.clear(); nodes.forEach(n => selected.add(n.uid)); applySelection(); }
+
+// map dropdown: "all nodes" == the table's select-all; a single node scopes everything to it
+function focusNode(uid){
+  mapFocusUid = uid || null;
+  if(mapFocusUid){
+    selectOnly(mapFocusUid);
+    mapPinned = mapFocusUid; listMode = mapFocusUid;
+    renderMap();
+    const pos = nodePositions()[mapFocusUid];
+    if(pos){ mapVB = {x: Math.max(0, pos[0] - 150), y: Math.max(0, pos[1] - 75), w: 300, h: 150}; panClamp(); applyVB(); }
+    hoverNode(mapFocusUid, true);
+  } else {
+    selectAllNodes();
+    mapPinned = null; listMode = 'all';
+    renderMap(); resetMap(); clearWeb();
+    renderAggList();
+  }
+}
+
+const ROW_COLORS = {up: 'var(--accent)', down: '#d9933a', both: '#a779e0', client: '#5bbcd6', wg: '#9b8cff'};
+let listSort = 'bps';   // 'bps' (throughput) or 'bytes' (traffic)
+const LIST_CAP = 250;
+
+function setListSort(mode){
+  listSort = mode;
+  refreshList();
+}
+
+function refreshList(){
+  if(listMode === 'all') renderAggList();
+  else { const n = nodes.find(x => x.uid === listMode); renderList(n, n ? peerCache[listMode] : null); }
+}
+
+function isLoopback(ip){
+  return !!ip && (ip === '127.0.0.1' || ip.startsWith('127.') || ip === '::1' || ip === '0.0.0.0');
+}
+// A node's own local client shows up as a 127.0.0.1 connection on the mixnet
+// client port — real, but it's the node talking to itself (one per node), so it's
+// noise in the fleet view and can't be geolocated. Strip loopback everywhere.
+function sanitizePeers(r){
+  if(!r) return r;
+  const f = arr => (arr || []).filter(x => !isLoopback(x.ip));
+  return Object.assign({}, r, {peers: f(r.peers), clients: f(r.clients), wg_clients: f(r.wg_clients)});
+}
+
+function listItems(data){
+  const items = [];
+  (data.peers || []).forEach(p => items.push({cat: p.dir || 'down', ip: p.ip, host: p.host, bps: p.bps, bytes: p.bytes, dur: p.dur, conns: p.conns, lat: p.lat, lon: p.lon, cc: p.cc}));
+  (data.clients || []).forEach(c => items.push({cat: 'client', ip: c.ip, host: c.host, bps: c.bps, bytes: c.bytes, dur: c.dur, conns: c.conns, lat: c.lat, lon: c.lon, cc: c.cc}));
+  (data.wg_clients || []).forEach(w => items.push({cat: 'wg', ip: w.ip, host: w.host, bps: w.bps, bytes: w.bytes, dur: w.dur, conns: w.conns, lat: w.lat, lon: w.lon, cc: w.cc}));
+  return items;
+}
+
+function catOn(it){ return it.cat === 'wg' ? mapFilter.wg : it.cat === 'client' ? mapFilter.clients : dirShown(it.cat); }
+function listSortKey(){ return listSort === 'bytes' ? 'bytes' : 'bps'; }
+function sortButtonsHtml(){
+  return `<span class="map-sort"><button data-sort="bps" class="${listSort === 'bps' ? 'on' : ''}" onclick="setListSort('bps')">rate</button>` +
+    `<button data-sort="bytes" class="${listSort === 'bytes' ? 'on' : ''}" onclick="setListSort('bytes')">traffic</button></span>`;
+}
+
+// reconcile rows in place (keyed) so background polls tick values without flicker
+function reconcileRows(shown, showNode, emptyMsg){
+  const rows = document.getElementById('map-list-rows');
+  const want = new Set();
+  shown.forEach(it => {
+    const id = 'lr|' + (showNode ? it.uid + '|' : '') + it.cat + '|' + it.ip;
+    want.add(id);
+    let el = document.getElementById(id);
+    if(!el){
+      el = document.createElement('div');
+      el.id = id;
+      el.innerHTML = `<span class="swatch"></span><span class="meta"><span class="ip"><span class="rflag"></span><span class="ipv"></span></span><div class="host"></div><div class="sub cat"></div></span>` +
+        `<span class="nums"><div class="rate"></div><div class="sub bytes"></div><div class="sub dur"></div></span>`;
+    }
+    el.className = 'map-row ' + it.cat;
+    const label = {up: 'in', down: 'out', both: 'both', client: 'client', wg: 'wg'}[it.cat] || it.cat;
+    const fl = flagFromCC(it.cc);
+    const flEl = el.querySelector('.rflag'); flEl.textContent = fl ? fl + ' ' : ''; flEl.title = it.cc || '';
+    el.querySelector('.ipv').textContent = it.ip;
+    const h = el.querySelector('.host'); h.textContent = it.host || ''; h.style.display = it.host ? '' : 'none';
+    const cat = el.querySelector('.cat');
+    cat.innerHTML = (showNode && it.node ? `<span class="rnode"></span> ` : '') + '<span class="lbl"></span>';
+    if(showNode && it.node) cat.querySelector('.rnode').textContent = it.node;
+    cat.querySelector('.lbl').textContent = label + (it.conns > 1 ? ' · ' + it.conns + ' conns' : '');
+    el.querySelector('.rate').textContent = fmtBitrate(it.bps);
+    el.querySelector('.bytes').textContent = fmtBytes(it.bytes);
+    el.querySelector('.dur').textContent = fmtDur(it.dur);
+    el.onclick = () => centerOnItem(it);
+    el.style.cursor = (it.lat != null || it.cc) ? 'pointer' : 'default';
+    rows.appendChild(el);   // re-append in sorted order (moves existing nodes, no flicker)
+  });
+  Array.from(rows.children).forEach(el => { if(!want.has(el.id)) el.remove(); });
+  if(!shown.length){ rows.innerHTML = `<div class="map-row"><span></span><span class="sub">${emptyMsg || 'no connections in the active filters'}</span><span></span></div>`; }
+}
+
+function renderList(n, data){
+  const head = document.getElementById('map-list-head');
+  const rows = document.getElementById('map-list-rows');
+  if(!head || !rows) return;
+  if(!n || !data || !data.peers){
+    head.innerHTML = '<span>hover or pick a node to list its connections</span>';
+    rows.innerHTML = '';
+    return;
+  }
+  const shown = listItems(data).filter(catOn).sort((a, b) => (b[listSortKey()] || 0) - (a[listSortKey()] || 0));
+  head.innerHTML = `<span>${n.name} · ${shown.length} connections` +
+    (data.wg_available === false ? ' <span class="sub" title="wg not available on this node">· wg n/a</span>' : '') + '</span>' + sortButtonsHtml();
+  reconcileRows(shown, false);
+}
+
+// aggregate every (selected) node's connections into one list, tagged by node
+function renderAggList(){
+  const head = document.getElementById('map-list-head');
+  const rows = document.getElementById('map-list-rows');
+  if(!head || !rows) return;
+  const set = cardNodes();
+  let items = [], reporting = 0;
+  set.forEach(n => {
+    const d = peerCache[n.uid];
+    if(!d || !d.peers) return;
+    reporting++;
+    listItems(d).forEach(it => { it.node = n.name; it.uid = n.uid; items.push(it); });
+  });
+  const filtered = items.filter(catOn).sort((a, b) => (b[listSortKey()] || 0) - (a[listSortKey()] || 0));
+  const shown = filtered.slice(0, LIST_CAP);
+  const more = filtered.length - shown.length;
+  head.innerHTML = `<span>all nodes · ${filtered.length} connections` +
+    `<span class="sub"> · ${reporting}/${set.length} reporting${more > 0 ? ' · top ' + LIST_CAP : ''}</span></span>` + sortButtonsHtml();
+  reconcileRows(shown, true, reporting ? 'no connections in the active filters' : 'gathering connections across nodes…');
+}
+
+// ---- fleet aggregate cards (selected nodes; default = all) ----------------
+function cardNodes(){ const s = selectedNodes(); return s.length ? s : nodes; }
+
+function sumDirField(nodesList, field, dev, dir){
+  let v = 0, have = false;
+  nodesList.forEach(n => {
+    const d = n.status && n.status[field];
+    if(d && d[dev] && d[dev][dir] != null){ v += d[dev][dir]; have = true; }
+  });
+  return {v, have};
+}
+
+// WireGuard + Mixnet in/out for the selected node (dropdown) or the fleet.
+// Interface counters give clean, non-doubled payload: nymwg (WG) + nymtun0 (mixnet
+// exit), rx = uploads, tx = downloads. On-wire mixnet (sphinx) is rate-only.
+function renderDetailCards(){
+  const g = id => document.getElementById(id); if(!g('dc-wg-in-rate')) return;
+  const one = mapFocusUid ? nodes.find(n => n.uid === mapFocusUid) : null;
+  const target = one ? [one] : cardNodes();
+  const scope = one ? (one.name || 'node') : 'all nodes';
+  g('dc-wg-scope').textContent = scope;
+  g('dc-mix-scope').textContent = scope;
+  const totTxt = (r) => r.have ? fmtBytesSI(r.v) + ' total' : '—';
+
+  // WireGuard — nymwg rx/tx
+  const wgInR = sumDirField(target, 'throughput_dir', 'nymwg', 'rx');
+  const wgOutR = sumDirField(target, 'throughput_dir', 'nymwg', 'tx');
+  const wgInT = sumDirField(target, 'traffic_dir', 'nymwg', 'rx');
+  const wgOutT = sumDirField(target, 'traffic_dir', 'nymwg', 'tx');
+  g('dc-wg-in-rate').textContent = wgInR.have ? fmtRate(wgInR.v) : '—';
+  g('dc-wg-out-rate').textContent = wgOutR.have ? fmtRate(wgOutR.v) : '—';
+  g('dc-wg-in-tot').textContent = wgInT.have ? totTxt(wgInT) : 'needs agent 0.9.7+';
+  g('dc-wg-out-tot').textContent = wgOutT.have ? totTxt(wgOutT) : '';
+  g('dc-wg-comb-rate').textContent = (wgInR.have || wgOutR.have) ? fmtRate(wgInR.v + wgOutR.v) : '—';
+  g('dc-wg-comb-tot').textContent = (wgInT.have || wgOutT.have) ? fmtBytesSI(wgInT.v + wgOutT.v) + ' total' : '';
+
+  // Mixnet exit — nymtun0 rx/tx
+  const exInR = sumDirField(target, 'throughput_dir', 'nymtun0', 'rx');
+  const exOutR = sumDirField(target, 'throughput_dir', 'nymtun0', 'tx');
+  const exInT = sumDirField(target, 'traffic_dir', 'nymtun0', 'rx');
+  const exOutT = sumDirField(target, 'traffic_dir', 'nymtun0', 'tx');
+  g('dc-exit-in-rate').textContent = exInR.have ? fmtRate(exInR.v) : '—';
+  g('dc-exit-out-rate').textContent = exOutR.have ? fmtRate(exOutR.v) : '—';
+  g('dc-exit-in-tot').textContent = totTxt(exInT);
+  g('dc-exit-out-tot').textContent = exOutT.have ? totTxt(exOutT) : '';
+  g('dc-exit-comb-rate').textContent = (exInR.have || exOutR.have) ? fmtRate(exInR.v + exOutR.v) : '—';
+  g('dc-exit-comb-tot').textContent = (exInT.have || exOutT.have) ? fmtBytesSI(exInT.v + exOutT.v) + ' total' : '';
+
+  // Mixnet on-wire — split: clients (9000) + peers (1789), each directional (bits/s)
+  let cliIn = 0, cliOut = 0, peerIn = 0, peerOut = 0, owHave = false;
+  target.forEach(n => {
+    const d = peerCache[n.uid]; if(!d) return;
+    if(d.onwire_clients){ cliIn += d.onwire_clients.rx_bps||0; cliOut += d.onwire_clients.tx_bps||0; owHave = true; }
+    if(d.onwire_peers){ peerIn += d.onwire_peers.rx_bps||0; peerOut += d.onwire_peers.tx_bps||0; owHave = true; }
+  });
+  g('dc-cli-in-rate').textContent = owHave ? fmtBitrate(cliIn) : '—';
+  g('dc-cli-out-rate').textContent = owHave ? fmtBitrate(cliOut) : '—';
+  g('dc-peer-in-rate').textContent = owHave ? fmtBitrate(peerIn) : '—';
+  g('dc-peer-out-rate').textContent = owHave ? fmtBitrate(peerOut) : '—';
+  g('dc-cli-comb-rate').textContent = owHave ? fmtBitrate(cliIn + cliOut) : '—';
+  g('dc-peer-comb-rate').textContent = owHave ? fmtBitrate(peerIn + peerOut) : '—';
+}
+
+function renderCards(){
+  const set = cardNodes();
+  let totalBps = 0, wgLiveBps = 0, mixLiveBps = 0, reporting = 0;
+  const byCCwg = {}, byCCmix = {};
+  const addCC = (map, it) => { if(it.cc){ const e = map[it.cc] || (map[it.cc] = {bytes: 0, bps: 0}); e.bytes += it.bytes || 0; e.bps += it.bps || 0; } };
+  set.forEach(n => {
+    const d = peerCache[n.uid];
+    if(!d || !d.peers) return;
+    reporting++;
+    // on-wire throughput by type (bits/s), matching the connection list:
+    //   node-to-node sphinx (1789): relay + cover between other Nym nodes — counts
+    //   toward mixnet throughput, but it's NOT end-user geography, so it's excluded
+    //   from the country card. Real users are WG dVPN (51822) + mixnet clients (9000).
+    (d.peers || []).forEach(it => { totalBps += it.bps||0; mixLiveBps += it.bps||0; });
+    (d.clients || []).forEach(it => { totalBps += it.bps||0; mixLiveBps += it.bps||0; addCC(byCCmix, it); });
+    (d.wg_clients || []).forEach(it => { totalBps += it.bps||0; wgLiveBps += it.bps||0; addCC(byCCwg, it); });
+  });
+  const g = id => document.getElementById(id); if(!g('fc-traffic')) return;
+
+  // TOTAL TRAFFIC (cumulative): the per-interface counters are the only
+  // since-restart source. These are EXIT payload per tunnel: nymwg = WireGuard
+  // dVPN exit, nymtun0 = mixnet exit. (Mixnet relay/cover on 1789 rides eth0 and
+  // isn't an exit tunnel, so it's not in these totals — see the throughput card.)
+  let wgBytes = 0, mixBytes = 0, haveIface = false;
+  let wgExitBps = 0, mixExitBps = 0, exitN = 0;
+  let allBytes = 0, haveAll = false;
+  let sinceMin = Infinity, sinceMax = 0, sinceN = 0;
+  let bootMin = Infinity, bootMax = 0, bootN = 0;
+  const EXITDEV = {nymtun0: 1, nymwg: 1};
+  set.forEach(n => {
+    const st = n.status; if(!st) return;
+    if(st.traffic){
+      if(st.traffic.nymwg != null){ wgBytes += st.traffic.nymwg; haveIface = true; }
+      if(st.traffic.nymtun0 != null){ mixBytes += st.traffic.nymtun0; haveIface = true; }
+      const up = st.uplink_device;   // all-ports = the physical uplink (default route)
+      if(up && st.traffic[up] != null){ allBytes += st.traffic[up]; haveAll = true; }
+    }
+    if(st.throughput){
+      let any = false;
+      if(st.throughput.nymwg != null){ wgExitBps += st.throughput.nymwg; any = true; }
+      if(st.throughput.nymtun0 != null){ mixExitBps += st.throughput.nymtun0; any = true; }
+      if(any) exitN++;
+    }
+    if(st.nym_node_since){ sinceMin = Math.min(sinceMin, st.nym_node_since); sinceMax = Math.max(sinceMax, st.nym_node_since); sinceN++; }
+    if(st.boot_since){ bootMin = Math.min(bootMin, st.boot_since); bootMax = Math.max(bootMax, st.boot_since); bootN++; }
+  });
+
+  // device-aware 24h volumes from the counter snapshots (traffic_window dev_bytes)
+  const sumDev = (devObj, exitOnly) => {
+    if(!devObj) return null; let s = 0, seen = false;
+    for(const k in devObj){ if(exitOnly === !!EXITDEV[k]){ s += devObj[k]||0; seen = true; } }
+    return seen ? s : null;
+  };
+  const dev = traf24 ? traf24.dev_bytes : null;
+  const span = (traf24 && traf24.observed_hours) ? traf24.observed_hours*3600 : 0;
+  const exit24 = sumDev(dev, true);
+  const all24 = sumDev(dev, false);
+  const oh = traf24 ? (traf24.observed_hours||0) : 0, wh = traf24 ? (traf24.window_hours||24) : 24;
+  const full = oh >= (wh - 0.5);
+  const winLbl = full ? '24h' : Math.max(1, Math.round(oh)) + 'h';
+  const winTxt = full ? '24 h' : '~' + Math.round(oh) + ' h';
+
+  // ---- TOTAL TRAFFIC (all ports) — the physical uplink counter ----
+  g('fc-all').textContent = haveAll ? fmtBytesSI(allBytes) : '—';
+  const allFoot = g('fc-all-foot'); const aparts = [];
+  if(bootN > 0 && isFinite(bootMin)){
+    const rel = fmtAgo(Date.now() - bootMin*1000);
+    const range = (bootMax - bootMin > 3600) ? ` Per node, since each node's last boot; oldest ${fmtSince(bootMin)}, newest ${fmtSince(bootMax)} — the total spans back to the oldest.` : '';
+    aparts.push({text: 'since ' + fmtSince(bootMin), title: `Uplink byte counters since last boot (${rel} ago). The uplink is the physical NIC (default route). nym-node creates nymtun0/nymwg but never touches the uplink, so restarting nym-node does NOT reset this counter — only a reboot (or manually cycling the NIC) does. It carries every port — WG, mixnet relay/cover, entry clients, exit egress — plus a little host traffic, i.e. your total bandwidth (billing-relevant). That's why its "since" is boot, unlike the exit card's since-nym-node-restart.${range}`});
+  } else if(haveAll){
+    aparts.push({text: 'since boot', title: 'Total bytes over the uplink since boot.'});
+  }
+  if(all24 != null){
+    aparts.push({text: winLbl + ' ' + fmtBytesSI(all24), title: `REAL all-ports traffic over the last ${winTxt} — uplink counter delta between snapshots (gap-immune, reset-safe). No projection.`});
+  }
+  allFoot.innerHTML = aparts.length
+    ? aparts.map(p => `<span title="${p.title.replace(/"/g,'&quot;')}" style="cursor:help;border-bottom:1px dotted var(--line)">${p.text}</span>`).join(' · ')
+    : (haveAll ? 'all ports' : 'needs agent 0.9.6+');
+
+  // ---- TOTAL EXIT TRAFFIC — nymtun0 + nymwg (decrypted payload out) ----
+  const ifaceTotal = wgBytes + mixBytes;
+  g('fc-traffic').textContent = haveIface ? fmtBytesSI(ifaceTotal) : '—';
+  const trafSplit = g('fc-traffic-split');
+  trafSplit.innerHTML = haveIface
+    ? `<span class="wg">WG</span> <b>${fmtBytesSI(wgBytes)}</b> · <span class="mix">Mixnet</span> <b>${fmtBytesSI(mixBytes)}</b>`
+    : '';
+  trafSplit.title = haveIface
+    ? 'Cumulative EXIT payload since nym-node restart, per tunnel: nymwg = WireGuard dVPN, nymtun0 = mixnet exit — data decrypted and routed OUT to the internet. Relay/cover (1789) isn\'t an exit tunnel; it\'s counted in the all-ports Total traffic card instead.'
+    : '';
+
+  const foot = g('fc-traffic-foot'); const parts = [];
+  if(sinceN > 0 && isFinite(sinceMin)){
+    const rel = fmtAgo(Date.now() - sinceMin*1000);
+    const sinceTitle = (sinceMax - sinceMin > 3600)
+      ? `Read live from each node's kernel byte counters. Per node, since that node's last nym-node restart. Oldest ${fmtSince(sinceMin)} (${rel} ago), newest ${fmtSince(sinceMax)}. The total spans back to the oldest.`
+      : `Read live from the node's kernel byte counters, accumulated since nym-node last restarted (${rel} ago). A restart resets them to zero.`;
+    parts.push({text: 'since ' + fmtSince(sinceMin), title: sinceTitle});
+  } else if(haveIface){
+    parts.push({text: 'since nym-node restart', title: 'Counters reset each time nym-node restarts. Exact restart time appears once nodes run agent 0.9.5+.'});
+  }
+  if(exit24 != null){
+    parts.push({text: winLbl + ' ' + fmtBytesSI(exit24), title: `REAL exit traffic over the last ${winTxt} — nymwg + nymtun0 counter delta between snapshots (gap-immune, reset-safe). No projection. The Ø rate on the Exit-throughput card is exactly this ÷ its covered time.`});
+  }
+  if(parts.length){
+    foot.innerHTML = parts.map(p => `<span title="${p.title.replace(/"/g,'&quot;')}" style="cursor:help;border-bottom:1px dotted var(--line)">${p.text}</span>`).join(' · ');
+  } else {
+    foot.textContent = haveIface ? 'since nym-node restart' : 'waiting for interface counters';
+  }
+  foot.title = '';
+
+  const selN = selectedNodes().length;
+  g('fc-scope').textContent = (selN && selN < nodes.length) ? selN + ' selected' : 'all nodes';
+
+  // Top traffic · country — WG and Mixnet side by side (on-wire client geography)
+  const renderCC = (byCC, elId, emptyKind) => {
+    const rows = Object.entries(byCC).sort((a, b) => b[1].bytes - a[1].bytes).slice(0, 3);
+    const el = g(elId); if(!el) return;
+    const emptyMsg = reporting ? ('no ' + emptyKind + ' located — turn on locate') : 'gathering…';
+    el.innerHTML = rows.length
+      ? rows.map(([cc, v]) => `<div class="fcrow"><span class="cc">${flagFromCC(cc)} ${cc}</span><span class="v">${fmtBytesSI(v.bytes)} · ${fmtBitrate(v.bps)}</span></div>`).join('')
+      : `<div class="fcard-foot">${emptyMsg}</div>`;
+  };
+  renderCC(byCCwg, 'fc-countries-wg', 'WireGuard clients');
+  renderCC(byCCmix, 'fc-countries-mix', 'mixnet clients');
+  renderDetailCards();
+}
+
+let cardCursor = 0;
+async function cardTick(){
+  if(document.hidden) return;
+  const set = cardNodes(); if(!set.length) return;
+  let pick = null, oldest = Infinity;
+  set.forEach(n => { const d = peerCache[n.uid]; const at = d ? d.at : 0; if(at < oldest){ oldest = at; pick = n; } });
+  if(pick && (!peerCache[pick.uid] || (Date.now() - peerCache[pick.uid].at) > 30000)){
+    try{
+      const r = await api('/api/peers', {method: 'POST', body: JSON.stringify({node_id: pick.uid})});
+      peerCache[pick.uid] = Object.assign({at: Date.now()}, sanitizePeers(r));
+    }catch(e){}
+  }
+  renderCards();
+  if(listMode === 'all') renderAggList();
+}
+setInterval(cardTick, 4000);
+
+function itemTipHtml(it){
+  const loc = placeLabel(it.cc, it.city, it.country);
+  const label = it.cat === 'wg' ? 'WireGuard dVPN client (51822) · inbound'
+    : it.cat === 'client' ? 'mixnet client (9000) · inbound'
+    : it.cat === 'up' ? 'inbound · peer → this node'
+    : it.cat === 'down' ? 'outbound · this node → peer' : 'bidirectional';
+  let html = `<div class="mt-name">${it.host || it.ip}</div>`;
+  if(it.host) html += `<div class="mt-sub">${it.ip}</div>`;
+  if(loc) html += `<div class="mt-sub">${loc}</div>`;
+  if(it.node) html += `<div class="mt-sub">via ${it.node}</div>`;
+  html += `<div style="margin-top:5px">${label}${it.conns > 1 ? ' · ' + it.conns + ' conns' : ''}</div>`;
+  html += `<div class="mt-sub" style="margin-top:3px">${fmtBitrate(it.bps)} · ${fmtBytes(it.bytes)} · ${fmtDur(it.dur)}</div>`;
+  return html;
+}
+
+function centerOnItem(it){
+  // endpoint position (exact GeoIP, else country centroid)
+  let lat = it.lat, lon = it.lon;
+  if((lat == null || lon == null) && it.cc && ISO2_CENTROID[it.cc]){ lon = ISO2_CENTROID[it.cc][0]; lat = ISO2_CENTROID[it.cc][1]; }
+  if(lat == null || lon == null) return;
+  const ex = (lon + 180) / 360 * W_MAP, ey = (90 - lat) / 180 * H_MAP;
+
+  // draw the OWNING node's web (forced) so the line + dots match this connection
+  const uid = it.uid || mapActiveUid;
+  const n = uid && nodes.find(x => x.uid === uid);
+  const np = uid && nodePositions()[uid];
+  if(n && np && peerCache[uid]){
+    mapActiveUid = uid; mapPinned = uid;
+    webSig[uid] = null;                 // force a full redraw of this node's web
+    drawWeb(n, np, peerCache[uid]);
+  }
+
+  // frame both the node and the endpoint so the animated line is visible
+  let cx = ex, cy = ey, w = Math.min(mapVB.w, 220);
+  if(np){
+    const minx = Math.min(np[0], ex), maxx = Math.max(np[0], ex);
+    const miny = Math.min(np[1], ey), maxy = Math.max(np[1], ey);
+    const padX = (maxx - minx) * 0.35 + 25, padY = (maxy - miny) * 0.35 + 25;
+    w = Math.max(maxx - minx + 2 * padX, 80);
+    if(w * (H_MAP / W_MAP) < (maxy - miny + 2 * padY)) w = (maxy - miny + 2 * padY) * (W_MAP / H_MAP);
+    cx = (minx + maxx) / 2; cy = (miny + maxy) / 2;
+  }
+  const hh = w * (H_MAP / W_MAP);
+  mapVB = {x: cx - w / 2, y: cy - hh / 2, w: w, h: hh};
+  panClamp(); applyVB(); rescaleMarkers();
+
+  // show THIS connection's details, built from the row itself (no DOM lookup)
+  tipHidden = false; tipIsItem = true;
+  showTip([ex, ey], itemTipHtml(it));
+}
+
+// ---- zoom / pan (viewBox-driven; markers counter-scaled to stay constant size)
+function mapScale(){ return mapVB.w / W_MAP; }
+
+function rescaleMarkers(){
+  const svg = document.getElementById('map-svg'); if(!svg) return;
+  const s = mapScale();
+  svg.querySelectorAll('circle[data-br]').forEach(c =>
+    c.setAttribute('r', (parseFloat(c.dataset.br) * s).toFixed(2)));
+}
+
+function applyVB(){
+  const svg = document.getElementById('map-svg'); if(!svg) return;
+  svg.setAttribute('viewBox',
+    `${mapVB.x.toFixed(2)} ${mapVB.y.toFixed(2)} ${mapVB.w.toFixed(2)} ${mapVB.h.toFixed(2)}`);
+  rescaleMarkers();
+}
+
+function panClamp(){
+  mapVB.w = Math.max(MAP_MINW, Math.min(mapVB.w, W_MAP));
+  mapVB.h = mapVB.w * (H_MAP / W_MAP);
+  mapVB.x = Math.max(0, Math.min(mapVB.x, W_MAP - mapVB.w));
+  mapVB.y = Math.max(0, Math.min(mapVB.y, H_MAP - mapVB.h));
+}
+
+// zoom around a focal point given as fractions (0..1) of the viewport
+function zoomMapAt(fx, fy, factor){
+  const px = mapVB.x + fx * mapVB.w, py = mapVB.y + fy * mapVB.h;
+  mapVB.w = Math.max(MAP_MINW, Math.min(mapVB.w * factor, W_MAP));
+  mapVB.h = mapVB.w * (H_MAP / W_MAP);
+  mapVB.x = px - fx * mapVB.w;
+  mapVB.y = py - fy * mapVB.h;
+  panClamp(); applyVB();
+}
+function zoomMap(factor){ zoomMapAt(0.5, 0.5, factor); }   // buttons zoom toward center
+function resetMap(){ mapVB = {x: 0, y: 0, w: W_MAP, h: H_MAP}; applyVB(); }
+
+function setMapFilter(key, on){
+  mapFilter[key] = on;
+  redrawActive();
+}
+
+async function loadGeoip(){
+  try{
+    const s = await api('/api/settings');
+    const sel = document.getElementById('map-geo');
+    if(sel){
+      sel.value = s.geoip || 'off';
+      if(!s.geoip_db_available){ const o = sel.querySelector('option[value="mmdb"]'); if(o) o.disabled = true; }
+    }
+  }catch(e){}
+}
+
+async function setGeoip(mode){
+  try{
+    await api('/api/settings/geoip', {method: 'POST', body: JSON.stringify({mode})});
+    for(const k in peerCache) delete peerCache[k];   // re-fetch with the new location source
+    if(mapActiveUid) hoverNode(mapActiveUid, !!mapPinned);
+    toast(mode === 'off' ? 'IP location off' : 'Locating IPs via ' + (mode === 'mmdb' ? 'offline DB' : 'ip-api'));
+  }catch(e){ toast('Could not change location mode', true); }
+}
+
+function renderMap(){
+  const svg = document.getElementById('map-svg');
+  if(!svg || mapHidden) return;
+  syncNodeSelect();
+  const pos = nodePositions();
+  const sel = new Set(selectedNodes().map(n => n.uid));
+  const visible = nodes.filter(n => pos[n.uid] && (!mapFocusUid || n.uid === mapFocusUid));
+  const structSig = JSON.stringify(visible.map(n => [n.uid, pos[n.uid][0].toFixed(1), pos[n.uid][1].toFixed(1)]));
+  // layout unchanged + already built -> update node colors/selection in place and
+  // leave the web/peers overlay untouched (no wipe, no flicker on the 15s poll)
+  if(svg._wired && svg._structSig === structSig){
+    visible.forEach(n => {
+      const g = svg.querySelector('.map-node[data-uid="' + n.uid + '"]');
+      if(g){ g.classList.toggle('sel', sel.has(n.uid)); const c = g.querySelector('circle'); if(c) c.setAttribute('fill', nodeMapColor(n)); }
+    });
+    return;
+  }
+  svg._structSig = structSig;
+  const s = mapScale();
+  let dots = '';
+  visible.forEach(n => { const p = pos[n.uid];
+    dots += `<g class="map-node${sel.has(n.uid) ? ' sel' : ''}" data-uid="${n.uid}">` +
+      `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="${(5 * s).toFixed(2)}" data-br="5" fill="${nodeMapColor(n)}"/></g>`;
+  });
+  webSig = {};   // structure rebuilt -> force web redraw on next draw
+  svg.innerHTML = geoLayer() +
+    '<g id="map-web"></g><g id="map-peers"></g>' +
+    '<g id="map-nodes">' + dots + '</g>';
+  if(!svg._wired){
+    svg._wired = true;
+    svg.addEventListener('mouseover', e => {
+      if(e.target.closest('.map-clients, .map-client, .map-wg, .map-peer, .map-node')){ tipHidden = false; tipIsItem = false; }
+      const cl = e.target.closest('.map-clients'); if(cl){ showClientsTip(cl); return; }
+      const cd = e.target.closest('.map-client, .map-wg'); if(cd){ showClientTip(cd); return; }
+      const peer = e.target.closest('.map-peer'); if(peer){ showPeerTip(peer); return; }
+      const g = e.target.closest('.map-node'); if(g) hoverNode(g.dataset.uid);
+    });
+    svg.addEventListener('mouseout', e => {
+      const peer = e.target.closest('.map-peer, .map-clients, .map-client, .map-wg'); if(peer){ if(mapPinned && !tipHidden){ const n = nodes.find(x => x.uid === mapPinned); const pp = nodePositions()[mapPinned]; if(n && pp) showTip(pp, tipFor(n, peerCache[mapPinned])); } else if(!mapPinned) hideTip(); return; }
+      const g = e.target.closest('.map-node'); if(g && !mapPinned) clearWeb();
+    });
+    svg.addEventListener('click', e => {
+      if(mapJustDragged) return;
+      const cl = e.target.closest('.map-clients'); if(cl){ showClientsTip(cl); return; }
+      const cd = e.target.closest('.map-client, .map-wg'); if(cd){ copyPeerIP(cd); return; }
+      const peer = e.target.closest('.map-peer'); if(peer){ copyPeerIP(peer); return; }
+      const g = e.target.closest('.map-node'); if(g) clickNode(g.dataset.uid);
+    });
+    svg.addEventListener('wheel', e => {
+      e.preventDefault();
+      const r = svg.getBoundingClientRect();
+      zoomMapAt((e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height,
+                e.deltaY < 0 ? 0.83 : 1 / 0.83);
+    }, {passive: false});
+    let drag = null;
+    svg.addEventListener('pointerdown', e => {
+      if(e.target.closest('.map-node, .map-peer, .map-clients, .map-client, .map-wg')) return;   // node/peer interaction wins
+      drag = {x: e.clientX, y: e.clientY, moved: false};
+      try { svg.setPointerCapture(e.pointerId); } catch(_){}
+      svg.style.cursor = 'grabbing';
+    });
+    svg.addEventListener('pointermove', e => {
+      if(!drag) return;
+      const r = svg.getBoundingClientRect();
+      mapVB.x -= (e.clientX - drag.x) / r.width * mapVB.w;
+      mapVB.y -= (e.clientY - drag.y) / r.height * mapVB.h;
+      drag.x = e.clientX; drag.y = e.clientY; drag.moved = true;
+      panClamp(); applyVB();
+    });
+    const endDrag = () => {
+      if(drag && drag.moved){ mapJustDragged = true; setTimeout(() => { mapJustDragged = false; }, 30); }
+      drag = null; svg.style.cursor = '';
+    };
+    svg.addEventListener('pointerup', endDrag);
+    svg.addEventListener('pointercancel', endDrag);
+    svg.addEventListener('pointerleave', endDrag);
+  }
+  applyVB();
+  if(mapPinned && pos[mapPinned]) hoverNode(mapPinned, true);
+}
+
+function tipFor(n, data){
+  let html = `<div class="mt-name">${n.name}</div><div class="mt-sub">${n.ip}</div>`;
+  if(data && data.peers){
+    const note = data.topology_known ? '' : ' · topology offline';
+    const lup = data.located_up || 0, ldn = data.located_down || 0;
+    html += `<div style="margin-top:5px">${data.total_peers} node peers · ${data.located} placed` +
+      `<span class="mt-sub"> (${ldn} out · ${lup} in)</span>${note}</div>`;
+    const inn = data.upstream || 0, out = data.downstream || 0, cl = data.client_count || 0;
+    const wg = data.wg_count || 0;
+    html += `<div class="mt-sub" style="margin-top:3px">` +
+      `<span style="color:var(--accent)">▾ ${inn} in</span> · ` +
+      `<span style="color:#d9933a">▴ ${out} out</span> · ` +
+      `<span style="color:#5bbcd6">${cl} clients</span>` +
+      `${wg ? ' · <span style="color:#9b8cff">' + wg + ' wg</span>' : ''}${data.fleet_peers ? ' · ' + data.fleet_peers + ' fleet' : ''}</div>`;
+    if((data.geoip === 'off' || !data.geoip) && data.located < data.total_peers){
+      html += `<div class="mt-sub" style="margin-top:3px">${data.total_peers - data.located} unplaced — turn on 'locate' (top of map) to map inbound peers</div>`;
+    }
+  } else {
+    html += `<div class="mt-sub" style="margin-top:5px">loading peers…</div>`;
+  }
+  return html;
+}
+
+function showClientsTip(elg){
+  const count = elg.dataset.count, conns = elg.dataset.conns, ports = elg.dataset.ports;
+  const located = +elg.dataset.located || 0, geo = elg.dataset.geo || 'off';
+  const data = mapActiveUid ? peerCache[mapActiveUid] : null;
+  const cls = (data && data.clients) || [];
+  const rows = cls.slice(0, 8).map(c => {
+    const flag = flagFromCC(c.cc);
+    const loc = c.cc ? ` · ${flag ? flag + ' ' : ''}${c.city ? c.city + ', ' : ''}${c.cc}` : '';
+    return `${c.ip}${c.conns > 1 ? ' ×' + c.conns : ''}${loc}`;
+  });
+  let html = `<div class="mt-name">${count} clients</div>` +
+    `<div class="mt-sub">inbound on ${ports} · ${conns} connections</div>`;
+  if(geo === 'off'){
+    html += `<div class="mt-sub" style="margin-top:5px">location off — use 'locate' (top of map) to place clients</div>`;
+  } else if(located < (+count)){
+    html += `<div class="mt-sub" style="margin-top:3px">${located}/${count} located (${geo})</div>`;
+  }
+  if(rows.length) html += `<div style="margin-top:5px;font-size:11px;line-height:1.55">${rows.join('<br>')}` +
+    `${(+count) > rows.length ? '<br>…+' + ((+count) - rows.length) + ' more' : ''}</div>`;
+  const c = elg.querySelector('circle');
+  showTip([+c.getAttribute('cx'), +c.getAttribute('cy')], html);
+}
+
+function showClientTip(elp){
+  const ip = elp.dataset.ip, cc = elp.dataset.cc, city = elp.dataset.city;
+  const country = elp.dataset.country, conns = +elp.dataset.conns || 1;
+  const isWg = elp.dataset.wg === '1';
+  const loc = placeLabel(cc, city, country);
+  let html = `<div class="mt-name">${ip}</div>`;
+  if(loc) html += `<div class="mt-sub">${loc}</div>`;
+  html += `<div style="margin-top:5px">${isWg ? 'WireGuard dVPN client (51822)' : 'mixnet client (9000)'} · inbound` +
+    `${conns > 1 ? ' · ' + conns + ' conns' : ''}</div>` +
+    `<div class="mt-sub" style="margin-top:3px">click to copy IP</div>`;
+  showTip([+elp.getAttribute('cx'), +elp.getAttribute('cy')], html);
+}
+
+let tipHidden = false, tipIsItem = false;
+function showTip(p, html){
+  const tip = document.getElementById('map-tip');
+  const svg = document.getElementById('map-svg');
+  const rect = svg.getBoundingClientRect();
+  const x = rect.width * (p[0] - mapVB.x) / mapVB.w;
+  const y = rect.height * (p[1] - mapVB.y) / mapVB.h;
+  tip.innerHTML = '<button class="map-tip-x" onclick="dismissTip()" title="close" aria-label="close">×</button>' + html;
+  tip.style.display = 'block';
+  tip.style.left = Math.min(Math.max(x + 12, 4), rect.width - 230) + 'px';
+  tip.style.top = Math.min(Math.max(y - 10, 4), rect.height - 70) + 'px';
+}
+function hideTip(){ const t = document.getElementById('map-tip'); if(t) t.style.display = 'none'; }
+function dismissTip(){ tipHidden = true; hideTip(); }
+
+async function hoverNode(uid, pinned){
+  const n = nodes.find(x => x.uid === uid); if(!n) return;
+  const pos = nodePositions(); const p = pos[uid]; if(!p) return;
+  mapActiveUid = uid;
+  showTip(p, tipFor(n));
+  let data = peerCache[uid];
+  if(!data || (Date.now() - data.at) > 20000){
+    try{
+      const r = await api('/api/peers', {method:'POST', body: JSON.stringify({node_id: uid})});
+      data = peerCache[uid] = Object.assign({at: Date.now()}, sanitizePeers(r));
+    }catch(e){ data = {peers: [], total_peers: 0, located: 0}; }
+  }
+  drawWeb(n, p, data);
+  if(listMode !== 'all') renderList(n, data);   // in all-mode the aggregate list stays
+  showTip(p, tipFor(n, data));
+}
+
+// redraw the currently-shown node's web (after a filter toggle)
+function redrawActive(){
+  refreshList();
+  if(!mapActiveUid) return;
+  const n = nodes.find(x => x.uid === mapActiveUid); if(!n) return;
+  const p = nodePositions()[mapActiveUid]; if(!p) return;
+  drawWeb(n, p, peerCache[mapActiveUid]);
+}
+
+function dirShown(dir){
+  if(dir === 'up') return mapFilter.up;
+  if(dir === 'down') return mapFilter.down;
+  return mapFilter.up || mapFilter.down;   // 'both'
+}
+
+let webSig = {};
+
+function drawWeb(n, p, data){
+  const web = document.getElementById('map-web');
+  const peerG = document.getElementById('map-peers');
+  if(!web || !peerG) return;
+  // signature of what would be drawn — if identical to last time, skip the DOM
+  // write so the line animation keeps running and nothing flickers on a poll
+  const sig = JSON.stringify([mapFilter,
+    ((data && data.peers) || []).filter(x => x.cc || x.lat != null).map(x => x.dir + x.ip + (x.lat != null ? x.lat + ',' + x.lon : x.cc)),
+    ((data && data.clients) || []).filter(x => x.lat != null).map(x => x.ip),
+    ((data && data.wg_clients) || []).filter(x => x.lat != null).map(x => x.ip),
+    (data && data.client_count) || 0]);
+  if(webSig[n.uid] === sig && document.getElementById('map-web').childNodes.length) return;
+  webSig[n.uid] = sig;
+  const s = mapScale();
+  const peers = (data && data.peers) || [];
+  let links = '', dots = '';
+  peers.forEach(pe => {
+    let dir = pe.dir || 'down';
+    if(!dirShown(dir)) return;
+    // if a 'both' peer has only one direction enabled, render it as that direction
+    if(dir === 'both' && !(mapFilter.up && mapFilter.down)) dir = mapFilter.up ? 'up' : 'down';
+    let x, y;
+    if(pe.lat != null && pe.lon != null){          // GeoIP gave exact coordinates
+      x = (pe.lon + 180) / 360 * W_MAP; y = (90 - pe.lat) / 180 * H_MAP;
+    } else {
+      const cc = pe.cc; if(!cc || !ISO2_CENTROID[cc]) return;   // country centroid + jitter
+      const c = ISO2_CENTROID[cc]; const base = lonlat(c[0], c[1]);
+      const h = hashStr(pe.ip);
+      const ang = (h % 360) * Math.PI / 180, rad = 4 + (h % 13);
+      x = base[0] + rad * Math.cos(ang); y = base[1] + rad * Math.sin(ang);
+    }
+    links += `<line class="map-link ${dir}" x1="${p[0].toFixed(1)}" y1="${p[1].toFixed(1)}" x2="${x.toFixed(1)}" y2="${y.toFixed(1)}"/>`;
+    const host = (pe.host || '').replace(/"/g, '&quot;');
+    dots += `<circle class="map-peer ${dir}" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${(2.4 * s).toFixed(2)}" data-br="2.4"` +
+      ` data-ip="${pe.ip}" data-host="${host}" data-cc="${pe.cc || ''}" data-dir="${pe.dir || 'down'}" data-conns="${pe.conns || 1}"/>`;
+  });
+  // clients (9000/9001). Geolocated via GeoIP when enabled -> draw as dots with
+  // inbound lines; otherwise just a count badge on the node.
+  const clist = (data && data.clients) || [];
+  const ccount = data && data.client_count || 0;
+  if(mapFilter.clients && ccount > 0){
+    let drawn = 0;
+    clist.forEach(cl => {
+      if(cl.lat == null || cl.lon == null) return;
+      const x = (cl.lon + 180) / 360 * W_MAP, y = (90 - cl.lat) / 180 * H_MAP;
+      links += `<line class="map-link client" x1="${p[0].toFixed(1)}" y1="${p[1].toFixed(1)}" x2="${x.toFixed(1)}" y2="${y.toFixed(1)}"/>`;
+      const city = (cl.city || '').replace(/"/g, '&quot;');
+      dots += `<circle class="map-client" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${(2.2 * s).toFixed(2)}" data-br="2.2"` +
+        ` data-ip="${cl.ip}" data-cc="${cl.cc || ''}" data-city="${city}" data-country="${(cl.country || '').replace(/"/g, '&quot;')}" data-conns="${cl.conns || 1}"/>`;
+      drawn++;
+    });
+    // count badge on the node (shows total clients incl. any not geolocated)
+    const bx = p[0] + 9 * s, by = p[1] - 9 * s, rr = (7 * s).toFixed(2);
+    dots += `<g class="map-clients" data-count="${ccount}" data-conns="${data.client_conns || 0}" data-located="${drawn}" data-geo="${data.client_geo || 'off'}" data-ports="${(data.client_ports || ['9000']).join('/')}">` +
+      `<circle cx="${bx.toFixed(1)}" cy="${by.toFixed(1)}" r="${rr}" data-br="7"/>` +
+      `<text x="${bx.toFixed(1)}" y="${(by + 2.6 * s).toFixed(1)}" font-size="${(7 * s).toFixed(2)}" text-anchor="middle">${ccount > 99 ? '99+' : ccount}</text></g>`;
+  }
+  // WireGuard dVPN clients (51822)
+  const wlist = (data && data.wg_clients) || [];
+  if(mapFilter.wg && wlist.length){
+    wlist.forEach(w => {
+      if(w.lat == null || w.lon == null) return;
+      const x = (w.lon + 180) / 360 * W_MAP, y = (90 - w.lat) / 180 * H_MAP;
+      links += `<line class="map-link wg" x1="${p[0].toFixed(1)}" y1="${p[1].toFixed(1)}" x2="${x.toFixed(1)}" y2="${y.toFixed(1)}"/>`;
+      dots += `<circle class="map-wg" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${(2.2 * s).toFixed(2)}" data-br="2.2"` +
+        ` data-ip="${w.ip}" data-cc="${w.cc || ''}" data-city="${(w.city || '').replace(/"/g, '&quot;')}" data-country="${(w.country || '').replace(/"/g, '&quot;')}" data-conns="${w.conns || 1}" data-wg="1"/>`;
+    });
+  }
+  web.innerHTML = links; peerG.innerHTML = dots;
+}
+
+function showPeerTip(elp){
+  const ip = elp.dataset.ip, host = elp.dataset.host, cc = elp.dataset.cc;
+  const dir = elp.dataset.dir, conns = +elp.dataset.conns || 1;
+  const dirTxt = dir === 'up' ? 'inbound · peer → this node'
+    : dir === 'down' ? 'outbound · this node → peer'
+    : 'bidirectional';
+  let html = `<div class="mt-name">${host || ip}</div>`;
+  if(host) html += `<div class="mt-sub">${ip}</div>`;
+  html += `<div style="margin-top:5px">${placeLabel(cc) || cc} · port 1789 · ${dirTxt}` +
+    `${conns > 1 ? ' · ' + conns + ' conns' : ''}</div>` +
+    `<div class="mt-sub" style="margin-top:3px">click to copy IP</div>`;
+  showTip([+elp.getAttribute('cx'), +elp.getAttribute('cy')], html);
+}
+
+function copyPeerIP(elp){
+  const ip = elp.dataset.ip;
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(ip).then(() => toast('Copied ' + ip)).catch(() => toast('Copy failed', true));
+  } else { toast(ip); }
+}
+
+function clearWeb(){
+  const web = document.getElementById('map-web'), peerG = document.getElementById('map-peers');
+  if(web) web.innerHTML = ''; if(peerG) peerG.innerHTML = '';
+  hideTip();
+}
+
+function clickNode(uid){
+  // clicking a node pins its web for inspection — it does NOT change the bulk
+  // selection (that's the dropdown / table checkboxes), so the cards stay put
+  if(mapPinned === uid){
+    mapPinned = null;
+    if(listMode === 'all'){ clearWeb(); renderMap(); renderAggList(); }
+    else hideTip();
+    return;
+  }
+  mapPinned = uid;
+  renderMap();
+  hoverNode(uid, true);
+}
+
+function toggleMap(){
+  mapHidden = !mapHidden;
+  document.getElementById('mapviz').classList.toggle('collapsed', mapHidden);
+  document.getElementById('map-toggle').textContent = mapHidden ? 'show' : 'hide';
+  if(!mapHidden) renderMap();
+}
+
+function el(tag, cls, text){
+  const e = document.createElement(tag);
+  if(cls) e.className = cls;
+  if(text != null) e.textContent = text;
+  return e;
+}
+
+function rolesCell(s){
+  const wrap = el('td');
+  if(!s){ wrap.append(dash()); return wrap; }
+  const roles = [];
+  if(s.exit) roles.push('exit');
+  if(s.entry) roles.push('entry');
+  if(s.mixnode) roles.push('mix');
+  if(roles.length === 0 && s.mode) roles.push(s.mode);
+  if(roles.length === 0){ wrap.append(dash()); return wrap; }
+  roles.forEach(r => { const p = el('span','pill',r); p.style.marginRight='4px'; wrap.append(p); });
+  return wrap;
+}
+
+function dash(){ return el('span','faint','—'); }
+
+function statePill(val, onText, offText){
+  if(val == null) return dash();
+  return val ? el('span','pill info', onText) : el('span','pill', offText);
+}
+
+let sortKey = 'name';
+let sortDir = 'asc';
+
+// ISO-2 country code → flag emoji (regional indicator letters)
+function flagFromCC(cc){
+  cc = (cc || '').toUpperCase();
+  if(!/^[A-Z]{2}$/.test(cc)) return '';
+  return String.fromCodePoint(...[...cc].map(ch => 0x1F1E6 + ch.charCodeAt(0) - 65));
+}
+// node names are prefixed with an ISO country code (AT01, DE02, …) → flag
+function countryFlag(name){
+  const m = (name || '').match(/^([A-Za-z]{2})/);
+  return m ? flagFromCC(m[1]) : '';
+}
+// "<flag> City, Country" (falls back to the bare code if that's all we have)
+function placeLabel(cc, city, country){
+  const flag = flagFromCC(cc);
+  const place = [city, country].filter(Boolean).join(', ') || (cc || '').toUpperCase();
+  if(!flag && !place) return '';
+  return (flag ? flag + ' ' : '') + place;
+}
+
+function fmtBytes(b){
+  if(b == null) return '—';
+  const u = ['B','KiB','MiB','GiB','TiB','PiB']; let i = 0, v = b;
+  while(v >= 1024 && i < u.length - 1){ v /= 1024; i++; }
+  return (i === 0 ? v : v.toFixed(v >= 100 ? 0 : 1)) + ' ' + u[i];
+}
+
+// decimal / SI byte formatter (TB, not TiB) for the fleet cards
+function fmtBytesSI(b){
+  if(b == null) return '—';
+  const u = ['B','kB','MB','GB','TB','PB']; let i = 0, v = b;
+  while(v >= 1000 && i < u.length - 1){ v /= 1000; i++; }
+  return (i === 0 ? v : v.toFixed(v >= 100 ? 0 : 2)) + ' ' + u[i];
+}
+
+// absolute local time for a "since" epoch (seconds); e.g. "1 Jul 09:15"
+function fmtSince(epoch){
+  const d = new Date(epoch * 1000);
+  return d.toLocaleDateString(undefined, {day:'numeric', month:'short'}) + ' ' +
+         d.toLocaleTimeString(undefined, {hour:'2-digit', minute:'2-digit'});
+}
+function fmtAgo(ms){
+  const s = Math.max(0, Math.floor(ms/1000));
+  if(s < 3600) return Math.floor(s/60) + 'm';
+  if(s < 86400) return Math.floor(s/3600) + 'h';
+  const d = Math.floor(s/86400), h = Math.floor((s%86400)/3600);
+  return d + 'd' + (h ? ' ' + h + 'h' : '');
+}
+
+function fmtBitrate(bps){
+  if(bps == null) return '—';
+  if(bps < 1000) return Math.round(bps) + ' bit/s';
+  const u = ['kbit/s','Mbit/s','Gbit/s']; let i = -1, v = bps;
+  while(v >= 1000 && i < u.length - 1){ v /= 1000; i++; }
+  return (v >= 100 ? Math.round(v) : v.toFixed(1)) + ' ' + u[i];
+}
+
+function fmtDur(sec){
+  if(sec == null) return '—';
+  sec = Math.max(0, Math.round(sec));
+  if(sec < 60) return sec + 's';
+  if(sec < 3600) return Math.floor(sec / 60) + 'm ' + (sec % 60) + 's';
+  if(sec < 86400) return Math.floor(sec / 3600) + 'h ' + Math.floor((sec % 3600) / 60) + 'm';
+  return Math.floor(sec / 86400) + 'd ' + Math.floor((sec % 86400) / 3600) + 'h';
+}
+
+function verTuple(v){
+  return String(v || '').split('.').map(x => parseInt(x, 10) || 0);
+}
+
+// which interfaces are checked (applies to both Traffic and Bandwidth)
+function devList(){
+  const ds = [];
+  const t = document.getElementById('dev-nymtun0'), w = document.getElementById('dev-nymwg');
+  if(!t || t.checked) ds.push('nymtun0');   // default checked before controls exist
+  if(!w || w.checked) ds.push('nymwg');
+  return ds;
+}
+
+// sum a {device: value} map over the selected interfaces; null if nothing applies
+function sumDevices(map){
+  if(!map) return null;
+  let s = 0, any = false;
+  devList().forEach(d => { if(map[d] != null){ s += map[d]; any = true; } });
+  return any ? s : null;
+}
+
+function bwUnit(){
+  return 'Mbit/s';
+}
+
+// bytes/sec -> bits-based rate string (network convention), SI (/1000)
+function fmtRate(bytesPerSec, unit){
+  if(bytesPerSec == null) return '—';
+  const bits = bytesPerSec * 8;
+  if(unit === 'Mbit/s') return (bits / 1e6).toFixed(2) + ' Mbit/s';
+  if(unit === 'Gbit/s') return (bits / 1e9).toFixed(3) + ' Gbit/s';
+  const u = ['bit/s','Kbit/s','Mbit/s','Gbit/s']; let i = 0, v = bits;
+  while(v >= 1000 && i < u.length - 1){ v /= 1000; i++; }
+  return (i >= 2 ? v.toFixed(2) : Math.round(v)) + ' ' + u[i];
+}
+
+// traffic over the selected interfaces; fall back to the summed counter only
+// when both interfaces are selected (that legacy number is the all-device sum)
+function trafficVal(s){
+  if(!s) return null;
+  const v = sumDevices(s.traffic);
+  if(v != null) return v;
+  return (devList().length === 2 && s.traffic_bytes != null) ? s.traffic_bytes : null;
+}
+
+function sortKeyVal(n, key){
+  const s = n.status || {};
+  switch(key){
+    case 'name':      return (n.name || '').toLowerCase();
+    case 'version':   return s.version || '';
+    case 'roles':     return s.mode || '';
+    case 'wg':        return s.wireguard === true ? 1 : (s.wireguard === false ? 0 : -1);
+    case 'service':   return s.service_active === true ? 1 : (s.service_active === false ? 0 : -1);
+    case 'bans':      return s.fail2ban_banned == null ? -1 : s.fail2ban_banned;
+    case 'eblocks':   { const e = s.extra_blocks; return !e || !e.installed ? 0 : (e.active ? 2 : 1); }
+    case 'traffic':   { const v = trafficVal(s); return v == null ? -1 : v; }
+    case 'throughput': { const v = sumDevices(s.throughput); return v == null ? -1 : v; }
+    default:          return '';
+  }
+}
+
+function sortNodes(list){
+  const dir = sortDir === 'desc' ? -1 : 1;
+  return list.slice().sort((a, b) => {
+    let r;
+    if(sortKey === 'version'){
+      const ta = verTuple((a.status||{}).version), tb = verTuple((b.status||{}).version);
+      r = 0;
+      for(let i = 0; i < Math.max(ta.length, tb.length); i++){ r = (ta[i]||0) - (tb[i]||0); if(r) break; }
+    } else {
+      const va = sortKeyVal(a, sortKey), vb = sortKeyVal(b, sortKey);
+      r = (typeof va === 'number' && typeof vb === 'number') ? va - vb : String(va).localeCompare(String(vb));
+    }
+    if(r === 0) r = (a.name||'').localeCompare(b.name||'');  // stable tiebreak
+    return r * dir;
+  });
+}
+
+function setSort(key){
+  if(sortKey === key) sortDir = (sortDir === 'asc' ? 'desc' : 'asc');
+  else { sortKey = key; sortDir = (key === 'name' || key === 'roles') ? 'asc' : 'desc'; }
+  renderTable();
+}
+
+function sortHeader(label, key){
+  const th = el('th', 'sortable');
+  th.append(document.createTextNode(label));
+  if(sortKey === key){
+    const a = el('span', 'sort-arrow', sortDir === 'asc' ? ' ▲' : ' ▼');
+    th.append(a);
+  }
+  th.onclick = () => setSort(key);
+  return th;
+}
+
+function renderTable(){
+  const wrap = document.getElementById('tablewrap');
+  wrap.innerHTML = '';
+  const q = (document.getElementById('filter').value || '').toLowerCase();
+  const shown = sortNodes(nodes.filter(n =>
+    !q || [n.name, n.ip, n.hostname, n.node_id].some(v => (v||'').toLowerCase().includes(q))));
+
+  if(nodes.length === 0){
+    const e = el('div','empty');
+    e.append(el('h3', null, 'No nodes yet'));
+    e.append(el('p', null, 'Add your first node to start building the fleet.'));
+    const b = el('button','primary','Add node'); b.onclick = ()=>openModal('add');
+    b.style.marginTop = '12px'; e.append(b);
+    wrap.append(e); return;
+  }
+
+  const table = el('table');
+  const thead = el('thead'); const htr = el('tr');
+  const selTh = el('th');
+  const selAll = document.createElement('input');
+  selAll.type = 'checkbox'; selAll.id = 'sel-all';
+  selAll.checked = shown.length > 0 && shown.every(n => selected.has(n.uid));
+  selAll.onchange = () => {
+    shown.forEach(n => selAll.checked ? selected.add(n.uid) : selected.delete(n.uid));
+    mapFocusUid = null; listMode = 'all';
+    const ns = document.getElementById('map-node-sel'); if(ns) ns.value = '';
+    renderTable(); updateBulk();
+    if(typeof renderAggList === 'function') renderAggList();
+  };
+  selTh.append(selAll); htr.append(selTh);
+  htr.append(sortHeader('Node', 'name'));
+  htr.append(sortHeader('Version', 'version'));
+  htr.append(sortHeader('Roles', 'roles'));
+  htr.append(sortHeader('WG', 'wg'));
+  htr.append(sortHeader('Service', 'service'));
+  htr.append(sortHeader('Jailed IPs', 'bans'));
+  htr.append(sortHeader('Extra blocks', 'eblocks'));
+  htr.append(sortHeader('Traffic', 'traffic'));
+  htr.append(sortHeader('Throughput', 'throughput'));
+  htr.append(el('th', null, '24h'));
+  htr.append(el('th', null, ''));
+  thead.append(htr); table.append(thead);
+
+  const tbody = el('tbody');
+  shown.forEach(n => {
+    const s = n.status;
+    const tr = el('tr');
+
+    const cbTd = el('td');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = selected.has(n.uid);
+    cb.onchange = () => {
+      cb.checked ? selected.add(n.uid) : selected.delete(n.uid);
+      mapFocusUid = null; listMode = 'all';
+      const ns = document.getElementById('map-node-sel'); if(ns) ns.value = '';
+      updateBulk(); syncSelAll();
+      if(typeof renderAggList === 'function') renderAggList();
+    };
+    cbTd.append(cb); tr.append(cbTd);
+
+    const nameTd = el('td');
+    const nameWrap = el('div',null);
+    const nrow = el('div'); nrow.style.display='flex'; nrow.style.alignItems='center'; nrow.style.gap='7px';
+    const d = el('span','dot');
+    if(s && s.reachable) d.className = 'dot ok';
+    else if(n.enabled) d.className = 'dot bad';
+    const flag = countryFlag(n.name);
+    const nameSpan = el('span', 'name', n.name);
+    if(flag){
+      const fe = el('span', 'flag', flag);
+      fe.title = n.name.slice(0, 2).toUpperCase();
+      nrow.append(d, fe, nameSpan);
+    } else {
+      nrow.append(d, nameSpan);
+    }
+    if(s && s.agent_stale){
+      const sp = el('span', 'pill warn', 'agent stale');
+      sp.title = 'Agent ' + (s.agent_version || '?') + ' is older than the orchestrator (' +
+        (s.local_agent_version || '?') + '). Select this node and click Update agent.';
+      nrow.append(sp);
+    }
+    nameWrap.append(nrow);
+    const sub = [n.ip, n.hostname].filter(Boolean).join(' · ');
+    nameWrap.append(el('div','sub', sub || n.node_id));
+    nameTd.append(nameWrap);
+    tr.append(nameTd);
+
+    const vTd = el('td');
+    vTd.append(s && s.version ? el('span','mono', s.version) : dash());
+    tr.append(vTd);
+
+    tr.append(rolesCell(s));
+
+    const wgTd = el('td');
+    wgTd.append(statePill(s ? s.wireguard : null, 'on', 'off'));
+    tr.append(wgTd);
+
+    const svcTd = el('td');
+    if(!s || s.service_active == null) svcTd.append(dash());
+    else svcTd.append(s.service_active ? el('span','pill ok','active') : el('span','pill bad','down'));
+    tr.append(svcTd);
+
+    const bTd = el('td');
+    bTd.append(s && s.fail2ban_banned != null ? el('span','mono', String(s.fail2ban_banned)) : dash());
+    tr.append(bTd);
+
+    const ebTd = el('td');
+    ebTd.append(extraBlocksBadge(s));
+    tr.append(ebTd);
+
+    const tTd = el('td');
+    const tv = trafficVal(s);
+    tTd.append(tv != null ? el('span','mono', fmtBytes(tv)) : dash());
+    tr.append(tTd);
+
+    const bwTd = el('td');
+    const bw = s ? sumDevices(s.throughput) : null;
+    bwTd.append(bw != null ? el('span','mono', fmtRate(bw, bwUnit())) : dash());
+    tr.append(bwTd);
+
+    const gTd = el('td');
+    const sp = sparkEl(n.uid);
+    sp.title = 'Throughput, last 24h — hover to preview, click to expand';
+    sp.addEventListener('mouseenter', () => showTputPop(n.uid, sp));
+    sp.addEventListener('mouseleave', scheduleHidePop);
+    sp.addEventListener('click', () => openTputModal(n.uid));
+    gTd.append(sp);
+    tr.append(gTd);
+
+    const aTd = el('td');
+    const ra = el('div','row-actions');
+    const uf = el('button','ghost','Unit file'); uf.onclick = ()=>openServiceFile(n);
+    const edit = el('button','ghost','Edit'); edit.onclick = ()=>openModal('edit', n);
+    const del = el('button','ghost','Delete'); del.onclick = ()=>removeNode(n);
+    ra.append(uf, edit, del); aTd.append(ra); tr.append(aTd);
+
+    tbody.append(tr);
+  });
+  table.append(tbody);
+  wrap.append(table);
+  updateBulk();
+  refreshOpenTput();
+}
+
+const selected = new Set();
+
+function selectedNodes(){
+  return nodes.filter(n => selected.has(n.uid));
+}
+
+function syncSelAll(){
+  const q = (document.getElementById('filter').value || '').toLowerCase();
+  const shown = nodes.filter(n => !q || [n.name,n.ip,n.hostname,n.node_id].some(v => (v||'').toLowerCase().includes(q)));
+  const sa = document.getElementById('sel-all');
+  if(sa) sa.checked = shown.length > 0 && shown.every(n => selected.has(n.uid));
+}
+
+function updateBulk(){
+  // drop selections for nodes that no longer exist
+  const ids = new Set(nodes.map(n => n.uid));
+  [...selected].forEach(id => { if(!ids.has(id)) selected.delete(id); });
+  const sel = selectedNodes();
+  const reachable = sel.filter(n => n.status && n.status.reachable);
+  const note = document.getElementById('sel-note');
+  document.getElementById('btn-restart').disabled = reachable.length === 0;
+  document.getElementById('btn-toggle').disabled = reachable.length === 0;
+  document.getElementById('btn-backup').disabled = reachable.length === 0;
+  document.getElementById('btn-fail2ban').disabled = reachable.length === 0;
+  document.getElementById('btn-ssh').disabled = reachable.length === 0;
+  document.getElementById('btn-extra-blocks').disabled = reachable.length === 0;
+  document.getElementById('btn-upgrade').disabled = reachable.length === 0;
+  document.getElementById('btn-update-agent').disabled = reachable.length === 0;
+  if(sel.length === 0) note.textContent = 'Select one or more nodes to act on them.';
+  else note.textContent = sel.length + ' selected · ' + reachable.length + ' reachable';
+  if(typeof renderCards === 'function') renderCards();
+}
+
+async function restartSelected(){
+  const sel = selectedNodes().filter(n => n.status && n.status.reachable);
+  if(sel.length === 0) return;
+  if(!confirm('Restart nym-node on ' + sel.length + ' node(s)? Exit traffic drops briefly.')) return;
+  const btn = document.getElementById('btn-restart');
+  btn.disabled = true; btn.textContent = 'Restarting…';
+  try{
+    const r = await api('/api/exec', {method:'POST', body: JSON.stringify(
+      {action:'restart', node_ids: sel.map(n => n.uid), params:{}})});
+    const okN = r.results.filter(x => x.ok).length;
+    const failed = r.results.filter(x => !x.ok);
+    toast('Restarted ' + okN + '/' + r.results.length + (failed.length ? ' · ' + failed[0].result.error : ''),
+          failed.length > 0);
+  }catch(e){ toast(e.message, true); }
+  btn.textContent = 'Restart';
+  await load();
+}
+
+function setField(id, val){ document.getElementById(id).value = val == null ? '' : val; }
+
+function openModal(mode, node){
+  editingId = mode === 'edit' ? node.uid : null;
+  document.getElementById('modal-title').textContent = mode === 'edit' ? 'Edit node' : 'Add node';
+  const idInput = document.getElementById('f-node_id');
+  idInput.disabled = false;
+  document.getElementById('f-node_id-hint').textContent =
+    'The id from nym-node init (e.g. "default-nym-node"). It does not need to be unique across your fleet.';
+
+  setField('f-node_id', node ? node.node_id : '');
+  setField('f-name', node ? node.name : '');
+  setField('f-ip', node ? node.ip : '');
+  setField('f-hostname', node ? node.hostname : '');
+  setField('f-agent_port', node ? node.agent_port : 8443);
+  setField('f-notes', node ? node.notes : '');
+  document.getElementById('f-enabled').checked = node ? node.enabled : true;
+  document.getElementById('modal-delete').style.display = mode === 'edit' ? 'inline-flex' : 'none';
+  document.getElementById('modal-delete').onclick = node ? ()=>removeNode(node, true) : null;
+
+  document.getElementById('overlay').classList.add('open');
+  setTimeout(()=>document.getElementById(mode==='edit'?'f-name':'f-node_id').focus(), 30);
+}
+
+function closeModal(){ document.getElementById('overlay').classList.remove('open'); }
+
+async function saveNode(){
+  const payload = {
+    node_id: document.getElementById('f-node_id').value.trim(),
+    name: document.getElementById('f-name').value.trim(),
+    ip: document.getElementById('f-ip').value.trim(),
+    hostname: document.getElementById('f-hostname').value.trim(),
+    agent_port: parseInt(document.getElementById('f-agent_port').value, 10) || 8443,
+    notes: document.getElementById('f-notes').value.trim(),
+    enabled: document.getElementById('f-enabled').checked,
+  };
+  try{
+    if(editingId){
+      await api('/api/nodes/' + encodeURIComponent(editingId), {method:'PATCH', body: JSON.stringify(payload)});
+      toast('Saved ' + payload.name);
+    }else{
+      await api('/api/nodes', {method:'POST', body: JSON.stringify(payload)});
+      toast('Added ' + payload.name);
+    }
+    closeModal(); await load();
+  }catch(e){ toast(e.message, true); }
+}
+
+async function removeNode(node, fromModal){
+  if(!confirm('Delete node "' + node.name + '"? This cannot be undone.')) return;
+  try{
+    await api('/api/nodes/' + encodeURIComponent(node.uid), {method:'DELETE'});
+    toast('Deleted ' + node.name);
+    if(fromModal) closeModal();
+    await load();
+  }catch(e){ toast(e.message, true); }
+}
+
+// --- toggle (edit ExecStart flags via dropdowns) -------------------------
+const ACCEPT_FLAG = '--accept-operator-terms-and-conditions';
+let toggleTargets = [];
+
+async function openToggle(){
+  const sel = selectedNodes().filter(n => n.status && n.status.reachable);
+  if(sel.length === 0) return;
+  toggleTargets = sel;
+  document.getElementById('toggle-title').textContent =
+    sel.length === 1 ? ('Toggle · ' + sel[0].name) : ('Toggle · ' + sel.length + ' nodes');
+
+  const mode = document.getElementById('t-mode');
+  const wg = document.getElementById('t-wg');
+  const accept = document.getElementById('t-accept');
+  const cur = document.getElementById('toggle-current');
+  mode.value = ''; wg.value = ''; accept.value = '';
+  cur.style.display = 'none'; cur.textContent = '';
+  document.getElementById('toggle-restart').checked = false;
+
+  if(sel.length === 1){
+    document.getElementById('toggle-sub').textContent = 'Editing the nym-node start command.';
+    try{
+      const info = await api('/api/nodes/' + encodeURIComponent(sel[0].uid) + '/execstart');
+      if(info.ok){
+        const map = {};
+        (info.flags || []).forEach(f => { map[f.flag] = f.value; });
+        if('--mode' in map) mode.value = map['--mode'] || '';
+        if('--wireguard-enabled' in map) wg.value = map['--wireguard-enabled'] || '';
+        accept.value = (ACCEPT_FLAG in map) ? 'present' : 'absent';
+        cur.style.display = 'block';
+        cur.textContent = info.execstart || '';
+      }else{
+        toast(info.error || 'could not read ExecStart', true);
+      }
+    }catch(e){ toast(e.message, true); return; }
+  }else{
+    document.getElementById('toggle-sub').textContent =
+      'Changes apply to all ' + sel.length + ' selected nodes. "Leave unchanged" skips a flag.';
+  }
+  document.getElementById('toggle-overlay').classList.add('open');
+}
+
+function closeToggle(){ document.getElementById('toggle-overlay').classList.remove('open'); }
+
+async function applyToggle(){
+  const mode = document.getElementById('t-mode').value;
+  const wg = document.getElementById('t-wg').value;
+  const accept = document.getElementById('t-accept').value;
+
+  const sets = {}, present = [], unset = [];
+  if(mode) sets['--mode'] = mode;
+  if(wg) sets['--wireguard-enabled'] = wg;
+  if(accept === 'present') present.push(ACCEPT_FLAG);
+  else if(accept === 'absent') unset.push(ACCEPT_FLAG);
+
+  if(Object.keys(sets).length === 0 && present.length === 0 && unset.length === 0){
+    toast('Nothing to change', true); return;
+  }
+  const params = { set: sets, present: present, unset: unset,
+                   restart: document.getElementById('toggle-restart').checked };
+
+  const btn = document.getElementById('toggle-apply');
+  btn.disabled = true; btn.textContent = 'Applying…';
+  try{
+    const r = await api('/api/exec', {method:'POST', body: JSON.stringify(
+      {action:'toggle', node_ids: toggleTargets.map(n => n.uid), params})});
+    const okN = r.results.filter(x => x.ok).length;
+    const failed = r.results.filter(x => !x.ok);
+    toast('Applied to ' + okN + '/' + r.results.length +
+          (failed.length ? ' · ' + (failed[0].result.error || 'failed') : ''), failed.length > 0);
+    closeToggle();
+  }catch(e){ toast(e.message, true); }
+  btn.disabled = false; btn.textContent = 'Apply';
+  await load();
+}
+
+// --- unit file viewer (dev) ----------------------------------------------
+async function openServiceFile(node){
+  document.getElementById('sf-title').textContent = 'Unit file · ' + node.name;
+  document.getElementById('sf-sub').textContent = '';
+  document.getElementById('sf-content').textContent = 'loading…';
+  document.getElementById('sf-overlay').classList.add('open');
+  try{
+    const r = await api('/api/nodes/' + encodeURIComponent(node.uid) + '/service-file');
+    if(r.ok){
+      document.getElementById('sf-sub').textContent = r.service + (r.fragment_path ? ' · ' + r.fragment_path : '');
+      document.getElementById('sf-content').textContent = r.content || '(empty)';
+    }else{
+      document.getElementById('sf-content').textContent = r.error || 'could not read unit file';
+    }
+  }catch(e){ document.getElementById('sf-content').textContent = e.message; }
+}
+function closeSF(){ document.getElementById('sf-overlay').classList.remove('open'); }
+function copySF(){
+  const t = document.getElementById('sf-content').textContent;
+  navigator.clipboard && navigator.clipboard.writeText(t).then(()=>toast('Copied')).catch(()=>{});
+}
+
+// --- push agent to nodes (self-update over mTLS) -------------------------
+let auTargets = [];
+async function openAgentUpdate(){
+  const sel = selectedNodes().filter(n => n.status && n.status.reachable);
+  if(sel.length === 0) return;
+  auTargets = sel;
+  let info = {version: '?', sha256: ''};
+  try{ info = await api('/api/agent/local'); }catch(e){}
+  document.getElementById('au-sub').textContent =
+    'Push agent ' + info.version + ' (' + (info.sha256 || '').slice(0,8) + ') to ' + sel.length + ' node(s).';
+  document.getElementById('au-restart').checked = true;
+  document.getElementById('au-overlay').classList.add('open');
+}
+function closeAU(){ document.getElementById('au-overlay').classList.remove('open'); }
+async function applyAgentUpdate(){
+  const btn = document.getElementById('au-apply');
+  btn.disabled = true; btn.textContent = 'Pushing…';
+  try{
+    const r = await api('/api/agent/update', {method:'POST', body: JSON.stringify(
+      {node_ids: auTargets.map(n => n.uid), restart: document.getElementById('au-restart').checked})});
+    const okN = r.results.filter(x => x.ok).length;
+    const failed = r.results.filter(x => !x.ok);
+    toast('Pushed ' + r.version + ' to ' + okN + '/' + r.results.length +
+          (failed.length ? ' · ' + (failed[0].result.error || 'failed') : ''), failed.length > 0);
+    closeAU();
+  }catch(e){ toast(e.message, true); }
+  btn.disabled = false; btn.textContent = 'Push';
+  setTimeout(load, 3500);  // agents may restart; refresh after they settle
+}
+
+// --- upgrade nym-node -----------------------------------------------------
+let upTargets = [];
+function openUpgrade(){
+  const sel = selectedNodes().filter(n => n.status && n.status.reachable);
+  if(sel.length === 0) return;
+  upTargets = sel;
+  document.getElementById('up-sub').textContent = 'Applies to ' + sel.length + ' selected node(s): ' +
+    sel.map(n => n.name).join(', ') + '.';
+  document.getElementById('up-url').value = '';
+  document.getElementById('up-ntm').checked = false;
+  document.getElementById('ntm-box').style.display = 'none';
+  document.getElementById('up-ntm-url').value = '';
+  document.getElementById('up-ntm-args').value = '';
+  document.getElementById('up-ntm-path').value = '';
+  document.getElementById('up-restart').checked = false;
+  document.getElementById('up-overlay').classList.add('open');
+}
+function closeUp(){ document.getElementById('up-overlay').classList.remove('open'); }
+
+async function applyUpgrade(){
+  const url = document.getElementById('up-url').value.trim();
+  if(!url){ toast('A nym-node release URL is required', true); return; }
+  const params = { url, restart: document.getElementById('up-restart').checked };
+  if(document.getElementById('up-ntm').checked){
+    const ntmUrl = document.getElementById('up-ntm-url').value.trim();
+    if(!ntmUrl){ toast('NTM is checked but no script URL given', true); return; }
+    params.ntm = { url: ntmUrl, args: document.getElementById('up-ntm-args').value.trim(),
+                   path: document.getElementById('up-ntm-path').value.trim() };
+  }
+  if(!confirm('Upgrade nym-node on ' + upTargets.length + ' node(s)?' +
+              (params.restart ? ' Services will restart (exit traffic drops briefly).' : ''))) return;
+
+  const btn = document.getElementById('up-apply');
+  btn.disabled = true; btn.textContent = 'Upgrading…';
+  try{
+    const r = await api('/api/exec', {method:'POST', body: JSON.stringify(
+      {action:'upgrade', node_ids: upTargets.map(n => n.uid), params})});
+    closeUp();
+    showResults('Upgrade results', r.results);
+  }catch(e){ toast(e.message, true); }
+  btn.disabled = false; btn.textContent = 'Upgrade';
+  await load();
+}
+
+// --- backup (stop, archive data dir, pull to Mac, restart) ----------------
+async function runBackup(){
+  const sel = selectedNodes().filter(n => n.status && n.status.reachable);
+  if(sel.length === 0) return;
+  if(!confirm('Back up ' + sel.length + ' node(s)?\n\nEach node\u2019s nym-node service is briefly stopped while its data directory (identity keys + sqlite) is archived, then restarted. The archive is downloaded to the orchestrator. Nodes are processed one at a time, so only one is offline at any moment.')) return;
+  const btn = document.getElementById('btn-backup');
+  btn.disabled = true; btn.textContent = 'Backing up…';
+  try{
+    const r = await api('/api/backup', {method:'POST', body: JSON.stringify(
+      {node_ids: sel.map(n => n.uid)})});
+    showResults('Backup results', r.results);
+  }catch(e){ toast(e.message, true); }
+  btn.textContent = 'Backup';
+  await load();
+}
+
+// ===== throughput history: sparkline + 24h chart =========================
+let tputCache = {};
+// REAL windowed fleet traffic from cumulative-counter snapshots (no projection):
+// {total_bytes, dev_bytes, total_bps, observed_hours, window_hours, nodes}
+let traf24 = null;
+async function fetchTraffic24(){
+  try{ traf24 = await api('/api/traffic/window?hours=24'); renderCards(); }catch(e){}
+}
+setInterval(fetchTraffic24, 60000);
+// REAL average ON-WIRE throughput (bits/s), split wg/mix: {wg_bps,mix_bps,total_bps,observed_hours,window_hours}
+let onwireAvg = null;
+async function fetchOnwireAvg(){
+  try{ onwireAvg = await api('/api/onwire/avg?hours=24'); renderCards(); }catch(e){}
+}
+setInterval(fetchOnwireAvg, 60000);
+
+async function loadThroughput(){
+  try{ tputCache = await api('/api/throughput?hours=24&buckets=288'); }
+  catch(e){ /* leave previous cache */ }
+}
+
+// summed bytes/sec over the selected interfaces, aligned to the bucket timeline
+function summedSeries(uid){
+  const s = tputCache[uid];
+  if(!s || !s.ts || !s.ts.length) return null;
+  const devs = devList();
+  if(!devs.length) return null;
+  const ts = s.ts, n = ts.length, val = new Array(n).fill(null);
+  for(let i = 0; i < n; i++){
+    let sum = 0, any = false;
+    for(const d of devs){ const a = s.dev[d]; if(a && a[i] != null){ sum += a[i]; any = true; } }
+    if(any) val[i] = sum;
+  }
+  return val.some(v => v != null) ? { ts, val } : null;
+}
+
+function niceCeil(x){
+  if(x <= 0) return 1;
+  const e = Math.pow(10, Math.floor(Math.log10(x)));
+  const f = x / e;
+  return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * e;
+}
+function rateUnitFor(bps){ const b = bps * 8; return b >= 1e9 ? 'Gbit/s' : b >= 1e6 ? 'Mbit/s' : b >= 1e3 ? 'Kbit/s' : 'bit/s'; }
+function rateDiv(u){ return { 'bit/s':1, 'Kbit/s':1e3, 'Mbit/s':1e6, 'Gbit/s':1e9 }[u] || 1e6; }
+function rateNum(bps, u){ return bps * 8 / rateDiv(u); }
+function hhmm(epoch){ const d = new Date(epoch * 1000); return String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0'); }
+
+function sparkEl(uid){
+  const wrap = el('span', 'spark-wrap');
+  const s = summedSeries(uid);
+  if(!s){ wrap.append(el('span','spark-na','—')); return wrap; }
+  const W = 84, H = 22, p = 2;
+  const v = s.val, n = v.length, max = Math.max(...v.filter(x => x != null), 1);
+  const X = i => p + (W - 2*p) * (n <= 1 ? 0 : i/(n-1));
+  const Y = val => (H - p) - (H - 2*p) * (val/max);
+  let d = '', pen = false, dots = '';
+  for(let i = 0; i < n; i++){
+    if(v[i] == null){ pen = false; continue; }
+    d += (pen ? 'L' : 'M') + X(i).toFixed(1) + ' ' + Y(v[i]).toFixed(1) + ' ';
+    if((i === 0 || v[i-1] == null) && (i === n-1 || v[i+1] == null))
+      dots += `<circle cx="${X(i).toFixed(1)}" cy="${Y(v[i]).toFixed(1)}" r="1.8"/>`;
+    pen = true;
+  }
+  wrap.innerHTML =
+    `<svg class="spark" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">` +
+    `<path d="${d.trim()}" fill="none" stroke="var(--accent)" stroke-width="1.5" vector-effect="non-scaling-stroke"/>` +
+    `<g fill="var(--accent)">${dots}</g></svg>`;
+  return wrap;
+}
+
+// renders metric cards + an SVG line chart with hover into `container`
+function renderChart(container, uid, w, h){
+  const s = summedSeries(uid);
+  if(!s){
+    container.innerHTML = '<div class="tput-empty">No throughput history yet.<br>This fills in as polls come in (up to 24h).</div>';
+    return;
+  }
+  const ts = s.ts, val = s.val, n = ts.length;
+  const present = val.filter(v => v != null);
+  // "now" must match the live Throughput column: use the current instantaneous
+  // sample for this node, not the last 5-minute bucket average.
+  const liveNode = nodes.find(n => n.uid === uid);
+  const live = (liveNode && liveNode.status) ? sumDevices(liveNode.status.throughput) : null;
+  const lastBucket = [...val].reverse().find(v => v != null);
+  const now = (live != null) ? live : lastBucket;
+  const avg = present.reduce((a,b)=>a+b,0) / present.length;
+  // the line is 5-min averages, so a live spike can exceed the bucketed max;
+  // fold "now" into peak so the cards never read now > peak.
+  const peak = Math.max(Math.max(...present), now != null ? now : 0);
+  const u = bwUnit();
+  const head =
+    `<div class="tput-head">
+       <div class="tput-stat"><div class="k">now</div><div class="v">${fmtRate(now, u)}</div></div>
+       <div class="tput-stat"><div class="k">24h avg</div><div class="v">${fmtRate(avg, u)}</div></div>
+       <div class="tput-stat"><div class="k">24h peak</div><div class="v">${fmtRate(peak, u)}</div></div>
+     </div>`;
+
+  const ml = 48, mr = 10, mt = 10, mb = 22;
+  const x0 = ml, x1 = w - mr, y0 = mt, y1 = h - mb;
+  const nm = niceCeil(peak);
+  const axisU = u === 'auto' ? rateUnitFor(nm) : u;
+  const X = i => x0 + (x1 - x0) * (n <= 1 ? 0 : i/(n-1));
+  const Y = v => y1 - (y1 - y0) * (v/nm);
+
+  let grid = '', ylab = '';
+  for(let k = 0; k <= 4; k++){
+    const yy = y0 + (y1 - y0) * k/4, lvl = nm * (1 - k/4);
+    grid += `<line class="tput-grid" x1="${x0}" y1="${yy.toFixed(1)}" x2="${x1}" y2="${yy.toFixed(1)}"/>`;
+    const num = rateNum(lvl, axisU);
+    ylab += `<text class="tput-axis" x="${x0-5}" y="${(yy+3).toFixed(1)}" text-anchor="end">${num.toFixed(axisU==='Gbit/s'?2:0)}</text>`;
+  }
+  let xlab = '';
+  const xt = 5;
+  for(let k = 0; k < xt; k++){
+    const i = Math.round((n-1) * k/(xt-1));
+    xlab += `<text class="tput-axis" x="${X(i).toFixed(1)}" y="${h-6}" text-anchor="middle">${hhmm(ts[i])}</text>`;
+  }
+  let line = '', area = '', dots = '', seg = [];
+  const flush = () => {
+    if(seg.length > 1){
+      const pts = seg.map(p => p[0].toFixed(1)+' '+p[1].toFixed(1));
+      line += `<path class="tput-line" d="M${pts.join(' L')}"/>`;
+      area += `<path class="tput-area" d="M${seg[0][0].toFixed(1)} ${y1} L${pts.join(' L')} L${seg[seg.length-1][0].toFixed(1)} ${y1} Z"/>`;
+    } else if(seg.length === 1){
+      dots += `<circle class="tput-dot" cx="${seg[0][0].toFixed(1)}" cy="${seg[0][1].toFixed(1)}" r="2.5"/>`;
+    }
+    seg = [];
+  };
+  for(let i = 0; i < n; i++){ if(val[i] == null){ flush(); continue; } seg.push([X(i), Y(val[i])]); }
+  flush();
+
+  const svg =
+    `<svg viewBox="0 0 ${w} ${h}" width="100%" style="display:block">
+       <text class="tput-axis" x="${x0-5}" y="${y0-1}" text-anchor="end">${axisU.replace('/s','')}</text>
+       ${grid}${area}${line}${dots}${ylab}${xlab}
+       <line class="tput-guide" style="display:none"/>
+       <circle class="tput-dot" r="3" style="display:none"/>
+       <g class="tput-tipg" style="display:none">
+         <rect class="tput-tipbg" rx="4" width="118" height="34"/>
+         <text class="tput-tip tip-t" x="6" y="14"></text>
+         <text class="tput-tip tip-v" x="6" y="28"></text>
+       </g>
+     </svg>`;
+  const caption = `<div class="tput-cap">Line = 5-min averages over 24h · <b>now</b> = live rate (matches the Throughput column)</div>`;
+  container.innerHTML = head + svg + caption;
+
+  const svgEl = container.querySelector('svg');
+  const guide = container.querySelector('.tput-guide');
+  const dot = container.querySelector('.tput-dot');
+  const tipg = container.querySelector('.tput-tipg');
+  const tipT = container.querySelector('.tip-t');
+  const tipV = container.querySelector('.tip-v');
+  const hide = () => { guide.style.display = dot.style.display = tipg.style.display = 'none'; };
+  svgEl.addEventListener('mousemove', ev => {
+    const r = svgEl.getBoundingClientRect();
+    const vx = (ev.clientX - r.left) / r.width * w;
+    let i = Math.round((vx - x0) / (x1 - x0) * (n - 1));
+    i = Math.max(0, Math.min(n - 1, i));
+    if(val[i] == null){ hide(); return; }
+    const px = X(i), py = Y(val[i]);
+    guide.setAttribute('x1', px); guide.setAttribute('x2', px);
+    guide.setAttribute('y1', y0); guide.setAttribute('y2', y1); guide.style.display = '';
+    dot.setAttribute('cx', px); dot.setAttribute('cy', py); dot.style.display = '';
+    tipT.textContent = hhmm(ts[i]); tipV.textContent = fmtRate(val[i], u);
+    let tx = px + 8; if(tx + 118 > x1) tx = px - 126; if(tx < x0) tx = x0;
+    tipg.setAttribute('transform', `translate(${tx.toFixed(1)}, ${Math.max(y0, py-40).toFixed(1)})`);
+    tipg.style.display = '';
+  });
+  svgEl.addEventListener('mouseleave', hide);
+}
+
+// ----- hover popover ------------------------------------------------------
+let popHideTimer = null, popHeld = false, popUid = null;
+function tputPopHold(on){
+  popHeld = on;
+  if(!on) scheduleHidePop();
+  else if(popHideTimer){ clearTimeout(popHideTimer); popHideTimer = null; }
+}
+function scheduleHidePop(){
+  if(popHideTimer) clearTimeout(popHideTimer);
+  popHideTimer = setTimeout(() => { if(!popHeld){ document.getElementById('tput-pop').classList.remove('open'); popUid = null; } }, 160);
+}
+function showTputPop(uid, anchor){
+  if(popHideTimer){ clearTimeout(popHideTimer); popHideTimer = null; }
+  popUid = uid;
+  const pop = document.getElementById('tput-pop');
+  renderChart(pop, uid, 360, 168);
+  pop.classList.add('open');
+  const r = anchor.getBoundingClientRect();
+  const pw = 380;
+  let left = r.left + window.scrollX;
+  if(left + pw > window.scrollX + document.documentElement.clientWidth - 8)
+    left = window.scrollX + document.documentElement.clientWidth - pw - 8;
+  let top = r.bottom + window.scrollY + 6;
+  pop.style.left = Math.max(8, left) + 'px';
+  pop.style.top = top + 'px';
+}
+
+// ----- click modal --------------------------------------------------------
+let tputModalUid = null;
+function openTputModal(uid){
+  tputModalUid = uid;
+  const node = nodes.find(n => n.uid === uid);
+  document.getElementById('tput-title').textContent =
+    'Throughput · last 24h · ' + (node ? node.name : uid);
+  renderChart(document.getElementById('tput-modal-body'), uid, 620, 250);
+  document.getElementById('tput-overlay').classList.add('open');
+}
+function closeTput(){ document.getElementById('tput-overlay').classList.remove('open'); tputModalUid = null; }
+
+// keep open panels live as data / interface selection changes
+function refreshOpenTput(){
+  if(tputModalUid) renderChart(document.getElementById('tput-modal-body'), tputModalUid, 620, 250);
+  if(popUid && document.getElementById('tput-pop').classList.contains('open'))
+    renderChart(document.getElementById('tput-pop'), popUid, 360, 168);
+}
+
+// ===== fail2ban ===========================================================
+let f2bTargets = [];
+
+function openFail2ban(){
+  const sel = selectedNodes().filter(n => n.status && n.status.reachable);
+  if(sel.length === 0) return;
+  f2bTargets = sel.map(n => n.uid);
+  document.getElementById('f2b-overlay').classList.add('open');
+  loadF2bStatus();
+}
+function closeF2b(){ document.getElementById('f2b-overlay').classList.remove('open'); }
+
+async function loadF2bStatus(){
+  const box = document.getElementById('f2b-status');
+  box.textContent = 'Checking…';
+  try{
+    const r = await api('/api/fail2ban/status', {method:'POST', body: JSON.stringify({node_ids: f2bTargets})});
+    renderF2bStatus(r.results);
+  }catch(e){ box.textContent = e.message; }
+}
+
+function renderF2bStatus(results){
+  const box = document.getElementById('f2b-status'); box.innerHTML = '';
+  let prefill = null;
+  results.forEach(r => {
+    const res = r.result || {};
+    const row = el('div','f2b-node');
+    row.append(el('span','nm', r.name));
+    if(res.installed === false){ row.append(el('span','pill bad','not installed')); box.append(row); return; }
+    if(res.installed !== true){
+      row.append(el('span','pill warn','agent out of date'));
+      row.append(el('span','sub', 'this node\u2019s agent can\u2019t report fail2ban — Update agent, then reopen'));
+      box.append(row); return;
+    }
+    row.append(res.running ? el('span','pill ok','running') : el('span','pill bad','stopped'));
+    const jailed = res.currently_banned == null ? '?' : res.currently_banned;
+    const add = res.banned_24h == null ? 0 : res.banned_24h;
+    row.append(el('span','mono', 'jailed ' + jailed + ' (+' + add + ' / 24h)'));
+    if(res.bantime || res.maxretry)
+      row.append(el('span','sub', 'ban ' + (res.bantime||'?') + ' · retries ' + (res.maxretry||'?')));
+    box.append(row);
+    if(!prefill && res.maxretry) prefill = res;
+    if(results.length === 1 && Array.isArray(res.banned_ips) && res.banned_ips.length){
+      const ips = el('div','f2b-ips');
+      res.banned_ips.forEach(ip => {
+        const chip = el('span','f2b-ip'); chip.append(document.createTextNode(ip));
+        const b = el('button','ghost','unban'); b.onclick = () => unbanIp(r.uid, ip);
+        chip.append(b); ips.append(chip);
+      });
+      box.append(ips);
+    }
+  });
+  if(prefill){
+    if(prefill.maxretry) document.getElementById('f2b-maxretry').value = prefill.maxretry;
+    if(prefill.findtime) document.getElementById('f2b-findtime').value = prefill.findtime;
+    if(prefill.bantime) document.getElementById('f2b-bantime').value = prefill.bantime;
+  }
+}
+
+async function applyF2b(){
+  const body = {
+    node_ids: f2bTargets,
+    maxretry: parseInt(document.getElementById('f2b-maxretry').value, 10) || 5,
+    findtime: (document.getElementById('f2b-findtime').value || '10m').trim(),
+    bantime: (document.getElementById('f2b-bantime').value || '1h').trim(),
+    increment: document.getElementById('f2b-increment').checked,
+    ignoreip: (document.getElementById('f2b-ignoreip').value || '').trim().split(/\s+/).filter(Boolean),
+  };
+  const btn = document.getElementById('f2b-apply');
+  btn.disabled = true; btn.textContent = 'Applying…';
+  try{
+    const r = await api('/api/fail2ban/setup', {method:'POST', body: JSON.stringify(body)});
+    showResults('Fail2ban results', r.results);
+    await loadF2bStatus();
+    await load();
+  }catch(e){ toast(e.message, true); }
+  btn.disabled = false; btn.textContent = 'Install & apply';
+}
+
+async function unbanIp(uid, ip){
+  try{
+    await api('/api/fail2ban/unban', {method:'POST', body: JSON.stringify({node_id: uid, ip})});
+    toast('Unbanned ' + ip);
+    await loadF2bStatus(); await load();
+  }catch(e){ toast(e.message, true); }
+}
+
+// ===== Extra blocks (NYM-EXIT abuse blocklist) ============================
+function extraBlocksBadge(s){
+  const eb = s && s.extra_blocks;
+  if(!eb || !eb.installed) return el('span','pill muted','Missing');
+  if(eb.active) return el('span','pill ok','Active');
+  return el('span','pill warn','Inactive');
+}
+
+let ebTargets = [];
+
+function openExtraBlocks(){
+  const sel = selectedNodes().filter(n => n.status && n.status.reachable);
+  if(sel.length === 0) return;
+  ebTargets = sel.map(n => n.uid);
+  document.getElementById('eb-overlay').classList.add('open');
+  loadEbStatus();
+}
+function closeExtraBlocks(){ document.getElementById('eb-overlay').classList.remove('open'); }
+
+async function loadEbStatus(){
+  const box = document.getElementById('eb-status');
+  box.textContent = 'Checking…';
+  try{
+    const r = await api('/api/extra-blocks/status', {method:'POST', body: JSON.stringify({node_ids: ebTargets})});
+    renderEbStatus(r.results);
+  }catch(e){ box.textContent = e.message; }
+}
+
+function ebStateBadge(res){
+  if(res.installed === false) return el('span','pill muted','Missing');
+  if(res.state === 'active' || res.active) return el('span','pill ok','Active');
+  return el('span','pill warn','Inactive');
+}
+
+// "v4 3/3 · v6 1/1" (or "v6 n/a" when the node has no v6 exit chain)
+function ebCountsText(res){
+  const parts = [];
+  if(res.v4) parts.push('v4 ' + res.v4.present + '/' + res.v4.size);
+  if(res.v6 && res.v6.size > 0)
+    parts.push('v6 ' + (res.v6.applicable ? res.v6.present + '/' + res.v6.size : 'n/a'));
+  if(!parts.length) return (res.rules_present ?? '?') + '/' + (res.blocklist_size ?? '?') + ' rules';
+  return parts.join(' · ');
+}
+
+function renderEbStatus(results){
+  const box = document.getElementById('eb-status'); box.innerHTML = '';
+  let prefillUrl = null;
+  results.forEach(r => {
+    const res = r.result || {};
+    const row = el('div','f2b-node');
+    row.append(el('span','nm', r.name));
+    if(res.ok === false && res.installed === undefined){
+      row.append(el('span','pill warn','agent out of date'));
+      row.append(el('span','sub','Update agent on this node, then reopen'));
+      box.append(row); return;
+    }
+    row.append(ebStateBadge(res));
+    if(res.chain_present === false){
+      row.append(el('span','sub','NYM-EXIT not present (nym-node not running?)'));
+    } else if(res.blocklist_size != null){
+      row.append(el('span','mono', ebCountsText(res)));
+      if(res.sample_ip) row.append(el('span','sub', 'sample ' + res.sample_ip + ' · ' +
+        (res.sample_blocked ? 'blocked' : 'not blocked')));
+    }
+    if(res.list_url && !prefillUrl) prefillUrl = res.list_url;
+    box.append(row);
+  });
+  const urlEl = document.getElementById('eb-url');
+  if(prefillUrl && !urlEl.value) urlEl.placeholder = prefillUrl;
+}
+
+function ebBody(){
+  const url = (document.getElementById('eb-url').value || '').trim();
+  const b = {node_ids: ebTargets};
+  if(url) b.list_url = url;
+  return b;
+}
+
+async function ebInstall(){
+  const restart = document.getElementById('eb-restart').checked;
+  if(restart && !confirm('This restarts nym-node on ' + ebTargets.length +
+     ' node(s) — a brief service interruption. Continue?')) return;
+  const body = Object.assign(ebBody(), {restart_node: restart});
+  const btn = document.getElementById('eb-install');
+  btn.disabled = true; btn.textContent = restart ? 'Installing + restarting…' : 'Installing…';
+  try{
+    const r = await api('/api/extra-blocks/install', {method:'POST', body: JSON.stringify(body)});
+    showResults('Extra blocks · install', r.results);
+    await loadEbStatus(); await load();
+  }catch(e){ toast(e.message, true); }
+  btn.disabled = false; btn.textContent = 'Install';
+}
+
+async function ebVerify(){
+  const btn = document.getElementById('eb-verify');
+  btn.disabled = true; btn.textContent = 'Verifying…';
+  try{
+    const r = await api('/api/extra-blocks/verify', {method:'POST', body: JSON.stringify({node_ids: ebTargets})});
+    showResults('Extra blocks · verify', r.results);
+    await loadEbStatus(); await load();
+  }catch(e){ toast(e.message, true); }
+  btn.disabled = false; btn.textContent = 'Verify';
+}
+
+async function ebRemove(){
+  if(!confirm('Remove the extra-blocks unit and delete its REJECT rules from NYM-EXIT on ' +
+     ebTargets.length + ' node(s)?')) return;
+  const btn = document.getElementById('eb-remove');
+  btn.disabled = true; btn.textContent = 'Removing…';
+  try{
+    const r = await api('/api/extra-blocks/remove', {method:'POST', body: JSON.stringify({node_ids: ebTargets})});
+    showResults('Extra blocks · remove', r.results);
+    await loadEbStatus(); await load();
+  }catch(e){ toast(e.message, true); }
+  btn.disabled = false; btn.textContent = 'Remove';
+}
+
+// ===== SSH key access =====================================================
+let sshTargets = [];
+
+function openSsh(){
+  const sel = selectedNodes().filter(n => n.status && n.status.reachable);
+  if(sel.length === 0) return;
+  sshTargets = sel.map(n => n.uid);
+  document.getElementById('ssh-results').innerHTML = '';
+  document.getElementById('ssh-overlay').classList.add('open');
+  loadSshKey(); loadSshStatus();
+}
+function closeSsh(){ document.getElementById('ssh-overlay').classList.remove('open'); }
+
+async function loadSshKey(){
+  try{
+    const k = await api('/api/ssh/key');
+    document.getElementById('ssh-pub').value = k.public_key;
+    const host = nodes.find(n => n.uid === sshTargets[0]) || {};
+    const target = host.hostname || host.ip || '<node>';
+    const user = k.ssh_user || 'hermes';
+    document.getElementById('ssh-cmd').textContent =
+      'private key: ' + k.private_key_path + '   ·   connect: ssh -i ' + k.private_key_path + ' ' + user + '@' + target;
+    // Derive a wildcard host pattern from the common domain if there is one
+    const dom = (target.indexOf('.') > -1) ? '*.' + target.split('.').slice(1).join('.') : target;
+    document.getElementById('ssh-config-snip').textContent =
+      'Host ' + dom + '\n' +
+      '    User ' + user + '\n' +
+      '    IdentityFile ' + k.private_key_path + '\n' +
+      '    IdentitiesOnly yes';
+  }catch(e){ document.getElementById('ssh-cmd').textContent = e.message; }
+}
+
+async function loadSshStatus(){
+  const box = document.getElementById('ssh-status');
+  box.textContent = 'Checking…';
+  try{
+    const r = await api('/api/ssh/status', {method:'POST', body: JSON.stringify({node_ids: sshTargets})});
+    renderSshStatus(r.results);
+  }catch(e){ box.textContent = e.message; }
+}
+
+function renderSshStatus(results){
+  const box = document.getElementById('ssh-status'); box.innerHTML = '';
+  results.forEach(r => {
+    const res = r.result || {};
+    const row = el('div','f2b-node');
+    row.append(el('span','nm', r.name));
+    if(res.ok === false || res.password_auth === undefined){
+      row.append(el('span','pill warn','agent out of date'));
+      row.append(el('span','sub', 'Update agent to manage SSH on this node'));
+      box.append(row); return;
+    }
+    const pw = res.password_auth;
+    row.append(pw === 'no' ? el('span','pill ok','password off')
+      : (pw === 'yes' ? el('span','pill bad','password on') : el('span','pill','?')));
+    if(res.user_exists === false){
+      row.append(el('span','pill bad', 'no user ' + (res.user || '?')));
+    } else {
+      row.append(el('span','mono', (res.user || 'hermes') + ': ' +
+        (res.authorized_keys_count != null ? res.authorized_keys_count : '?') + ' key' +
+        (res.authorized_keys_count === 1 ? '' : 's')));
+    }
+    if(res.permit_root_login) row.append(el('span','sub', 'root login: ' + res.permit_root_login));
+    box.append(row);
+  });
+}
+
+async function sshRun(btnId, label, fn){
+  const btn = document.getElementById(btnId);
+  const orig = btn.textContent; btn.disabled = true; btn.textContent = label;
+  try{ await fn(); await loadSshStatus(); await load(); }
+  catch(e){ toast(e.message, true); }
+  btn.disabled = false; btn.textContent = orig;
+}
+
+function sshResults(results){
+  const box = document.getElementById('ssh-results');
+  buildResultCards(box, results);
+  if(results.length){
+    const ok = results.filter(r => r.ok).length;
+    const fail = results.length - ok;
+    const sum = el('div', 'ssh-sum',
+      ok + ' ok' + (fail ? ' · ' + fail + ' failed — see per-node detail below' : ''));
+    sum.style.color = fail ? 'var(--danger)' : 'var(--ok)';
+    box.prepend(sum);
+  }
+}
+
+async function sshInstall(){
+  const extra = (document.getElementById('ssh-extra').value || '').trim();
+  const body = {node_ids: sshTargets, extra_pubkeys: extra ? [extra] : []};
+  await sshRun('ssh-install', 'Installing…', async () => {
+    const r = await api('/api/ssh/install', {method:'POST', body: JSON.stringify(body)});
+    sshResults(r.results);
+  });
+}
+
+async function sshVerify(){
+  await sshRun('ssh-verify', 'Verifying…', async () => {
+    const r = await api('/api/ssh/verify', {method:'POST', body: JSON.stringify({node_ids: sshTargets})});
+    sshResults(r.results);
+  });
+}
+
+async function sshHarden(mode){
+  if(mode === 'off' && !confirm('Disable password login on the selected node(s)?\n\nmaestro will first verify a key login on each node and skip any that fail, so you cannot be locked out. Keep one SSH session open as a backup the first time.')) return;
+  const btnId = mode === 'off' ? 'ssh-disable' : 'ssh-enable';
+  await sshRun(btnId, mode === 'off' ? 'Disabling…' : 'Enabling…', async () => {
+    const r = await api('/api/ssh/harden', {method:'POST', body: JSON.stringify({node_ids: sshTargets, password: mode})});
+    sshResults(r.results);
+  });
+}
+
+// --- reusable results panel ----------------------------------------------
+function buildResultCards(container, results){
+  container.innerHTML = '';
+  results.forEach(r => {
+    const res = r.result || {};
+    const card = el('div'); card.style.cssText = 'border:1px solid var(--line);border-radius:var(--r);padding:12px;margin-bottom:10px';
+    const head = el('div'); head.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:6px';
+    head.append(el('span','name', r.name || r.node_id));
+    head.append(r.ok ? el('span','pill ok','ok') : el('span','pill bad','failed'));
+    if(res.new_version) head.append(el('span','pill info', 'v' + res.new_version));
+    if(res.running) head.append(el('span','pill ok','running'));
+    if(res.restarted) head.append(el('span','pill','restarted'));
+    card.append(head);
+
+    if(res.error){ const e = el('div','sub', res.error); e.style.color = 'var(--danger)'; card.append(e); }
+    if(res.effective) card.append(el('div','sub', 'effective: ban ' + (res.effective.bantime||'?') +
+      ' · retries ' + (res.effective.maxretry||'?') + ' · find ' + (res.effective.findtime||'?')));
+    if(res.added != null) card.append(el('div','sub',
+      'keys: +' + res.added + ' added, ' + res.already_present + ' already present' +
+      (res.user ? ' (user ' + res.user + ')' : '')));
+    if(res.verified !== undefined && !res.password_auth)
+      card.append(el('div','sub', res.verified ? 'key login verified' : 'key login NOT verified'));
+    if(res.detail && res.verified !== undefined){ const e = el('div','sub', res.detail); if(!res.verified) e.style.color = 'var(--danger)'; card.append(e); }
+    if(res.password_auth) card.append(el('div','sub', 'password auth now: ' + res.password_auth +
+      (res.permit_root_login ? ' · root login: ' + res.permit_root_login : '')));
+    if(res.include_added) card.append(el('div','sub', 'added missing Include to sshd_config so the drop-in applies'));
+    if(res.backup) card.append(el('div','sub', 'backup: ' + res.backup));
+    if(res.replaced_handmade){ const e = el('div','sub',
+      'replaced a hand-made script/unit — original saved as *.maestro.bak'); e.style.color = 'var(--warn)'; card.append(e); }
+    if(res.before && res.after) card.append(el('div','sub',
+      'exit-chain rules: ' + ebCountsText(res.before) + ' → ' + ebCountsText(res.after)));
+    else if(res.v4 || res.rules_present != null) card.append(el('div','sub',
+      'exit-chain rules: ' + ebCountsText(res) +
+      (res.sample_ip ? ' · sample ' + res.sample_ip + ' ' + (res.sample_blocked ? 'blocked' : 'not blocked') : '')));
+    if(res.removed_rules != null) card.append(el('div','sub', 'removed ' + res.removed_rules + ' REJECT rules from NYM-EXIT'));
+    if(res.note) card.append(el('div','sub', res.note));
+    if(res.filename) card.append(el('div','sub', 'archive: ' + res.filename +
+      (res.size != null ? ' (' + fmtBytes(res.size) + ')' : '')));
+    if(res.saved_path) card.append(el('div','sub', 'saved to: ' + res.saved_path));
+
+    if(res.ntm){
+      const n = res.ntm;
+      card.append(el('div','sub', 'NTM ' + (n.ok ? 'ok' : 'failed') +
+        (n.exit_code != null ? ' (exit ' + n.exit_code + ')' : '') + (n.command ? ' · ' + n.command : '')));
+      if(n.output || n.error){ const box = el('div','codebox', n.output || n.error); box.style.marginTop = '4px'; card.append(box); }
+    }
+    if(res.output){ const box = el('div','codebox', res.output); box.style.marginTop = '6px'; card.append(box); }
+    container.append(card);
+  });
+}
+
+function showResults(title, results){
+  document.getElementById('res-title').textContent = title;
+  buildResultCards(document.getElementById('res-body'), results);
+  document.getElementById('res-overlay').classList.add('open');
+}
+function closeRes(){ document.getElementById('res-overlay').classList.remove('open'); }
+
+// ===== wallets ============================================================
+// Orchestrator-side: every call hits /api/wallet/* on this localhost app; keys
+// never leave this machine. Wallet selection is independent of node selection.
+let walletNames = [];
+let walletQueried = {};   // name -> last query row (balance/rewards)
+
+async function loadWalletList(){
+  const info = await api('/api/wallet/list');
+  walletNames = info.wallets || [];
+  document.getElementById('w-dir').textContent = info.wallet_dir || '~/.nym_wallets';
+  const note = document.getElementById('w-cli-note');
+  note.textContent = info.nym_cli ? '' : 'nym-cli not found on this machine — install it for balance/withdraw/send';
+  return info;
+}
+
+function wSelectedNames(){
+  return [...document.querySelectorAll('#w-list input.wsel:checked')].map(c => c.value);
+}
+
+function renderWalletList(){
+  const box = document.getElementById('w-list'); box.innerHTML = '';
+  if(walletNames.length === 0){
+    box.append(el('div','sub','No wallets yet. Use “Manage wallets…” to add one.'));
+    return;
+  }
+  // select-all sits above the grid so it doesn't perturb column tracks
+  const sarow = el('div','w-selall');
+  const sa = el('input'); sa.type = 'checkbox'; sa.id = 'w-selall';
+  sa.onchange = () => { document.querySelectorAll('#w-list input.wsel').forEach(c => c.checked = sa.checked); };
+  sarow.append(sa, document.createTextNode(' select all'));
+  box.append(sarow);
+
+  // one grid for every row: checkbox · name · address · balance · rewards.
+  // shared tracks mean the balance and rewards columns line up across all rows.
+  const grid = el('div','wgrid');
+  walletNames.forEach((name, i) => {
+    const cbId = 'wsel-' + i;
+    const c1 = el('div','wc');
+    const cb = el('input'); cb.type = 'checkbox'; cb.className = 'wsel'; cb.value = name;
+    cb.checked = true; cb.id = cbId;
+    c1.append(cb);
+    const c2 = el('div','wc');
+    const nm = el('label','wname', name); nm.setAttribute('for', cbId); c2.append(nm);
+    const c3 = el('div','wc waddr');   // address
+    const c4 = el('div','wc');         // balance
+    const c5 = el('div','wc');         // rewards
+
+    const q = walletQueried[name];
+    if(q){
+      if(q.error){
+        const e = el('span','sub', q.error); e.style.color = 'var(--danger)'; c3.append(e);
+      } else {
+        if(q.address) c3.append(document.createTextNode(q.address.slice(0,12) + '…' + q.address.slice(-6)));
+        if(q.balance_nym != null) c4.append(el('span','pill', fmtNym(q.balance_nym) + ' NYM'
+          + (q.balance_usd != null ? ' · $' + q.balance_usd : '')));
+        else if(q.balance_error) c4.append(el('span','sub', q.balance_error));
+        if(q.rewards_nym != null) c5.append(el('span', 'pill ' + (q.rewards_nym > 0 ? 'ok' : 'muted'),
+          'rewards ' + fmtNym(q.rewards_nym) + ' NYM'));
+        else if(q.rewards_error) c5.append(el('span','sub', q.rewards_error));
+      }
+    }
+    grid.append(c1, c2, c3, c4, c5);
+  });
+  box.append(grid);
+}
+
+function fmtNym(v){
+  const n = Number(v);
+  if(!isFinite(n)) return String(v);
+  return n.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 6});
+}
+
+function openWallets(mode){
+  document.getElementById('w-overlay').classList.add('open');
+  document.getElementById('w-pass').value = '';
+  walletQueried = {};
+  const send = (mode === 'send');
+  document.getElementById('w-send-fields').style.display = send ? 'block' : 'none';
+  // emphasise the action matching the entry point
+  document.getElementById('w-btn-redeem').className = (mode === 'redeem') ? 'primary' : '';
+  document.getElementById('w-btn-send').className = send ? 'primary' : '';
+  document.getElementById('w-btn-query').className = (mode === 'query') ? 'primary' : '';
+  loadWalletList().then(renderWalletList).catch(e => toast(e.message, true));
+}
+function closeWallets(){ document.getElementById('w-overlay').classList.remove('open'); }
+
+function wToggleMax(){
+  const max = document.getElementById('w-sendmax').checked;
+  document.getElementById('w-amount').disabled = max;
+}
+
+function wNeedPass(){
+  const p = document.getElementById('w-pass').value;
+  if(!p){ toast('Enter the wallet password', true); return null; }
+  return p;
+}
+
+async function wQuery(){
+  const names = wSelectedNames();
+  if(names.length === 0){ toast('Select at least one wallet', true); return; }
+  const password = wNeedPass(); if(password === null) return;
+  const btn = document.getElementById('w-btn-query');
+  btn.disabled = true; const t0 = btn.textContent; btn.textContent = 'Querying…';
+  try{
+    const r = await api('/api/wallet/query', {method:'POST', body: JSON.stringify(
+      {wallets: names, password, with_usd: true})});
+    (r.results || []).forEach(row => { walletQueried[row.name] = row; });
+    renderWalletList();
+  }catch(e){ toast(e.message, true); }
+  btn.disabled = false; btn.textContent = t0;
+}
+
+async function wRedeem(){
+  const names = wSelectedNames();
+  if(names.length === 0){ toast('Select at least one wallet', true); return; }
+  const password = wNeedPass(); if(password === null) return;
+  // build a confirmation that shows pending amounts if we've queried them
+  let known = names.filter(n => walletQueried[n] && walletQueried[n].rewards_nym != null);
+  let totalTxt = '';
+  if(known.length){
+    const tot = known.reduce((s,n) => s + Number(walletQueried[n].rewards_nym || 0), 0);
+    totalTxt = '\n\nKnown pending rewards: ' + fmtNym(tot) + ' NYM across ' + known.length + ' wallet(s).';
+  }
+  if(!confirm('Withdraw (claim) operator rewards for ' + names.length + ' wallet(s)?' + totalTxt +
+    '\n\nThis broadcasts a claim transaction — the rewards move into each wallet\'s balance. Irreversible.')) return;
+  const btn = document.getElementById('w-btn-redeem');
+  btn.disabled = true; const t0 = btn.textContent; btn.textContent = 'Withdrawing…';
+  try{
+    const r = await api('/api/wallet/redeem', {method:'POST', body: JSON.stringify(
+      {wallets: names, password, confirm: true})});
+    showWalletResults('Withdraw rewards', r.results, r.csv);
+    // refresh balances/rewards after claiming
+    await wQuery();
+  }catch(e){ toast(e.message, true); }
+  btn.disabled = false; btn.textContent = t0;
+}
+
+async function wSend(){
+  // if send fields hidden (opened in another mode), reveal them first
+  const fields = document.getElementById('w-send-fields');
+  if(fields.style.display === 'none'){
+    fields.style.display = 'block';
+    document.getElementById('w-btn-send').className = 'primary';
+    toast('Enter receiver and amount, then Send again');
+    return;
+  }
+  const names = wSelectedNames();
+  if(names.length === 0){ toast('Select at least one wallet', true); return; }
+  const password = wNeedPass(); if(password === null) return;
+  const receiver = (document.getElementById('w-receiver').value || '').trim();
+  if(!/^n1[a-z0-9]{38,50}$/.test(receiver)){ toast('Invalid receiver address (n1…)', true); return; }
+  const sendMax = document.getElementById('w-sendmax').checked;
+  const amount = parseFloat(document.getElementById('w-amount').value);
+  if(!sendMax && (!(amount > 0))){ toast('Enter an amount > 0 or tick Send max', true); return; }
+
+  const amtTxt = sendMax ? 'the maximum whole-NYM balance' : (fmtNym(amount) + ' NYM');
+  if(!confirm('Send ' + amtTxt + ' from EACH of ' + names.length + ' selected wallet(s)\nto ' +
+    receiver + '?\n\nThis is irreversible.')) return;
+
+  const body = {wallets: names, password, receiver, confirm: true};
+  if(sendMax) body.send_max = true; else body.amount_nym = amount;
+  const btn = document.getElementById('w-btn-send');
+  btn.disabled = true; const t0 = btn.textContent; btn.textContent = 'Sending…';
+  try{
+    const r = await api('/api/wallet/send', {method:'POST', body: JSON.stringify(body)});
+    showWalletResults('Send NYM', r.results);
+    await wQuery();
+  }catch(e){ toast(e.message, true); }
+  btn.disabled = false; btn.textContent = t0;
+}
+
+// dedicated result renderer (amounts + tx output), reusing the results overlay.
+// csvInfo (when withdrawing) = {filename,count,total_nym} for this run's CSV.
+function showWalletResults(title, results, csvInfo){
+  document.getElementById('res-title').textContent = title;
+  const container = document.getElementById('res-body'); container.innerHTML = '';
+  (results || []).forEach(r => {
+    const card = el('div'); card.style.cssText = 'border:1px solid var(--line);border-radius:var(--r);padding:12px;margin-bottom:10px';
+    const head = el('div'); head.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:6px';
+    head.append(el('span','name', r.name));
+    head.append(r.ok ? el('span','pill ok','ok') : el('span','pill bad','failed'));
+    if(r.amount_nym != null) head.append(el('span','pill info', fmtNym(r.amount_nym) + ' NYM'));
+    if(r.rewards_nym != null) head.append(el('span','pill', 'rewards ' + fmtNym(r.rewards_nym) + ' NYM'));
+    card.append(head);
+    if(r.receiver) card.append(el('div','sub mono', '→ ' + r.receiver));
+    if(r.record_note) card.append(el('div','sub', r.record_note));
+    if(r.error){ const e = el('div','sub', r.error); e.style.color = 'var(--danger)'; card.append(e); }
+    if(r.output){ const box = el('div','codebox', r.output); box.style.marginTop = '6px'; card.append(box); }
+    container.append(card);
+  });
+  if(csvInfo !== undefined){
+    const foot = el('div'); foot.style.cssText = 'display:flex;align-items:center;gap:12px;margin-top:4px;padding-top:10px;border-top:1px solid var(--line)';
+    if(csvInfo){
+      foot.append(el('span','sub', '📄 ' + csvInfo.filename + ' · ' + csvInfo.count + ' line(s) · ' + csvInfo.total_nym + ' NYM'));
+      const btn = el('button','primary','Download CSV'); btn.style.marginLeft = 'auto';
+      btn.onclick = () => downloadRewardsFile(csvInfo.filename);
+      foot.append(btn);
+    } else {
+      foot.append(el('span','sub', 'No CSV written (no wallet had a non-zero reward to record).'));
+    }
+    container.append(foot);
+  }
+  document.getElementById('res-overlay').classList.add('open');
+}
+
+// download one dated session CSV via the attachment endpoint
+function downloadRewardsFile(filename){
+  const a = document.createElement('a');
+  a.href = '/api/wallet/rewards-file/' + encodeURIComponent(filename);
+  a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+// list every per-withdrawal CSV, each downloadable
+async function openRewardsFiles(){
+  document.getElementById('res-title').textContent = 'Rewards CSV files';
+  const b = document.getElementById('res-body'); b.innerHTML = 'Loading…';
+  try{
+    const r = await api('/api/wallet/rewards-files');
+    b.innerHTML = '';
+    b.append(el('div','sub', (r.files.length) + ' file(s) · ' + r.total_nym + ' NYM total withdrawn · saved in ' + r.dir));
+    if(r.files.length === 0){
+      b.append(el('div','sub','No withdrawals recorded yet. Each “Withdraw rewards” run writes one dated CSV here.'));
+    }
+    r.files.forEach(f => {
+      const row = el('div'); row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--line)';
+      row.append(el('span','mono', f.filename));
+      row.append(el('span','pill', f.count + ' line(s)'));
+      row.append(el('span','pill ok', f.total_nym + ' NYM'));
+      const dl = el('button','ghost','Download'); dl.style.marginLeft = 'auto';
+      dl.onclick = () => downloadRewardsFile(f.filename);
+      row.append(dl);
+      b.append(row);
+    });
+    document.getElementById('res-overlay').classList.add('open');
+  }catch(e){ toast(e.message, true); }
+}
+
+// ---- manage wallets -------------------------------------------------------
+async function openWalletManage(){
+  document.getElementById('wm-overlay').classList.add('open');
+  document.getElementById('wm-name').value = '';
+  document.getElementById('wm-mnemonic').value = '';
+  document.getElementById('wm-pass').value = '';
+  await renderManageList();
+}
+function closeWalletManage(){ document.getElementById('wm-overlay').classList.remove('open'); }
+
+async function renderManageList(){
+  const box = document.getElementById('wm-list'); box.innerHTML = 'Loading…';
+  try{
+    const info = await api('/api/wallet/list');
+    box.innerHTML = '';
+    const names = info.wallets || [];
+    if(names.length === 0){ box.append(el('div','sub','No wallets stored yet.')); return; }
+    names.forEach(name => {
+      const row = el('div','f2b-node');
+      row.append(el('span','nm', name));
+      const exp = el('button', 'ghost', 'Export'); exp.onclick = () => wmExport(name);
+      const del = el('button', 'ghost', 'Delete'); del.onclick = () => wmDelete(name);
+      del.style.color = 'var(--danger)';
+      row.append(exp, del);
+      box.append(row);
+    });
+  }catch(e){ box.textContent = e.message; }
+}
+
+async function wmAdd(){
+  const name = (document.getElementById('wm-name').value || '').trim();
+  const mnemonic = (document.getElementById('wm-mnemonic').value || '').trim();
+  const password = document.getElementById('wm-pass').value;
+  if(!name || !mnemonic || !password){ toast('Name, mnemonic and password are all required', true); return; }
+  try{
+    await api('/api/wallet/add', {method:'POST', body: JSON.stringify({name, mnemonic, password})});
+    toast('Wallet ' + name + ' added');
+    document.getElementById('wm-name').value = '';
+    document.getElementById('wm-mnemonic').value = '';
+    document.getElementById('wm-pass').value = '';
+    await renderManageList();
+  }catch(e){ toast(e.message, true); }
+}
+
+async function wmExport(name){
+  const password = prompt('Password to decrypt "' + name + '" (mnemonic will be shown):');
+  if(!password) return;
+  try{
+    const r = await api('/api/wallet/export', {method:'POST', body: JSON.stringify({name, password})});
+    // show in the results overlay rather than an alert, so it can be copied
+    document.getElementById('res-title').textContent = 'Mnemonic · ' + name;
+    const b = document.getElementById('res-body'); b.innerHTML = '';
+    const warn = el('div','sub','Anyone with this phrase controls the funds. Close when done.');
+    warn.style.color = 'var(--warn)';
+    const box = el('div','codebox', r.mnemonic);
+    b.append(warn, box);
+    document.getElementById('res-overlay').classList.add('open');
+  }catch(e){ toast(e.message, true); }
+}
+
+async function wmDelete(name){
+  if(!confirm('Delete wallet "' + name + '"?\n\nThis removes the encrypted .enc file from this machine. ' +
+    'The on-chain account is unaffected, but if this is your only copy of the mnemonic it is lost.')) return;
+  try{
+    await api('/api/wallet/delete', {method:'POST', body: JSON.stringify({name, confirm: true})});
+    toast('Deleted ' + name);
+    await renderManageList();
+    walletNames = walletNames.filter(n => n !== name);
+  }catch(e){ toast(e.message, true); }
+}
+
+
+document.getElementById('filter').addEventListener('input', () => { renderTable(); });
+document.getElementById('overlay').addEventListener('click', e => { if(e.target.id === 'overlay') closeModal(); });
+document.getElementById('toggle-overlay').addEventListener('click', e => { if(e.target.id === 'toggle-overlay') closeToggle(); });
+document.getElementById('sf-overlay').addEventListener('click', e => { if(e.target.id === 'sf-overlay') closeSF(); });
+document.getElementById('au-overlay').addEventListener('click', e => { if(e.target.id === 'au-overlay') closeAU(); });
+document.getElementById('up-overlay').addEventListener('click', e => { if(e.target.id === 'up-overlay') closeUp(); });
+document.getElementById('res-overlay').addEventListener('click', e => { if(e.target.id === 'res-overlay') closeRes(); });
+document.getElementById('tput-overlay').addEventListener('click', e => { if(e.target.id === 'tput-overlay') closeTput(); });
+document.getElementById('f2b-overlay').addEventListener('click', e => { if(e.target.id === 'f2b-overlay') closeF2b(); });
+document.getElementById('ssh-overlay').addEventListener('click', e => { if(e.target.id === 'ssh-overlay') closeSsh(); });
+document.getElementById('w-overlay').addEventListener('click', e => { if(e.target.id === 'w-overlay') closeWallets(); });
+document.getElementById('wm-overlay').addEventListener('click', e => { if(e.target.id === 'wm-overlay') closeWalletManage(); });
+document.addEventListener('keydown', e => { if(e.key === 'Escape'){ closeModal(); closeToggle(); closeSF(); closeAU(); closeUp(); closeRes(); closeTput(); closeF2b(); closeSsh(); closeWallets(); closeWalletManage(); } });
+
+health();
+load();
+loadWalletList().catch(()=>{});   // populate the wallet-bar nym-cli note
+fetchTraffic24();                 // real 24h fleet traffic (counter-delta) for the cards
+fetchOnwireAvg();                 // real on-wire average (peers sampler) for the throughput card
+loadThroughput().then(renderTable);
+loadWorld().then(renderMap);
+loadGeoip();
+setInterval(load, 15000);
+setInterval(() => loadThroughput().then(refreshOpenTput), 60000);
+
+// refresh the pinned node's peers in the background — drawWeb sig-skips and the
+// list reconciles in place, so values tick without the map/list flickering
+async function refreshPinned(){
+  if(!mapPinned) return;
+  const n = nodes.find(x => x.uid === mapPinned); const p = nodePositions()[mapPinned];
+  if(!n || !p) return;
+  try{
+    const r = await api('/api/peers', {method: 'POST', body: JSON.stringify({node_id: mapPinned})});
+    peerCache[mapPinned] = Object.assign({at: Date.now()}, sanitizePeers(r));
+  }catch(e){ return; }
+  drawWeb(n, p, peerCache[mapPinned]);
+  refreshList();
+  if(mapActiveUid === mapPinned && !tipHidden && !tipIsItem) showTip(p, tipFor(n, peerCache[mapPinned]));
+}
+setInterval(refreshPinned, 15000);
+</script>
+</body>
+</html>
