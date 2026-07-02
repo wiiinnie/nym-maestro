@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Live database
+maestro.db
+
+# Per-node cert bundles and secrets
+dist/
+
+# Sensitive node data
+recovery_nodes.csv
+
+# Old scratch files
+_old/
