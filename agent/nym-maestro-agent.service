@@ -1,0 +1,17 @@
+[Unit]
+Description=nym maestro agent
+Documentation=https://github.com/wiiinnie/nym-maestro
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/nym-maestro-agent/agent.env
+ExecStart=/usr/bin/python3 /etc/nym-maestro-agent/agent.py
+Restart=on-failure
+RestartSec=3
+User=root
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target
