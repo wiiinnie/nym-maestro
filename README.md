@@ -9,13 +9,14 @@ root shell.
 
 ## Quick start
 
-### Prerequisites
+> **Windows:** use WSL (Ubuntu). Run `wsl --install` in PowerShell, then follow
+> these instructions inside the WSL terminal.
 
-- Mac with Python 3.11+ (the launcher installs it via Homebrew if missing)
-- SSH key access to your nodes
-- `python3` available on each node (`apt install python3`)
+---
 
-### 1. Clone and launch
+### On your Mac (once, ever)
+
+**1. Clone and launch**
 
 ```bash
 git clone git@github.com:wiiinnie/nym-maestro.git
@@ -23,10 +24,10 @@ cd nym-maestro
 ./run.sh
 ```
 
-`run.sh` handles everything: Homebrew, Python, virtualenv, pip dependencies. On
-first run it also opens `http://127.0.0.1:7766` — the dashboard.
+`run.sh` installs Homebrew and Python if missing, creates a virtualenv, installs
+pip dependencies, then starts the orchestrator at `http://127.0.0.1:7766`.
 
-### 2. Initialise the CA (once, ever)
+**2. Initialise the CA**
 
 ```bash
 source .venv/bin/activate
@@ -34,41 +35,134 @@ python pki.py init
 ```
 
 Creates `~/.nym-maestro/pki/` with your CA key and orchestrator cert. Never shared,
-never in the repo.
+never in the repo. Run this once — regenerating the CA invalidates all node certs.
 
-### 3. Add a node
+---
 
-Open the dashboard → **Add node** → enter name (e.g. `AT01`), IP, port (default
-`8443`).
+### Per-node setup — do this for every new VPS
 
-### 4. Enroll and deploy
+The flow for each new node is:
+
+```
+VPS provider → create node → you get root/password access
+       ↓
+Create a sudo user on the node (your deployment user)
+       ↓
+Enable passwordless sudo for that user
+       ↓
+Open port 8443 (the maestro agent port)
+       ↓
+Run enroll + deploy from your Mac (uses password SSH — this is the only time)
+       ↓
+Node appears green in the dashboard
+       ↓
+Use SSH keys panel in UI to install maestro key + disable password login
+```
+
+**3. On the node — create your sudo user (if not already done)**
+
+Log in as root via your VPS provider's console or their provided SSH access:
 
 ```bash
+adduser <your-user>
+usermod -aG sudo <your-user>
+```
+
+**4. On the node — enable passwordless sudo**
+
+Required so the deploy script can run `install.sh` as root without prompting:
+
+```bash
+echo "<your-user> ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/maestro-user
+sudo chmod 440 /etc/sudoers.d/maestro-user
+```
+
+**5. On the node — open port 8443**
+
+The maestro agent listens on port 8443 (mTLS). Open it before deploying:
+
+```bash
+# iptables (Debian/Ubuntu default):
+sudo iptables -I INPUT -p tcp --dport 8443 -j ACCEPT
+sudo apt install -y iptables-persistent
+sudo netfilter-persistent save
+
+# UFW (if active instead):
+sudo ufw allow 8443/tcp
+```
+
+Verify: `sudo iptables -L INPUT -n | grep 8443`
+
+**6. On your Mac — enroll and deploy**
+
+This uses password-based SSH — it is the only time you need the password:
+
+```bash
+source .venv/bin/activate
 python pki.py enroll AT01
+ssh <your-user>@<node-ip> 'rm -rf /tmp/maestro-deploy && mkdir /tmp/maestro-deploy'
+scp dist/AT01/* <your-user>@<node-ip>:/tmp/maestro-deploy/
+ssh <your-user>@<node-ip> 'sudo bash -c "cd /tmp/maestro-deploy && bash install.sh"'
 ```
 
-Then deploy the bundle to the node:
+The agent installs as `nym-maestro-agent.service` (systemd, port 8443).
+
+**7. Add the node in the dashboard**
+
+Open `http://127.0.0.1:7766` → **Add node** → enter name (e.g. `AT01`), IP,
+port (default `8443`). Click **Refresh** or wait 30 s — the node goes green.
+
+**8. Switch to key-based SSH (disable password login)**
+
+Once the node is green, open the **SSH keys** panel in the UI:
+
+1. Copy the maestro public key shown (or use your own)
+2. Click **Install key** — adds it to the node's `~/.ssh/authorized_keys`
+3. Click **Verify login** — confirms key login works before touching password auth
+4. Click **Disable password** — locks down SSH to key-only
+
+From this point on, the maestro key (`~/.nym-maestro/ssh/id_maestro`) is the only
+way in. Add it to `~/.ssh/config` so plain `ssh <your-user>@<host>` uses it:
+
+```
+Host *.your-domain.com
+    User <your-user>
+    IdentityFile ~/.nym-maestro/ssh/id_maestro
+    IdentitiesOnly yes
+```
+
+Set `MAESTRO_SSH_USER` so the orchestrator knows which user to connect as:
 
 ```bash
-ssh <username>@NODE_IP 'rm -rf /tmp/maestro-deploy && mkdir /tmp/maestro-deploy'
-scp dist/AT01/* <username>@NODE_IP:/tmp/maestro-deploy/
-ssh <username>@NODE_IP 'sudo bash -c "cd /tmp/maestro-deploy && bash install.sh"'
+export MAESTRO_SSH_USER=<your-user>
 ```
-
-The agent installs as `nym-maestro-agent.service` (systemd, port 8443). Open that
-port in the node firewall if needed.
-
-### 5. Verify
-
-Click **Refresh** in the dashboard or wait 30 s for the poll. The node goes green
-with live version, roles, WireGuard state, service status and traffic metrics.
 
 ---
 
 ## Fleet rollout
 
-To enroll and deploy to many nodes at once, create a script using the `deploy`
-function pattern — see the deploy checklist below. Always test one node first.
+For multiple nodes, use a deploy script with one `deploy()` call per node. Always
+test on one node first, then roll to the fleet.
+
+```bash
+#!/bin/bash
+SSH_KEY=~/.nym-maestro/ssh/id_maestro
+USER=<your-user>
+
+deploy() {
+  name=$1; ip=$2
+  echo "--- $name ($ip) ---"
+  python pki.py enroll "$name"
+  ssh -i "$SSH_KEY" "$USER"@"$ip" 'rm -rf /tmp/maestro-deploy && mkdir /tmp/maestro-deploy'
+  scp -i "$SSH_KEY" dist/"$name"/* "$USER"@"$ip":/tmp/maestro-deploy/
+  ssh -i "$SSH_KEY" "$USER"@"$ip" 'sudo bash -c "cd /tmp/maestro-deploy && bash install.sh"'
+  echo "--- $name done ---"
+}
+
+deploy AT01 1.2.3.4
+deploy AT02 1.2.3.5
+# ...
+```
 
 ---
 
@@ -101,10 +195,12 @@ Wallet material stays in `~/.nym_wallets` — never in the DB, never on a node.
 | `MAESTRO_PKI` | `~/.nym-maestro/pki` | CA + cert directory |
 | `MAESTRO_POLL` | `30` | Agent poll interval in seconds (0 = disable) |
 | `MAESTRO_ONWIRE_POLL` | `60` | On-wire sampler interval (0 = disable) |
+| `MAESTRO_SSH_USER` | system user | SSH user on each node |
+| `MAESTRO_SSH_DIR` | `~/.nym-maestro/ssh` | Maestro SSH key directory |
 | `MAESTRO_UPLINK_DEVICE` | auto | Override uplink interface detection |
 | `MAESTRO_WALLET_DIR` | `~/.nym_wallets` | Wallet store |
 | `MAESTRO_NYM_CLI` | `nym-cli` | nym-cli binary path |
-| `MAESTRO_NYX_REST` | polkachu, nodes.guru, nymtech, cosmos.directory | Nyx REST endpoints (comma/space separated, tried in order) |
+| `MAESTRO_NYX_REST` | polkachu, nodes.guru, nymtech, cosmos.directory | Nyx REST endpoints |
 | `MAESTRO_REST_UA` | `nym-maestro/1.0` | User-Agent for reward queries |
 | `MAESTRO_MIXNET_CONTRACT` | `n17srj…t0cznr` | Mixnet contract address |
 | `MAESTRO_REWARDS_DIR` | `<wallet_dir>/rewards/` | Rewards CSV output directory |
@@ -149,9 +245,6 @@ the web is a live snapshot.
 
 ### Traffic cards (top row)
 
-**Total traffic · all ports** — `eth0` cumulative since last **reboot**. Every port,
-every byte — your bandwidth bill.
-
 **Total exit traffic** — `nymtun0` + `nymwg` cumulative since last **nym-node
 restart**, WG / Mixnet split, plus real 24h exit volume.
 
@@ -177,13 +270,8 @@ No double-counting: a 1 GB download = ~1 GB OUT, not 2 GB.
 
 ### Two clocks, one explanation
 
-- **All-ports** resets on **reboot** (`eth0` is the physical NIC, nym-node never
-  touches it).
 - **Exit traffic** resets on **nym-node restart** (`nymtun0`/`nymwg` are created by
   nym-node; a restart makes fresh zeroed interfaces).
-
-Restarting nym-node without rebooting resets the exit card but not the all-ports
-card. Not a bug — two different odometers.
 
 ---
 
@@ -201,14 +289,13 @@ Current agent: **0.9.8**
 
 ## Deploy checklist
 
-1. `python app.py` restart + browser hard-refresh (runs additive DB migration).
+1. `./run.sh` restart + browser hard-refresh (runs additive DB migration).
 2. Push agent via **"Update agent"** in the UI — **one node first**, verify green,
    then roll to the fleet.
 3. Sanity check: WireGuard OUT should be the big number; a known download should
    show ~its real size on OUT (not 2×); on-wire mixnet ≫ exit.
 
 Graceful degradation before agent is updated:
-- all-ports Total-traffic needs agent **≥ 0.9.6**
 - WireGuard + Mixnet-exit totals need **≥ 0.9.7**
 - clients/relay on-wire split needs **≥ 0.9.8** (shows `—` until then)
 
@@ -263,16 +350,6 @@ POST   /api/wallet/delete                  remove a wallet .enc (confirm=true)
 GET    /api/wallet/rewards-files           list per-withdrawal CSVs + totals
 GET    /api/wallet/rewards-file/{name}     download one dated withdrawal CSV
 ```
-
-### Rewards CSV (tax / CoinTracking)
-
-Each **Withdraw rewards** run writes a dated CoinTracking CSV:
-`<YYYYMMDD>_nym_rewards.csv` (subsequent same-day runs become `_v2`, `_v3`, …).
-Files live in `<wallet_dir>/rewards/`. Format: Type `Masternode`, currency `NYM2`,
-14 quoted columns, stable Trade ID `nym-withdraw-<wallet>-<unix>`. Only successful
-non-zero withdrawals get a line; sends are transfers, not income, and are not logged.
-
-Overrides: `MAESTRO_CT_TYPE`, `MAESTRO_CT_CURRENCY`.
 
 ### Agent (mTLS, port 8443, on each node)
 
