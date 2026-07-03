@@ -50,9 +50,9 @@ python pki.py enroll AT01
 Then deploy the bundle to the node:
 
 ```bash
-ssh hermes@NODE_IP 'rm -rf /tmp/maestro-deploy && mkdir /tmp/maestro-deploy'
-scp dist/AT01/* hermes@NODE_IP:/tmp/maestro-deploy/
-ssh hermes@NODE_IP 'sudo bash -c "cd /tmp/maestro-deploy && bash install.sh"'
+ssh <username>@NODE_IP 'rm -rf /tmp/maestro-deploy && mkdir /tmp/maestro-deploy'
+scp dist/AT01/* <username>@NODE_IP:/tmp/maestro-deploy/
+ssh <username>@NODE_IP 'sudo bash -c "cd /tmp/maestro-deploy && bash install.sh"'
 ```
 
 The agent installs as `nym-maestro-agent.service` (systemd, port 8443). Open that
