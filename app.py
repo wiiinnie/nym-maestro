@@ -48,7 +48,7 @@ INDEX_PATH = (BASE / "web" / "index.html")
 INDEX_HTML = INDEX_PATH.read_bytes()   # fallback if the file can't be read at request time
 BACKUPS = Path(os.environ.get("MAESTRO_BACKUPS") or (BASE / "backups"))
 SSH_DIR = Path(os.environ.get("MAESTRO_SSH_DIR") or (Path.home() / ".nym-maestro" / "ssh"))
-SSH_USER = os.environ.get("MAESTRO_SSH_USER", "hermes")
+SSH_USER = os.environ.get("MAESTRO_SSH_USER", "")
 
 _COUNTRY_NAME_TO_ISO2 = {
     "austria": "AT", "belgium": "BE", "bulgaria": "BG", "switzerland": "CH",
@@ -1435,8 +1435,17 @@ def agent_local():
 def ssh_key(request: Request):
     _require_pki(request)
     key_path, pub = ensure_ssh_key()
-    return {"private_key_path": key_path, "public_key": pub, "ssh_user": SSH_USER,
-            "known_hosts": str(SSH_DIR / "known_hosts")}
+    home = Path.home()
+    try:
+        display_path = "~/" + str(Path(key_path).relative_to(home))
+    except ValueError:
+        display_path = key_path
+    try:
+        known_hosts_disp = "~/" + str((SSH_DIR / "known_hosts").relative_to(home))
+    except ValueError:
+        known_hosts_disp = str(SSH_DIR / "known_hosts")
+    return {"private_key_path": display_path, "public_key": pub, "ssh_user": SSH_USER,
+            "known_hosts": known_hosts_disp}
 
 
 @app.post("/api/ssh/install")
