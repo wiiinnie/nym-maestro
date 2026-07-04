@@ -1588,7 +1588,7 @@ EB_CACHE = EB_STATE_DIR + "/blocklist.txt"
 EB_URL_FILE = EB_STATE_DIR + "/list_url"
 EB_CHAIN = "NYM-EXIT"
 EB_CHAIN6 = os.environ.get("MAESTRO_NYM_EXIT6", "NYM-EXIT")  # ip6tables chain (same name by default)
-EB_DEFAULT_LIST_URL = ("https://raw.githubusercontent.com/wiiinnie/nym-maestro/
+EB_DEFAULT_LIST_URL = ("https://raw.githubusercontent.com/wiiinnie/nym-maestro/"
                        "refs/heads/main/blocklist.txt")
 
 EB_SCRIPT = r"""#!/usr/bin/env bash
