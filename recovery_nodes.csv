@@ -1,7 +1,0 @@
-name,ip,hostname,node_id
-AT01,152.53.92.255,nym-exit-at01.hermes-stakepool.de,default-nym-node
-AT02,188.172.228.15,nym-exit-at02.hermes-stakepool.de,default-nym-node
-BE01,141.227.186.52,nym-exit-be01.hermes-stakepool.de,default-nym-node
-BG01,185.103.166.153,nym-exit-bg01.hermes-stakepool.de,default-nym-node
-CH01,141.227.148.103,nym-exit-ch01.hermes-stakepool.de,default-nym-node
-CH02,141.227.149.187,nym-exit-ch02.hermes-stakepool.de,default-nym-node
