@@ -647,6 +647,21 @@ def act_upgrade(params):
         _download(url, tmp, timeout=300)
     except Exception as e:
         return {"ok": False, "error": f"download failed: {e}", "output": "\n".join(log)}
+    # Integrity-gate the binary before it is made executable and run as root.
+    # (act_update_agent already verifies its pushed payload this way; upgrade did not,
+    #  so a compromised/typo'd download URL meant arbitrary root code.)
+    want_sha = (params.get("sha256") or "").strip().lower()
+    if want_sha:
+        got_sha = _sha256_file(tmp)
+        if got_sha != want_sha:
+            with contextlib.suppress(Exception):
+                os.remove(tmp)
+            return {"ok": False,
+                    "error": f"sha256 mismatch: expected {want_sha}, got {got_sha}; "
+                             "left old binary in place",
+                    "output": "\n".join(log)}
+        log.append(f"sha256 verified: {got_sha}")
+
     try:
         os.chmod(tmp, 0o755)
     except Exception:
