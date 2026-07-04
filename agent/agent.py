@@ -1006,7 +1006,7 @@ def act_fail2ban_unban(params):
 # user's ~/.ssh/authorized_keys (owned by the user), NOT root's. Hardening sets
 # PasswordAuthentication no + PermitRootLogin no for the whole daemon.
 
-SSH_USER_DEFAULT = os.environ.get("MAESTRO_SSH_USER", "hermes")
+SSH_USER_DEFAULT = os.environ.get("MAESTRO_SSH_USER", "")
 SSH_MAIN = "/etc/ssh/sshd_config"
 SSH_DROPIN_DIR = "/etc/ssh/sshd_config.d"
 # 00- prefix so sshd (first-match-wins) reads our value BEFORE 50-cloud-init.conf etc.
@@ -1588,7 +1588,7 @@ EB_CACHE = EB_STATE_DIR + "/blocklist.txt"
 EB_URL_FILE = EB_STATE_DIR + "/list_url"
 EB_CHAIN = "NYM-EXIT"
 EB_CHAIN6 = os.environ.get("MAESTRO_NYM_EXIT6", "NYM-EXIT")  # ip6tables chain (same name by default)
-EB_DEFAULT_LIST_URL = ("https://raw.githubusercontent.com/wiiinnie/nym_node_manager/"
+EB_DEFAULT_LIST_URL = ("https://raw.githubusercontent.com/wiiinnie/nym-maestro/
                        "refs/heads/main/blocklist.txt")
 
 EB_SCRIPT = r"""#!/usr/bin/env bash
