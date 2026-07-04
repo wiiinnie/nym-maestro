@@ -1630,6 +1630,19 @@ else
     echo "$CHAIN6 (v6) not present / ip6tables unavailable; skipping IPv6 blocks" >&2
 fi
 
+# Per-source rate-limit: allow established flows + up to 50 new conn/sec per source IP;
+# drop excess. Remove any prior copies first so re-runs don't stack duplicates.
+if [ "$have4" = 1 ]; then
+    iptables -D "$CHAIN" -p tcp -m conntrack --ctstate NEW -j DROP 2>/dev/null || true
+    iptables -D "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit         --hashlimit-mode srcip --hashlimit-upto 50/sec --hashlimit-burst 200         --hashlimit-name nym_scan -j ACCEPT 2>/dev/null || true
+    iptables -D "$CHAIN" -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+
+    iptables -I "$CHAIN" -p tcp -m conntrack --ctstate NEW -j DROP
+    iptables -I "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit         --hashlimit-mode srcip --hashlimit-upto 50/sec --hashlimit-burst 200         --hashlimit-name nym_scan -j ACCEPT
+    iptables -I "$CHAIN" -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    echo "applied rate-limit rules to $CHAIN"
+fi
+
 c4=0; c6=0
 while IFS= read -r line; do
     ip="${line%%#*}"; ip="$(echo "$ip" | xargs)"   # strip comments/whitespace
@@ -1931,6 +1944,30 @@ def act_extra_blocks_install(params):
     }
 
 
+def act_extra_blocks_upgrade(params):
+    """Rewrite the runtime script (EB_SH) from the agent's built-in template,
+    preserving the currently configured list_url, then restart the service so
+    the new script runs immediately. Use this to push rate-limit or script
+    logic changes fleet-wide without re-running the external installer."""
+    list_url = _eb_url()
+    log = [f"rewriting {EB_SH} from built-in template (url: {list_url})"]
+    ok, err, meta = _eb_write_files(list_url)
+    if not ok:
+        return {"ok": False, "error": err, "output": "\n".join(log)}
+    log.append("script and unit rewritten")
+    rc, out, errx = _run(["systemctl", "restart", EB_UNIT_NAME], timeout=90)
+    log.append("restarted extra-blocks: " + ("ok" if rc == 0 else "FAILED " + (errx or out).strip()))
+    after = _eb_verify(list_url)
+    return {
+        "ok": rc == 0,
+        "list_url": list_url,
+        "after": after,
+        "state": _extra_blocks_state(),
+        "output": "\n".join(log),
+        "error": None if rc == 0 else "service restart failed after script update",
+    }
+
+
 def act_extra_blocks_verify(params):
     """Confirm the blocks are in place — e.g. after a manual nym-node restart."""
     url = params.get("list_url") or _eb_url()
@@ -1989,6 +2026,7 @@ EXEC_ACTIONS = {
     "ssh_harden": act_ssh_harden,
     "extra_blocks_status": act_extra_blocks_status,
     "extra_blocks_install": act_extra_blocks_install,
+    "extra_blocks_upgrade": act_extra_blocks_upgrade,
     "extra_blocks_verify": act_extra_blocks_verify,
     "extra_blocks_remove": act_extra_blocks_remove,
     "peers": act_peers,

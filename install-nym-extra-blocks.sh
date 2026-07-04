@@ -13,7 +13,7 @@ UNIT=/etc/systemd/system/nym-extra-blocks.service
 cat > "$SCRIPT" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-LIST_URL="https://raw.githubusercontent.com/wiiinnie/nym_node_manager/refs/heads/main/blocklist.txt"
+LIST_URL="https://raw.githubusercontent.com/wiiinnie/nym-maestro/refs/heads/main/blocklist.txt"
 CACHE="/var/lib/nym-extra-blocks/blocklist.txt"
 CHAIN="NYM-EXIT"
 IP_RE='^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$'

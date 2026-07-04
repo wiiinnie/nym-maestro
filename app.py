@@ -1157,6 +1157,16 @@ async def extra_blocks_install(payload: ExtraBlocksInstallRequest, request: Requ
     return {"job_id": job_id, "status": status, "results": results}
 
 
+@app.post("/api/extra-blocks/upgrade")
+async def extra_blocks_upgrade(payload: ExtraBlocksRequest, request: Request):
+    _require_pki(request)
+    store = request.app.state.store
+    nodes = store.get_nodes_by_ids(payload.node_ids)
+    results = await _f2b_fanout(request.app, store, nodes, "extra_blocks_upgrade", {}, 60,
+                                "extra_blocks_upgrade")
+    return {"results": results}
+
+
 @app.post("/api/extra-blocks/verify")
 async def extra_blocks_verify(payload: ExtraBlocksRequest, request: Request):
     store, nodes = _eb_targets(request, payload.node_ids)
