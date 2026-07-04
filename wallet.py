@@ -12,9 +12,9 @@ broadcasts to the Nyx chain. Keeping keys off the internet-facing nodes is the
 whole point — a compromised exit node must never be able to spend operator funds.
 
 Secrets never touch a command line: the wallet password is handed to openssl via
-an environment variable (env:VAR), not argv, so it isn't visible in `ps`. The one
-unavoidable exception is nym-cli's own `--mnemonic` flag (that's the interface it
-offers); those invocations are brief and local to the operator's machine.
+an environment variable (env:VAR), and the mnemonic is handed to nym-cli via its
+MNEMONIC env var (nym-cli's documented fallback for --mnemonic), not argv, so
+neither is ever visible in `ps`.
 
 Nothing in this module logs a mnemonic or a password.
 
@@ -231,7 +231,8 @@ def delete_wallet(name: str) -> None:
 def derive_address(mnemonic: str) -> str:
     if not have_nym_cli():
         raise WalletError("nym-cli not found in PATH")
-    rc, out, err = _run([NYM_CLI, "account", "pub-key", "--mnemonic", mnemonic], T_QUICK)
+    rc, out, err = _run([NYM_CLI, "account", "pub-key"], T_QUICK,
+                        env_extra={"MNEMONIC": mnemonic})
     blob = (out + "\n" + err)
     m = _ADDR_EXTRACT.search(blob)
     if not m:
@@ -300,8 +301,8 @@ def claim_rewards(mnemonic: str) -> dict:
     if not have_nym_cli():
         raise WalletError("nym-cli not found in PATH")
     rc, out, err = _run(
-        [NYM_CLI, "mixnet", "operators", "nymnode", "rewards", "claim", "--mnemonic", mnemonic],
-        T_TX)
+        [NYM_CLI, "mixnet", "operators", "nymnode", "rewards", "claim"],
+        T_TX, env_extra={"MNEMONIC": mnemonic})
     ok = rc == 0
     return {"ok": ok, "output": _tail(out if ok else (err or out))}
 
@@ -315,8 +316,8 @@ def send(receiver: str, amount_unym: int, mnemonic: str) -> dict:
     if int(amount_unym) <= 0:
         raise WalletError("amount must be positive")
     rc, out, err = _run(
-        [NYM_CLI, "account", "send", receiver, str(int(amount_unym)), "--mnemonic", mnemonic],
-        T_TX)
+        [NYM_CLI, "account", "send", receiver, str(int(amount_unym))],
+        T_TX, env_extra={"MNEMONIC": mnemonic})
     ok = rc == 0
     return {"ok": ok, "output": _tail(out if ok else (err or out))}
 
