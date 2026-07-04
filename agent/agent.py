@@ -1995,6 +1995,27 @@ EXEC_ACTIONS = {
 }
 
 
+ORCHESTRATOR_CN = os.environ.get("MAESTRO_ORCHESTRATOR_CN", "nym-maestro-orchestrator")
+
+
+def _peer_common_name(sock):
+    """Common Name from the peer's (already CA-verified) client certificate.
+
+    mTLS guarantees the presented cert chains to our CA, but not *which* CA-signed
+    cert it is. Every node's server cert is signed by the same CA, so without this
+    check a single compromised node could authenticate to a sibling agent and drive
+    it as root. Pin the client identity to the orchestrator CN."""
+    try:
+        cert = sock.getpeercert() or {}
+    except Exception:
+        return None
+    for rdn in cert.get("subject", ()):
+        for key, val in rdn:
+            if key == "commonName":
+                return val
+    return None
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "nym-maestro-agent/" + AGENT_VERSION
     timeout = 30   # bound a stalled client mid-request (applied after handshake)
@@ -2018,7 +2039,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _client_is_orchestrator(self):
+        cn = _peer_common_name(self.request)
+        if cn == ORCHESTRATOR_CN:
+            return True
+        self._send(403, {"error": "client certificate is not the maestro orchestrator"})
+        return False
+
     def do_GET(self):
+        if not self._client_is_orchestrator():
+            return
         if self.path == "/v1/health":
             self._send(200, {"status": "ok", "agent_version": AGENT_VERSION})
         elif self.path == "/v1/status":
@@ -2050,6 +2080,8 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def do_POST(self):
+        if not self._client_is_orchestrator():
+            return
         if self.path != "/v1/exec":
             self._send(404, {"error": "not found"})
             return
