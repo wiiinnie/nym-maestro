@@ -2045,7 +2045,22 @@ function renderTable(){
     tr.append(nameTd);
 
     const vTd = el('td');
-    vTd.append(s && s.version ? el('span','mono', s.version) : dash());
+    const vWrap = el('div');
+    vWrap.style.display = 'flex';
+    vWrap.style.flexDirection = 'column';
+    vWrap.style.gap = '2px';
+    vWrap.append(s && s.version ? el('span','mono', s.version) : dash());
+    if(s && s.agent_version){
+      const av = el('span','sub', 'agent ' + s.agent_version);
+      av.style.fontSize = '11px';
+      av.style.whiteSpace = 'nowrap';
+      if(s.agent_stale) av.style.color = 'var(--warn, #d9933a)';
+      av.title = s.agent_stale
+        ? 'Agent ' + s.agent_version + ' is older than the orchestrator (' + (s.local_agent_version || '?') + '). Select this node and click Update agent.'
+        : 'nym-maestro agent version running on this node';
+      vWrap.append(av);
+    }
+    vTd.append(vWrap);
     tr.append(vTd);
 
     tr.append(rolesCell(s));
@@ -2703,11 +2718,59 @@ async function unbanIp(uid, ip){
 }
 
 // ===== Extra blocks (NYM-EXIT abuse blocklist) ============================
+function fmtBurstShort(n){
+  if(n == null) return '?';
+  if(n >= 1000 && n % 1000 === 0) return (n/1000) + 'k';
+  if(n >= 1000) return (n/1000).toFixed(1).replace(/\.0$/,'') + 'k';
+  return String(n);
+}
+
 function extraBlocksBadge(s){
   const eb = s && s.extra_blocks;
   if(!eb || !eb.installed) return el('span','pill muted','Missing');
-  if(eb.active) return el('span','pill ok','Active');
-  return el('span','pill warn','Inactive');
+
+  const wrap = el('div');
+  wrap.style.display = 'flex';
+  wrap.style.flexDirection = 'column';
+  wrap.style.gap = '3px';
+  wrap.style.alignItems = 'flex-start';
+
+  // line 1: state pill
+  wrap.append(eb.active ? el('span','pill ok','Active') : el('span','pill warn','Inactive'));
+
+  // line 2: blocked IP count (our blocklist entries present in the chain)
+  if(eb.blocked_count != null){
+    const size = eb.blocklist_size;
+    const txt = (size != null && eb.blocked_count < size)
+      ? eb.blocked_count + '/' + size + ' IPs blocked'
+      : eb.blocked_count + ' IPs blocked';
+    const line = el('span','sub', txt);
+    line.style.fontSize = '11px';
+    line.style.whiteSpace = 'nowrap';
+    if(size != null && eb.blocked_count < size) line.style.color = 'var(--warn, #d9933a)';
+    line.title = 'Your blocklist REJECT rules present in NYM-EXIT (not the node-wide exit policy, which adds hundreds more).';
+    wrap.append(line);
+  }
+
+  // line 3: rate / burst
+  if(eb.rate_limit_active && eb.rate_limit_rate){
+    const line = el('span','sub', eb.rate_limit_rate + ' · burst ' + fmtBurstShort(eb.rate_limit_burst));
+    line.style.fontSize = '11px';
+    line.style.whiteSpace = 'nowrap';
+    line.title = 'Per-source-IP connection rate-limit: new TCP connections up to ' +
+      eb.rate_limit_rate + ' (burst ' + (eb.rate_limit_burst != null ? eb.rate_limit_burst : '?') +
+      ') per source IP are accepted; excess dropped. Established flows never limited.';
+    wrap.append(line);
+  } else if(eb.rate_limit_active === false){
+    const line = el('span','sub','no rate-limit');
+    line.style.fontSize = '11px';
+    line.style.whiteSpace = 'nowrap';
+    line.style.color = 'var(--warn, #d9933a)';
+    line.title = 'No per-source rate-limit rule in NYM-EXIT — run section 1 (Install / Update script) to apply it.';
+    wrap.append(line);
+  }
+
+  return wrap;
 }
 
 let ebTargets = [];

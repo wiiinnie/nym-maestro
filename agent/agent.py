@@ -39,7 +39,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-AGENT_VERSION = "0.9.8"
+AGENT_VERSION = "0.9.9"
 
 try:
     with open(os.path.abspath(__file__), "rb") as _sf:
@@ -1695,14 +1695,67 @@ def _eb_is(state_cmd):
     return out.strip()
 
 
+def _eb_chain_summary():
+    """Live summary for the fleet column. Returns (blocked_count, blocklist_size,
+    rate, burst).
+
+    blocked_count is how many of OUR blocklist entries are actually present in the
+    chain — NOT the total REJECT count. The NYM-EXIT chain also carries hundreds of
+    REJECTs from nym-node's own exit policy; counting all of them would be
+    misleading (it would show ~432 when our blocklist has only a handful). We use
+    the same blocklist-aware count as _eb_verify().
+
+    rate/burst come from parsing the per-source hashlimit line. Fields that can't
+    be read come back as None."""
+    blocked = None
+    blocklist_size = None
+    try:
+        entries = _eb_fetch_entries(None)
+        v4 = [e for e in entries if _eb_family(e) == 4]
+        v6 = [e for e in entries if _eb_family(e) == 6]
+        _, d4 = _eb_chain_rules("iptables", EB_CHAIN)
+        if _eb_v6_supported():
+            _, d6 = _eb_chain_rules("ip6tables", EB_CHAIN6)
+        else:
+            d6 = set()
+        blocked = _eb_present(v4, d4) + _eb_present(v6, d6)
+        blocklist_size = len(entries)
+    except Exception:
+        blocked = None
+        blocklist_size = None
+
+    rate = None
+    burst = None
+    try:
+        rc, out, _ = _run(["iptables", "-L", EB_CHAIN, "-n", "-v"], timeout=10)
+        if rc == 0:
+            m = re.search(r"limit:\s*up to\s+(\d+/\w+)\s+burst\s+(\d+)\s+mode\s+srcip", out)
+            if m:
+                rate = m.group(1)
+                burst = int(m.group(2))
+    except Exception:
+        pass
+
+    return blocked, blocklist_size, rate, burst
+
+
 def _extra_blocks_state():
-    """Lightweight state for the fleet column (no iptables/network calls)."""
+    """State for the fleet column. One lightweight iptables read gives the live
+    blocked-IP count (OUR blocklist entries present in the chain, not the whole
+    exit policy) and the active per-source rate/burst, so the overview can show
+    them without opening the modal."""
     if not _eb_installed():
         return {"installed": False, "enabled": False, "active": False, "state": "missing"}
     active = _eb_is("is-active") == "active"
     enabled = _eb_is("is-enabled") in ("enabled", "enabled-runtime", "static", "alias")
+    blocked, blocklist_size, rate, burst = _eb_chain_summary()
     return {"installed": True, "enabled": enabled, "active": active,
-            "state": "active" if active else "inactive"}
+            "state": "active" if active else "inactive",
+            "blocked_count": blocked,
+            "blocklist_size": blocklist_size,
+            "rate_limit_active": (rate is not None),
+            "rate_limit_rate": rate,
+            "rate_limit_burst": burst}
 
 
 def _eb_url():
