@@ -2044,9 +2044,18 @@ def act_extra_blocks_install_script(params):
         "https://raw.githubusercontent.com/wiiinnie/nym-maestro/"
         "refs/heads/main/install-nym-extra-blocks.sh"
     )
+    # cache-bust raw.githubusercontent (its CDN caches aggressively) so we always
+    # get the current file, not a stale edge copy.
+    fetch_url = installer_url
+    sep = "&" if "?" in fetch_url else "?"
+    fetch_url = f"{fetch_url}{sep}t={int(time.time())}"
     log = [f"fetching installer from {installer_url}"]
     try:
-        req = urllib.request.Request(installer_url, headers={"User-Agent": "nym-maestro-agent"})
+        req = urllib.request.Request(fetch_url, headers={
+            "User-Agent": "nym-maestro-agent",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        })
         with urllib.request.urlopen(req, timeout=30) as resp:
             script = resp.read()
         log.append(f"downloaded {len(script)} bytes")
@@ -2095,9 +2104,18 @@ def act_extra_blocks_install_script(params):
         "https://raw.githubusercontent.com/wiiinnie/nym-maestro/"
         "refs/heads/main/install-nym-extra-blocks.sh"
     )
+    # cache-bust raw.githubusercontent (its CDN caches aggressively) so we always
+    # get the current file, not a stale edge copy.
+    fetch_url = installer_url
+    sep = "&" if "?" in fetch_url else "?"
+    fetch_url = f"{fetch_url}{sep}t={int(time.time())}"
     log = [f"fetching installer from {installer_url}"]
     try:
-        req = urllib.request.Request(installer_url, headers={"User-Agent": "nym-maestro-agent"})
+        req = urllib.request.Request(fetch_url, headers={
+            "User-Agent": "nym-maestro-agent",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        })
         with urllib.request.urlopen(req, timeout=30) as resp:
             script = resp.read()
         log.append(f"downloaded {len(script)} bytes")
