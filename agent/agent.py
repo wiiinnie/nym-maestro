@@ -1634,11 +1634,11 @@ fi
 # drop excess. Remove any prior copies first so re-runs don't stack duplicates.
 if [ "$have4" = 1 ]; then
     iptables -D "$CHAIN" -p tcp -m conntrack --ctstate NEW -j DROP 2>/dev/null || true
-    iptables -D "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit         --hashlimit-mode srcip --hashlimit-upto 50/sec --hashlimit-burst 200         --hashlimit-name nym_scan -j ACCEPT 2>/dev/null || true
+    iptables -D "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit         --hashlimit-mode srcip --hashlimit-upto 200/sec --hashlimit-burst 1000         --hashlimit-name nym_scan -j ACCEPT 2>/dev/null || true
     iptables -D "$CHAIN" -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 
     iptables -I "$CHAIN" -p tcp -m conntrack --ctstate NEW -j DROP
-    iptables -I "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit         --hashlimit-mode srcip --hashlimit-upto 50/sec --hashlimit-burst 200         --hashlimit-name nym_scan -j ACCEPT
+    iptables -I "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit         --hashlimit-mode srcip --hashlimit-upto 200/sec --hashlimit-burst 1000         --hashlimit-name nym_scan -j ACCEPT
     iptables -I "$CHAIN" -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
     echo "applied rate-limit rules to $CHAIN"
 fi
@@ -1818,6 +1818,25 @@ def act_extra_blocks_status(params):
     st["chain6"] = EB_CHAIN6
     st["list_url"] = _eb_url()
     st.update({k: v for k, v in _eb_verify().items() if k != "ok"})
+    # parse rate limit values from the live iptables chain
+    rate_limit_active = False
+    rate_limit_rate = None
+    rate_limit_burst = None
+    try:
+        rc, out, _ = _run(["iptables", "-L", EB_CHAIN, "-n", "-v"], timeout=10)
+        # iptables prints hashlimit as "limit: up to 50/sec burst 200 mode srcip"
+        # (no literal "hashlimit"), so detect the per-source limit line directly.
+        if rc == 0:
+            m_rate = re.search(r"limit:\s*up to\s+(\d+/\w+)\s+burst\s+(\d+)\s+mode\s+srcip", out)
+            if m_rate:
+                rate_limit_active = True
+                rate_limit_rate = m_rate.group(1)
+                rate_limit_burst = int(m_rate.group(2))
+    except Exception:
+        pass
+    st["rate_limit_active"] = rate_limit_active
+    st["rate_limit_rate"] = rate_limit_rate
+    st["rate_limit_burst"] = rate_limit_burst
     return st
 
 
@@ -1944,6 +1963,57 @@ def act_extra_blocks_install(params):
     }
 
 
+def act_extra_blocks_restart_service(params):
+    """Restart nym-extra-blocks.service — re-fetches the blocklist and re-applies
+    all REJECT rules + rate-limit to the running NYM-EXIT chain."""
+    log = ["restarting nym-extra-blocks.service"]
+    rc, out, errx = _run(["systemctl", "restart", EB_UNIT_NAME], timeout=90)
+    log.append("restart: " + ("ok" if rc == 0 else "FAILED " + (errx or out).strip()))
+    return {
+        "ok": rc == 0,
+        "state": _extra_blocks_state(),
+        "output": "\n".join(log),
+        "error": None if rc == 0 else "service restart failed",
+    }
+
+
+def act_extra_blocks_install_script(params):
+    """Fetch install-nym-extra-blocks.sh from GitHub and run it as root.
+    Sets up the systemd unit, rate limiting, and applies the blocklist."""
+    import urllib.request, tempfile, os
+    installer_url = params.get("installer_url") or (
+        "https://raw.githubusercontent.com/wiiinnie/nym-maestro/"
+        "refs/heads/main/install-nym-extra-blocks.sh"
+    )
+    log = [f"fetching installer from {installer_url}"]
+    try:
+        with urllib.request.urlopen(installer_url, timeout=30) as resp:
+            script = resp.read()
+        log.append(f"downloaded {len(script)} bytes")
+    except Exception as e:
+        return {"ok": False, "error": f"fetch failed: {e}", "output": "\n".join(log)}
+
+    # write to a temp file and run as root
+    with tempfile.NamedTemporaryFile(suffix=".sh", delete=False, mode="wb") as f:
+        f.write(script)
+        tmp = f.name
+    try:
+        os.chmod(tmp, 0o700)
+        rc, out, errx = _run(["bash", tmp], timeout=120)
+        log.append(out or "")
+        if errx: log.append(errx)
+        log.append("installer: " + ("ok" if rc == 0 else "FAILED"))
+    finally:
+        try: os.unlink(tmp)
+        except: pass
+    return {
+        "ok": rc == 0,
+        "state": _extra_blocks_state(),
+        "output": "\n".join(log),
+        "error": None if rc == 0 else "installer exited with error",
+    }
+
+
 def act_extra_blocks_upgrade(params):
     """Rewrite the runtime script (EB_SH) from the agent's built-in template,
     preserving the currently configured list_url, then restart the service so
@@ -1965,6 +2035,108 @@ def act_extra_blocks_upgrade(params):
         "state": _extra_blocks_state(),
         "output": "\n".join(log),
         "error": None if rc == 0 else "service restart failed after script update",
+    }
+
+
+def act_extra_blocks_install_script(params):
+    """Fetch install-nym-extra-blocks.sh from GitHub and run it as root."""
+    installer_url = (params.get("installer_url") or "").strip() or (
+        "https://raw.githubusercontent.com/wiiinnie/nym-maestro/"
+        "refs/heads/main/install-nym-extra-blocks.sh"
+    )
+    log = [f"fetching installer from {installer_url}"]
+    try:
+        req = urllib.request.Request(installer_url, headers={"User-Agent": "nym-maestro-agent"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            script = resp.read()
+        log.append(f"downloaded {len(script)} bytes")
+    except Exception as e:
+        return {"ok": False, "error": f"fetch failed: {e}", "output": "\n".join(log)}
+    fd, tmp = tempfile.mkstemp(suffix=".sh", prefix="maestro-install-")
+    rc = 1
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(script)
+        os.chmod(tmp, 0o700)
+        rc, out, errx = _run(["bash", tmp], timeout=180)
+        log.append((out or "").strip())
+        if errx and errx.strip():
+            log.append(errx.strip())
+        log.append("installer: " + ("ok" if rc == 0 else f"FAILED (exit {rc})"))
+    except Exception as e:
+        return {"ok": False, "error": f"run failed: {e}", "output": "\n".join(log)}
+    finally:
+        with contextlib.suppress(Exception):
+            os.unlink(tmp)
+    return {
+        "ok": rc == 0,
+        "state": _extra_blocks_state(),
+        "output": "\n".join(log),
+        "error": None if rc == 0 else f"installer exited with code {rc}",
+    }
+
+
+def act_extra_blocks_restart_service(params):
+    """Restart nym-extra-blocks.service without touching nym-node."""
+    log = [f"restarting {EB_UNIT_NAME}"]
+    rc, out, errx = _run(["systemctl", "restart", EB_UNIT_NAME], timeout=90)
+    log.append("restart: " + ("ok" if rc == 0 else "FAILED " + (errx or out).strip()))
+    return {
+        "ok": rc == 0,
+        "state": _extra_blocks_state(),
+        "output": "\n".join(log),
+        "error": None if rc == 0 else "service restart failed",
+    }
+
+
+def act_extra_blocks_install_script(params):
+    """Fetch install-nym-extra-blocks.sh from GitHub and run it as root."""
+    installer_url = (params.get("installer_url") or "").strip() or (
+        "https://raw.githubusercontent.com/wiiinnie/nym-maestro/"
+        "refs/heads/main/install-nym-extra-blocks.sh"
+    )
+    log = [f"fetching installer from {installer_url}"]
+    try:
+        req = urllib.request.Request(installer_url, headers={"User-Agent": "nym-maestro-agent"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            script = resp.read()
+        log.append(f"downloaded {len(script)} bytes")
+    except Exception as e:
+        return {"ok": False, "error": f"fetch failed: {e}", "output": "\n".join(log)}
+    fd, tmp = tempfile.mkstemp(suffix=".sh", prefix="maestro-install-")
+    rc = 1
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(script)
+        os.chmod(tmp, 0o700)
+        rc, out, errx = _run(["bash", tmp], timeout=180)
+        log.append((out or "").strip())
+        if errx and errx.strip():
+            log.append(errx.strip())
+        log.append("installer: " + ("ok" if rc == 0 else f"FAILED (exit {rc})"))
+    except Exception as e:
+        return {"ok": False, "error": f"run failed: {e}", "output": "\n".join(log)}
+    finally:
+        with contextlib.suppress(Exception):
+            os.unlink(tmp)
+    return {
+        "ok": rc == 0,
+        "state": _extra_blocks_state(),
+        "output": "\n".join(log),
+        "error": None if rc == 0 else f"installer exited with code {rc}",
+    }
+
+
+def act_extra_blocks_restart_service(params):
+    """Restart nym-extra-blocks.service without touching nym-node."""
+    log = [f"restarting {EB_UNIT_NAME}"]
+    rc, out, errx = _run(["systemctl", "restart", EB_UNIT_NAME], timeout=90)
+    log.append("restart: " + ("ok" if rc == 0 else "FAILED " + (errx or out).strip()))
+    return {
+        "ok": rc == 0,
+        "state": _extra_blocks_state(),
+        "output": "\n".join(log),
+        "error": None if rc == 0 else "service restart failed",
     }
 
 
@@ -2026,6 +2198,8 @@ EXEC_ACTIONS = {
     "ssh_harden": act_ssh_harden,
     "extra_blocks_status": act_extra_blocks_status,
     "extra_blocks_install": act_extra_blocks_install,
+    "extra_blocks_install_script": act_extra_blocks_install_script,
+    "extra_blocks_restart_service": act_extra_blocks_restart_service,
     "extra_blocks_upgrade": act_extra_blocks_upgrade,
     "extra_blocks_verify": act_extra_blocks_verify,
     "extra_blocks_remove": act_extra_blocks_remove,

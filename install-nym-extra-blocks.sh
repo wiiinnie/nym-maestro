@@ -13,7 +13,7 @@ UNIT=/etc/systemd/system/nym-extra-blocks.service
 cat > "$SCRIPT" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-LIST_URL="https://raw.githubusercontent.com/wiiinnie/nym_node_manager/refs/heads/main/blocklist.txt"
+LIST_URL="https://raw.githubusercontent.com/wiiinnie/nym-maestro/refs/heads/main/blocklist.txt"
 CACHE="/var/lib/nym-extra-blocks/blocklist.txt"
 CHAIN="NYM-EXIT"
 IP_RE='^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$'
@@ -28,18 +28,13 @@ fi
 
 iptables -nL "$CHAIN" >/dev/null 2>&1 || { echo "$CHAIN not present yet"; exit 0; }
 
-# --- per-source scan/enumeration rate-limit ---
+# per-source scan/enumeration rate-limit.
 # Remove any prior copies first so re-runs don't stack duplicates, then insert.
-# -I pushes to top, so after these three inserts the final order is:
-#   1) ESTABLISHED/RELATED accept  2) NEW up-to-rate accept  3) NEW over-rate drop
-# Remove current (loosened) rules if present:
+# -I pushes to top, so insert in reverse of desired order:
+#   final order -> 1) ESTABLISHED/RELATED accept  2) NEW up-to-rate accept  3) NEW over-rate drop
 iptables -D "$CHAIN" -p tcp -m conntrack --ctstate NEW -j DROP 2>/dev/null || true
 iptables -D "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit \
     --hashlimit-mode srcip --hashlimit-upto 200/sec --hashlimit-burst 1000 \
-    --hashlimit-name nym_scan -j ACCEPT 2>/dev/null || true
-# Also remove the OLD tighter rule (50/sec burst 200) if it lingers from a prior install:
-iptables -D "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit \
-    --hashlimit-mode srcip --hashlimit-upto 50/sec --hashlimit-burst 200 \
     --hashlimit-name nym_scan -j ACCEPT 2>/dev/null || true
 iptables -D "$CHAIN" -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 
@@ -49,7 +44,7 @@ iptables -I "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit \
     --hashlimit-name nym_scan -j ACCEPT
 iptables -I "$CHAIN" -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
-# --- destination IP blocks (inserted last => end up above the rate-limit rules => evaluated first) ---
+# destination IP blocks (inserted last => end up above the rate-limit rules => evaluated first)
 count=0
 if [ -f "$CACHE" ]; then
   while IFS= read -r line; do
@@ -62,7 +57,7 @@ if [ -f "$CACHE" ]; then
   done < "$CACHE"
 fi
 
-echo "applied rate-limit (200/sec burst 1000) + $count block entries to $CHAIN"
+echo "applied rate-limit + $count block entries to $CHAIN"
 EOF
 chmod +x "$SCRIPT"
 
