@@ -118,7 +118,7 @@
   .map-legend .down{color:#d9933a}
   .map-legend .both{color:#a779e0}
   .map-legend .clients{color:#5bbcd6}
-  .fleet-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(232px,1fr));gap:10px;margin:10px 0}
+  .fleet-cards{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin:10px 0}
   .fcard{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:11px 13px;min-height:84px}
   .fcard-k{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);font-weight:600}
   .fcard-sub{text-transform:none;letter-spacing:0;font-weight:400;opacity:.8}
@@ -374,11 +374,6 @@
   </div>
 
   <div class="fleet-cards" id="fleet-cards">
-    <div class="fcard">
-      <div class="fcard-k">Total traffic <span class="fcard-sub">all ports</span></div>
-      <div class="fcard-v" id="fc-all">—</div>
-      <div class="fcard-foot" id="fc-all-foot">—</div>
-    </div>
     <div class="fcard">
       <div class="fcard-k">Total exit traffic <span class="fcard-sub" id="fc-scope">all nodes</span></div>
       <div class="fcard-v" id="fc-traffic">—</div>
@@ -707,7 +702,7 @@
         <input id="ssh-extra" placeholder="paste an existing pubkey line, e.g. ssh-ed25519 AAAA… you@mac"></label>
     </div>
     <div class="ssh-note">
-      <b>The key lives at a non-default path</b>, so a plain <code>ssh hermes@host</code> will <b>ignore it and ask for a password</b>.
+      <b>The key lives at a non-default path</b>, so a plain <code>ssh &lt;your-node-user&gt;@host</code> will <b>ignore it and ask for a password</b>.
       Either log in with <code>-i</code> (the connect line above), or add this once to <code>~/.ssh/config</code> so plain
       <code>ssh &lt;host&gt;</code> uses it automatically:
       <pre id="ssh-config-snip"></pre>
@@ -759,26 +754,48 @@
   <div class="modal wide">
     <h2>Extra blocks · NYM-EXIT abuse blocklist</h2>
     <div id="eb-status" class="f2b-status"></div>
-    <div class="f2b-form">
-      <label>Blocklist URL
-        <input id="eb-url" placeholder="leave blank for the default list"></label>
-      <label class="f2b-check"><input id="eb-restart" type="checkbox">
-        Restart nym-node now to apply &amp; verify the on-restart re-application (brief service blip)</label>
-      <p class="f2b-warn">The blocks live in the <span class="mono">NYM-EXIT</span> chain, which nym-node rebuilds
-        on start — so a oneshot unit re-applies them after each start. <b>Install only</b> applies the list to the
-        running chain immediately (no restart) and enables the unit; tick the box to also restart nym-node and confirm
-        the full flush-and-reapply, or restart later and use <b>Verify</b>. Verification checks the REJECT rules are
-        present in the chain (the authoritative signal — a from-node ping wouldn't traverse the exit forward path).
-        IPv4 goes in <span class="mono">iptables NYM-EXIT</span>; IPv6 entries are applied to
-        <span class="mono">ip6tables NYM-EXIT</span> when the node has a v6 exit chain (set
-        <span class="mono">MAESTRO_NYM_EXIT6</span> on the agent if yours is named differently).</p>
+
+    <div style="display:flex;flex-direction:column;gap:12px;margin-bottom:14px">
+
+      <div style="border:1px solid var(--line);border-radius:8px;padding:12px 14px">
+        <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">1 · Install / Update script</div>
+        <p style="font-size:12px;color:var(--muted);margin:0 0 8px">Fetches <span class="mono" style="font-size:11px">install-nym-extra-blocks.sh</span> from GitHub and runs it as root. Sets up the systemd oneshot unit, installs the rate limiting and the IP blocklist. Use for first install or when the installer script has changed (e.g. new rate-limit values).</p>
+        <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:6px">Installer URL
+          <input id="eb-script-url" placeholder="https://raw.githubusercontent.com/wiiinnie/nym-maestro/refs/heads/main/install-nym-extra-blocks.sh" style="margin-top:3px;font-size:11px;font-family:var(--mono)">
+        </label>
+        <button id="eb-install-script" onclick="ebInstallScript()">Run installer</button>
+      </div>
+
+      <div style="border:1px solid var(--line);border-radius:8px;padding:12px 14px">
+        <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">2 · Update blocklist only</div>
+        <p style="font-size:12px;color:var(--muted);margin:0 0 8px">Pulls the latest <span class="mono" style="font-size:11px">blocklist.txt</span> and applies the REJECT rules to the running <span class="mono" style="font-size:11px">NYM-EXIT</span> chain immediately. Does not touch the rate-limit rules.</p>
+        <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:6px">Blocklist URL
+          <input id="eb-url" placeholder="leave blank for the default list" style="margin-top:3px;font-size:11px;font-family:var(--mono)">
+        </label>
+        <label class="f2b-check" style="font-size:12px;color:var(--muted);margin-bottom:8px"><input id="eb-restart" type="checkbox">
+          Also restart nym-node to verify on-restart re-application (brief service blip)</label>
+        <div style="display:flex;gap:8px">
+          <button id="eb-install" onclick="ebInstall()">Update blocklist</button>
+          <button id="eb-verify" onclick="ebVerify()">Verify</button>
+        </div>
+      </div>
+
+      <div style="border:1px solid var(--line);border-radius:8px;padding:12px 14px">
+        <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">3 · Service control</div>
+        <p style="font-size:12px;color:var(--muted);margin:0 0 8px">Restart the <span class="mono" style="font-size:11px">nym-extra-blocks</span> oneshot — re-fetches the blocklist and re-applies all REJECT rules and the rate-limit to the running chain. No nym-node restart needed.</p>
+        <button id="eb-svc-restart" onclick="ebRestartService()">Restart nym-extra-blocks</button>
+      </div>
+
     </div>
+
+    <p class="f2b-warn" style="margin-bottom:0">IPv4 goes in <span class="mono">iptables NYM-EXIT</span>; IPv6 entries are applied to
+      <span class="mono">ip6tables NYM-EXIT</span> when the node has a v6 exit chain
+      (set <span class="mono">MAESTRO_NYM_EXIT6</span> on the agent if yours is named differently).
+      The oneshot unit is PartOf nym-node.service, so the rules re-apply automatically on every nym-node restart.</p>
+
     <div class="modal-actions">
       <button id="eb-remove" class="ghost" onclick="ebRemove()" style="margin-right:auto">Remove</button>
       <button onclick="closeExtraBlocks()">Close</button>
-      <button id="eb-verify" onclick="ebVerify()">Verify</button>
-      <button id="eb-upgrade" onclick="ebUpgrade()">Update script</button>
-      <button class="primary" id="eb-install" onclick="ebInstall()">Install</button>
     </div>
   </div>
 </div>
@@ -1235,17 +1252,13 @@ function renderCards(){
   // isn't an exit tunnel, so it's not in these totals — see the throughput card.)
   let wgBytes = 0, mixBytes = 0, haveIface = false;
   let wgExitBps = 0, mixExitBps = 0, exitN = 0;
-  let allBytes = 0, haveAll = false;
   let sinceMin = Infinity, sinceMax = 0, sinceN = 0;
-  let bootMin = Infinity, bootMax = 0, bootN = 0;
   const EXITDEV = {nymtun0: 1, nymwg: 1};
   set.forEach(n => {
     const st = n.status; if(!st) return;
     if(st.traffic){
       if(st.traffic.nymwg != null){ wgBytes += st.traffic.nymwg; haveIface = true; }
       if(st.traffic.nymtun0 != null){ mixBytes += st.traffic.nymtun0; haveIface = true; }
-      const up = st.uplink_device;   // all-ports = the physical uplink (default route)
-      if(up && st.traffic[up] != null){ allBytes += st.traffic[up]; haveAll = true; }
     }
     if(st.throughput){
       let any = false;
@@ -1254,7 +1267,6 @@ function renderCards(){
       if(any) exitN++;
     }
     if(st.nym_node_since){ sinceMin = Math.min(sinceMin, st.nym_node_since); sinceMax = Math.max(sinceMax, st.nym_node_since); sinceN++; }
-    if(st.boot_since){ bootMin = Math.min(bootMin, st.boot_since); bootMax = Math.max(bootMax, st.boot_since); bootN++; }
   });
 
   // device-aware 24h volumes from the counter snapshots (traffic_window dev_bytes)
@@ -1264,30 +1276,11 @@ function renderCards(){
     return seen ? s : null;
   };
   const dev = traf24 ? traf24.dev_bytes : null;
-  const span = (traf24 && traf24.observed_hours) ? traf24.observed_hours*3600 : 0;
   const exit24 = sumDev(dev, true);
-  const all24 = sumDev(dev, false);
   const oh = traf24 ? (traf24.observed_hours||0) : 0, wh = traf24 ? (traf24.window_hours||24) : 24;
   const full = oh >= (wh - 0.5);
   const winLbl = full ? '24h' : Math.max(1, Math.round(oh)) + 'h';
   const winTxt = full ? '24 h' : '~' + Math.round(oh) + ' h';
-
-  // ---- TOTAL TRAFFIC (all ports) — the physical uplink counter ----
-  g('fc-all').textContent = haveAll ? fmtBytesSI(allBytes) : '—';
-  const allFoot = g('fc-all-foot'); const aparts = [];
-  if(bootN > 0 && isFinite(bootMin)){
-    const rel = fmtAgo(Date.now() - bootMin*1000);
-    const range = (bootMax - bootMin > 3600) ? ` Per node, since each node's last boot; oldest ${fmtSince(bootMin)}, newest ${fmtSince(bootMax)} — the total spans back to the oldest.` : '';
-    aparts.push({text: 'since ' + fmtSince(bootMin), title: `Uplink byte counters since last boot (${rel} ago). The uplink is the physical NIC (default route). nym-node creates nymtun0/nymwg but never touches the uplink, so restarting nym-node does NOT reset this counter — only a reboot (or manually cycling the NIC) does. It carries every port — WG, mixnet relay/cover, entry clients, exit egress — plus a little host traffic, i.e. your total bandwidth (billing-relevant). That's why its "since" is boot, unlike the exit card's since-nym-node-restart.${range}`});
-  } else if(haveAll){
-    aparts.push({text: 'since boot', title: 'Total bytes over the uplink since boot.'});
-  }
-  if(all24 != null){
-    aparts.push({text: winLbl + ' ' + fmtBytesSI(all24), title: `REAL all-ports traffic over the last ${winTxt} — uplink counter delta between snapshots (gap-immune, reset-safe). No projection.`});
-  }
-  allFoot.innerHTML = aparts.length
-    ? aparts.map(p => `<span title="${p.title.replace(/"/g,'&quot;')}" style="cursor:help;border-bottom:1px dotted var(--line)">${p.text}</span>`).join(' · ')
-    : (haveAll ? 'all ports' : 'needs agent 0.9.6+');
 
   // ---- TOTAL EXIT TRAFFIC — nymtun0 + nymwg (decrypted payload out) ----
   const ifaceTotal = wgBytes + mixBytes;
@@ -2773,6 +2766,18 @@ function renderEbStatus(results){
       if(res.sample_ip) row.append(el('span','sub', 'sample ' + res.sample_ip + ' · ' +
         (res.sample_blocked ? 'blocked' : 'not blocked')));
     }
+    if(res.rate_limit_active === true){
+      const label = res.rate_limit_rate
+        ? res.rate_limit_rate + ' burst ' + (res.rate_limit_burst != null ? res.rate_limit_burst : '?') + ' · rate-limited'
+        : 'rate-limit active';
+      const rl = el('span','pill ok', label);
+      rl.title = 'hashlimit rule active in NYM-EXIT: new TCP connections per source IP are rate-limited; excess are DROPped';
+      row.append(rl);
+    } else if(res.rate_limit_active === false){
+      const rl = el('span','pill warn','no rate-limit');
+      rl.title = 'hashlimit rule not found in NYM-EXIT — run "Install / Update script" (section 1) to apply';
+      row.append(rl);
+    }
     if(res.list_url && !prefillUrl) prefillUrl = res.list_url;
     box.append(row);
   });
@@ -2802,16 +2807,6 @@ async function ebInstall(){
   btn.disabled = false; btn.textContent = 'Install';
 }
 
-async function ebUpgrade(){
-  const btn = document.getElementById('eb-upgrade');
-  btn.disabled = true; btn.textContent = 'Updating…';
-  try{
-    const r = await api('/api/extra-blocks/upgrade', {method:'POST', body: JSON.stringify({node_ids: ebTargets})});
-    showResults('Extra blocks · update script', r.results);
-    await loadEbStatus(); await load();
-  }catch(e){ toast(e.message, true); }
-  btn.disabled = false; btn.textContent = 'Update script';
-}
 
 async function ebVerify(){
   const btn = document.getElementById('eb-verify');
@@ -2837,6 +2832,31 @@ async function ebRemove(){
   btn.disabled = false; btn.textContent = 'Remove';
 }
 
+async function ebInstallScript(){
+  const btn = document.getElementById('eb-install-script');
+  btn.disabled = true; btn.textContent = 'Running installer…';
+  const url = (document.getElementById('eb-script-url').value || '').trim();
+  const body = {node_ids: ebTargets};
+  if(url) body.installer_url = url;
+  try{
+    const r = await api('/api/extra-blocks/install-script', {method:'POST', body: JSON.stringify(body)});
+    showResults('Extra blocks · install script', r.results);
+    await loadEbStatus(); await load();
+  }catch(e){ toast(e.message, true); }
+  btn.disabled = false; btn.textContent = 'Run installer';
+}
+
+async function ebRestartService(){
+  const btn = document.getElementById('eb-svc-restart');
+  btn.disabled = true; btn.textContent = 'Restarting…';
+  try{
+    const r = await api('/api/extra-blocks/restart-service', {method:'POST', body: JSON.stringify({node_ids: ebTargets})});
+    showResults('Extra blocks · restart service', r.results);
+    await loadEbStatus(); await load();
+  }catch(e){ toast(e.message, true); }
+  btn.disabled = false; btn.textContent = 'Restart nym-extra-blocks';
+}
+
 // ===== SSH key access =====================================================
 let sshTargets = [];
 
@@ -2856,7 +2876,7 @@ async function loadSshKey(){
     document.getElementById('ssh-pub').value = k.public_key;
     const host = nodes.find(n => n.uid === sshTargets[0]) || {};
     const target = host.hostname || host.ip || '<node>';
-    const user = k.ssh_user || 'hermes';
+    const user = k.ssh_user || '<your-node-user>';
     document.getElementById('ssh-cmd').textContent =
       'private key: ' + k.private_key_path + '   ·   connect: ssh -i ' + k.private_key_path + ' ' + user + '@' + target;
     // Derive a wildcard host pattern from the common domain if there is one
@@ -2895,7 +2915,7 @@ function renderSshStatus(results){
     if(res.user_exists === false){
       row.append(el('span','pill bad', 'no user ' + (res.user || '?')));
     } else {
-      row.append(el('span','mono', (res.user || 'hermes') + ': ' +
+      row.append(el('span','mono', (res.user || '<your-node-user>') + ': ' +
         (res.authorized_keys_count != null ? res.authorized_keys_count : '?') + ' key' +
         (res.authorized_keys_count === 1 ? '' : 's')));
     }
