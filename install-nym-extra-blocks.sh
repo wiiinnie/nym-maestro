@@ -80,8 +80,9 @@ WantedBy=nym-node.service
 EOF
 
 systemctl daemon-reload
-systemctl disable nym-extra-blocks.service 2>/dev/null || true
 systemctl enable nym-extra-blocks.service
-systemctl start nym-extra-blocks.service
+# restart (not start) so re-running the installer always re-applies to the live chain,
+# even when the oneshot is already active (RemainAfterExit=yes makes start a no-op).
+systemctl restart nym-extra-blocks.service
 echo "installed. status:"
 systemctl --no-pager status nym-extra-blocks.service | head -n 8
