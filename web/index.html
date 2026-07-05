@@ -2762,20 +2762,29 @@ function renderEbStatus(results){
     if(res.chain_present === false){
       row.append(el('span','sub','NYM-EXIT not present (nym-node not running?)'));
     } else if(res.blocklist_size != null){
-      row.append(el('span','mono', ebCountsText(res)));
-      if(res.sample_ip) row.append(el('span','sub', 'sample ' + res.sample_ip + ' · ' +
-        (res.sample_blocked ? 'blocked' : 'not blocked')));
+      // blocked-IP count, shown as a clear pill: "N IPs blocked" (+ v6 note if any)
+      const nBlocked = (res.v4 ? res.v4.present : (res.rules_present ?? 0)) +
+                       (res.v6 && res.v6.applicable ? res.v6.present : 0);
+      const nTotal = (res.v4 ? res.v4.size : (res.blocklist_size ?? 0)) +
+                     (res.v6 && res.v6.applicable ? res.v6.size : 0);
+      const blk = el('span','pill ok', nBlocked + ' IPs blocked');
+      blk.title = ebCountsText(res) + (res.sample_ip ? ' · sample ' + res.sample_ip + ' ' +
+        (res.sample_blocked ? '(blocked)' : '(NOT blocked)') : '');
+      if(nTotal && nBlocked < nTotal){ blk.className = 'pill warn'; blk.textContent = nBlocked + '/' + nTotal + ' IPs blocked'; }
+      row.append(blk);
     }
+    // rate-limit pill: explicit rate + burst pulled live from iptables
     if(res.rate_limit_active === true){
-      const label = res.rate_limit_rate
-        ? res.rate_limit_rate + ' burst ' + (res.rate_limit_burst != null ? res.rate_limit_burst : '?') + ' · rate-limited'
-        : 'rate-limit active';
-      const rl = el('span','pill ok', label);
-      rl.title = 'hashlimit rule active in NYM-EXIT: new TCP connections per source IP are rate-limited; excess are DROPped';
+      const rateTxt = res.rate_limit_rate || '?';
+      const burstTxt = (res.rate_limit_burst != null ? res.rate_limit_burst : '?');
+      const rl = el('span','pill ok', 'rate ' + rateTxt + ' · burst ' + burstTxt);
+      rl.title = 'Per-source-IP connection rate-limit active in NYM-EXIT: new TCP connections up to ' +
+        rateTxt + ' (burst ' + burstTxt + ') per source IP are accepted; excess are dropped. ' +
+        'Established connections are never limited.';
       row.append(rl);
     } else if(res.rate_limit_active === false){
       const rl = el('span','pill warn','no rate-limit');
-      rl.title = 'hashlimit rule not found in NYM-EXIT — run "Install / Update script" (section 1) to apply';
+      rl.title = 'No per-source rate-limit rule found in NYM-EXIT — run section 1 (Install / Update script) to apply it';
       row.append(rl);
     }
     if(res.list_url && !prefillUrl) prefillUrl = res.list_url;
