@@ -39,7 +39,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-AGENT_VERSION = "0.9.9"
+AGENT_VERSION = "0.9.10"
 
 try:
     with open(os.path.abspath(__file__), "rb") as _sf:
@@ -50,6 +50,12 @@ except Exception:
 HOST = os.environ.get("MAESTRO_AGENT_HOST", "0.0.0.0")
 PORT = int(os.environ.get("MAESTRO_AGENT_PORT", "8443"))
 CERTDIR = os.environ.get("MAESTRO_AGENT_CERTDIR", "/etc/nym-maestro-agent")
+# The agent accepts only the orchestrator's client cert. All node certs are signed
+# by the same CA, so a CA-signed check alone would let any node (or anyone holding a
+# node's server key) drive root actions on every other node. We additionally pin the
+# client cert's Common Name to the orchestrator's, so one compromised node cannot
+# impersonate the orchestrator against the rest of the fleet.
+ORCH_CN = os.environ.get("MAESTRO_ORCH_CN", "nym-maestro-orchestrator")
 NYM_PORT = int(os.environ.get("MAESTRO_NYM_PORT", "8080"))
 NYM_SERVICE = os.environ.get("MAESTRO_NYM_SERVICE", "nym-node.service")
 
@@ -647,6 +653,39 @@ def act_upgrade(params):
         _download(url, tmp, timeout=300)
     except Exception as e:
         return {"ok": False, "error": f"download failed: {e}", "output": "\n".join(log)}
+
+    # Optional integrity check: if the orchestrator supplied an expected sha256,
+    # verify it before we ever mark the file executable or run it. This binary is
+    # run as root, so a hijacked download host or a wrong URL would otherwise be
+    # arbitrary root code execution. Backward compatible: skipped if no hash given.
+    want_sha = (params.get("sha256") or "").strip().lower()
+    if want_sha:
+        try:
+            h = hashlib.sha256()
+            with open(tmp, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+            got_sha = h.hexdigest()
+        except Exception as e:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            return {"ok": False, "error": f"could not hash downloaded binary: {e}",
+                    "output": "\n".join(log)}
+        if got_sha != want_sha:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            return {"ok": False,
+                    "error": f"sha256 mismatch: expected {want_sha}, got {got_sha}; "
+                             f"discarded download, old binary untouched",
+                    "output": "\n".join(log)}
+        log.append(f"sha256 verified: {got_sha}")
+    else:
+        log.append("no sha256 supplied — skipping integrity check")
+
     try:
         os.chmod(tmp, 0o755)
     except Exception:
@@ -2291,6 +2330,24 @@ class Handler(BaseHTTPRequestHandler):
         # wrap_socket performs the handshake here in the worker thread, bounded by
         # the socket timeout above — a stalled client only ties up its own thread
         self.request = self.server.ssl_context.wrap_socket(raw, server_side=True)
+        # CERT_REQUIRED already guarantees the peer cert is signed by our CA. Since
+        # every node's server cert is signed by that same CA, we must also confirm
+        # the peer is specifically the orchestrator (by CN), not another node.
+        peer = self.request.getpeercert()
+        cn = None
+        if peer:
+            for rdn in peer.get("subject", ()):
+                for k, v in rdn:
+                    if k == "commonName":
+                        cn = v
+        if cn != ORCH_CN:
+            # Refuse to serve anything to a non-orchestrator client, even though it
+            # presented a CA-signed cert. Close before any request is dispatched.
+            try:
+                self.request.close()
+            except Exception:
+                pass
+            raise ssl.SSLError(f"client CN {cn!r} is not the orchestrator ({ORCH_CN!r})")
         super().setup()
 
     def _send(self, code, payload):

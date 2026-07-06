@@ -12,18 +12,19 @@ broadcasts to the Nyx chain. Keeping keys off the internet-facing nodes is the
 whole point — a compromised exit node must never be able to spend operator funds.
 
 Secrets never touch a command line: the wallet password is handed to openssl via
-an environment variable (env:VAR), not argv, so it isn't visible in `ps`. The one
-unavoidable exception is nym-cli's own `--mnemonic` flag (that's the interface it
-offers); those invocations are brief and local to the operator's machine.
+an environment variable (env:VAR), not argv, so it isn't visible in `ps`. The
+mnemonic likewise reaches nym-cli via the MNEMONIC env var, never argv, so the
+spending key isn't exposed in `ps` / /proc either; those invocations are brief
+and local to the operator's machine.
 
 Nothing in this module logs a mnemonic or a password.
 
 The exact command surface mirrors the proven old CLI:
-  address : nym-cli account pub-key --mnemonic <m>          -> parse n1...
+  address : MNEMONIC=<m> nym-cli account pub-key            -> parse n1...
   balance : nym-cli account balance <addr>                  -> parse "N.NNNNNN nym"
   rewards : Nyx cosmwasm smart-query get_pending_operator_reward (read-only REST)
-  redeem  : nym-cli mixnet operators nymnode rewards claim --mnemonic <m>
-  send    : nym-cli account send <receiver> <amount_uNYM> --mnemonic <m>
+  redeem  : MNEMONIC=<m> nym-cli mixnet operators nymnode rewards claim
+  send    : MNEMONIC=<m> nym-cli account send <receiver> <amount_uNYM>
 """
 
 from __future__ import annotations
@@ -231,7 +232,11 @@ def delete_wallet(name: str) -> None:
 def derive_address(mnemonic: str) -> str:
     if not have_nym_cli():
         raise WalletError("nym-cli not found in PATH")
-    rc, out, err = _run([NYM_CLI, "account", "pub-key", "--mnemonic", mnemonic], T_QUICK)
+    # Pass the mnemonic via the environment, not argv: argv is world-readable via
+    # ps / /proc/<pid>/cmdline, which would briefly expose the spending key to any
+    # local process. nym-cli reads MNEMONIC as a fallback for the --mnemonic flag.
+    rc, out, err = _run([NYM_CLI, "account", "pub-key"], T_QUICK,
+                        env_extra={"MNEMONIC": mnemonic})
     blob = (out + "\n" + err)
     m = _ADDR_EXTRACT.search(blob)
     if not m:
@@ -300,8 +305,8 @@ def claim_rewards(mnemonic: str) -> dict:
     if not have_nym_cli():
         raise WalletError("nym-cli not found in PATH")
     rc, out, err = _run(
-        [NYM_CLI, "mixnet", "operators", "nymnode", "rewards", "claim", "--mnemonic", mnemonic],
-        T_TX)
+        [NYM_CLI, "mixnet", "operators", "nymnode", "rewards", "claim"],
+        T_TX, env_extra={"MNEMONIC": mnemonic})
     ok = rc == 0
     return {"ok": ok, "output": _tail(out if ok else (err or out))}
 
@@ -315,8 +320,8 @@ def send(receiver: str, amount_unym: int, mnemonic: str) -> dict:
     if int(amount_unym) <= 0:
         raise WalletError("amount must be positive")
     rc, out, err = _run(
-        [NYM_CLI, "account", "send", receiver, str(int(amount_unym)), "--mnemonic", mnemonic],
-        T_TX)
+        [NYM_CLI, "account", "send", receiver, str(int(amount_unym))],
+        T_TX, env_extra={"MNEMONIC": mnemonic})
     ok = rc == 0
     return {"ok": ok, "output": _tail(out if ok else (err or out))}
 
