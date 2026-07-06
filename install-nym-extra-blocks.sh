@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# install-nym-extra-blocks.sh  (nym-maestro built-in template)
-# Installs the nym-extra-blocks runtime script + systemd unit that re-applies a
+# install-nym-extra-blocks.sh  (nym-maestro built-in template / GitHub installer)
+# Writes the nym-extra-blocks runtime script + systemd unit that re-applies a
 # single per-source rate-limit AND destination REJECTs to NYM-EXIT on every
-# nym-node start.
+# nym-node start, then RESTARTS the service so the change applies immediately
+# (start alone is a no-op on an already-active RemainAfterExit oneshot).
 #
-# Teardown is nf_tables-safe: it deletes rules by exact spec (from `iptables -S`),
-# NOT by line number (which is unreliable on the nf_tables backend, v1.8.x). It
-# drains duplicates fully, and never touches --dport 465 rules.
+# Teardown is nf_tables-safe: deletes by exact spec (never line number), and
+# uses count-based draining (re-count after each delete) so duplicates cannot
+# survive. Port 465 (SMTP) rules are never touched.
 set -euo pipefail
 
 [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
@@ -49,9 +50,20 @@ if [ -x "$IPT6" ] && "$IPT6" -nL "$CHAIN6" >/dev/null 2>&1; then have6=1; else
     echo "$CHAIN6 (v6) not present / ip6tables unavailable; skipping IPv6 blocks" >&2
 fi
 
-# --- teardown helpers (nf_tables-safe: delete by exact spec, drain duplicates) ---
+# Count how many rules in CHAIN match an exact -A spec.
+count_exact() { "$IPT" -S "$CHAIN" 2>/dev/null | grep -Fxc -- "-A $CHAIN $*" || true; }
 
-# Drain all nym_scan ACCEPT rules regardless of rate value; never touch dport 465.
+# Delete EVERY rule exactly matching the given spec; re-count each pass so no
+# duplicate can survive (count-based, not guard-based).
+purge_exact() {
+    local n; n=$(count_exact "$@")
+    while [ "${n:-0}" -gt 0 ]; do
+        "$IPT" -D "$CHAIN" "$@" 2>/dev/null || break
+        n=$(count_exact "$@")
+    done
+}
+
+# Drain ALL nym_scan ACCEPT rules regardless of rate value; never touch dport 465.
 drain_nym_scan() {
     local spec
     while :; do
@@ -62,17 +74,10 @@ drain_nym_scan() {
     done
 }
 
-# Delete every rule whose full spec exactly equals the given arguments.
-del_exact() {
-    while "$IPT" -S "$CHAIN" 2>/dev/null | grep -Fxq -- "-A $CHAIN $*"; do
-        "$IPT" -D "$CHAIN" "$@" 2>/dev/null || break
-    done
-}
-
 if [ "$have4" = 1 ]; then
     drain_nym_scan
-    del_exact -p tcp -m conntrack --ctstate NEW -j DROP
-    del_exact -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    purge_exact -p tcp -m conntrack --ctstate NEW -j DROP
+    purge_exact -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
     # insert exactly one clean triplet (final order: established, rate-accept, drop)
     "$IPT" -I "$CHAIN" -p tcp -m conntrack --ctstate NEW -j DROP
@@ -127,7 +132,7 @@ WantedBy=nym-node.service
 EOF
 
 systemctl daemon-reload
-systemctl disable nym-extra-blocks.service 2>/dev/null || true
-systemctl enable nym-extra-blocks.service
-systemctl start nym-extra-blocks.service
-echo "installed nym-extra-blocks.service (enabled); ran once."
+systemctl enable nym-extra-blocks.service >/dev/null 2>&1 || true
+# RESTART (not start): forces the oneshot to re-run so changes apply now.
+systemctl restart nym-extra-blocks.service
+echo "installed + restarted nym-extra-blocks.service"
