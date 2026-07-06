@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # install-nym-extra-blocks.sh  (nym-maestro built-in template)
-# Installs the nym-extra-blocks runtime script + systemd unit that re-applies
-# destination REJECTs AND a single per-source rate-limit to NYM-EXIT on every
+# Installs the nym-extra-blocks runtime script + systemd unit that re-applies a
+# single per-source rate-limit AND destination REJECTs to NYM-EXIT on every
 # nym-node start.
 #
-# FIX vs. earlier versions: the rate-limit delete-guard now removes EVERY existing
-# nym_scan rule by name (loop over line numbers) before inserting exactly one, so
-# retuning the rate can never leave old rules stacked in the chain.
+# Teardown is nf_tables-safe: it deletes rules by exact spec (from `iptables -S`),
+# NOT by line number (which is unreliable on the nf_tables backend, v1.8.x). It
+# drains duplicates fully, and never touches --dport 465 rules.
 set -euo pipefail
 
 [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
@@ -18,90 +18,94 @@ cat > "$SCRIPT" <<'EOF'
 #!/usr/bin/env bash
 # nym-maestro-managed — do not edit by hand; reinstall via maestro instead.
 set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+IPT=$(command -v iptables || echo /usr/sbin/iptables)
+IPT6=$(command -v ip6tables || echo /usr/sbin/ip6tables)
 
 LIST_URL="https://raw.githubusercontent.com/wiiinnie/nym-maestro/refs/heads/main/blocklist.txt"
 CACHE="/var/lib/nym-extra-blocks/blocklist.txt"
-CHAIN="NYM-EXIT"
-CHAIN6="NYM-EXIT"
+CHAIN="NYM-EXIT"; CHAIN6="NYM-EXIT"
 IP_RE='^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$'
 IP6_RE='^[0-9a-fA-F:]*:[0-9a-fA-F:]+(/[0-9]{1,3})?$'
-
-# active rate-limit parameters (change here to retune fleet-wide via the template)
 RL_RATE="200/sec"
 RL_BURST="1000"
 
 mkdir -p "$(dirname "$CACHE")"
-
-# Fetch; only overwrite cache on a clean download, else keep last-known-good.
 if curl -fsS --max-time 15 "$LIST_URL" -o "${CACHE}.new"; then
     mv "${CACHE}.new" "$CACHE"
 else
-    echo "fetch failed, using cached list" >&2
-    rm -f "${CACHE}.new"
+    echo "fetch failed, using cached list if present" >&2; rm -f "${CACHE}.new"
 fi
-[ -f "$CACHE" ] || { echo "no list available, nothing to do"; exit 0; }
 
-# nym-node flushes/recreates the exit chains on start, so wait for the v4 chain to
-# exist before applying ON TOP. Poll rather than rely on a fixed sleep.
 have4=0
 for _ in $(seq 1 30); do
-    iptables -nL "$CHAIN" >/dev/null 2>&1 && { have4=1; break; }
+    "$IPT" -nL "$CHAIN" >/dev/null 2>&1 && { have4=1; break; }
     sleep 2
 done
 [ "$have4" = 1 ] || echo "$CHAIN (v4) not present after waiting" >&2
 
 have6=0
-if command -v ip6tables >/dev/null 2>&1 && ip6tables -nL "$CHAIN6" >/dev/null 2>&1; then
-    have6=1
-else
+if [ -x "$IPT6" ] && "$IPT6" -nL "$CHAIN6" >/dev/null 2>&1; then have6=1; else
     echo "$CHAIN6 (v6) not present / ip6tables unavailable; skipping IPv6 blocks" >&2
 fi
 
-# Per-source rate-limit. FIRST remove EVERY existing nym_scan rule by name
-# (loop over line numbers) so previous values can't stack; then remove the paired
-# DROP and ESTABLISHED-accept; then insert exactly one fresh set.
-if [ "$have4" = 1 ]; then
-    while iptables -L "$CHAIN" --line-numbers -n 2>/dev/null | grep -q 'nym_scan'; do
-        ln=$(iptables -L "$CHAIN" --line-numbers -n | awk '/nym_scan/{print $1; exit}')
-        iptables -D "$CHAIN" "$ln" || break
-    done
-    iptables -D "$CHAIN" -p tcp -m conntrack --ctstate NEW -j DROP 2>/dev/null || true
-    iptables -D "$CHAIN" -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+# --- teardown helpers (nf_tables-safe: delete by exact spec, drain duplicates) ---
 
-    # insert (reverse of final order; -I pushes to top):
-    #   1) ESTABLISHED/RELATED accept  2) NEW up-to-rate accept  3) NEW over-rate drop
-    iptables -I "$CHAIN" -p tcp -m conntrack --ctstate NEW -j DROP
-    iptables -I "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit \
+# Drain all nym_scan ACCEPT rules regardless of rate value; never touch dport 465.
+drain_nym_scan() {
+    local spec
+    while :; do
+        spec=$("$IPT" -S "$CHAIN" 2>/dev/null | grep 'nym_scan' | grep -v 'dport 465' | head -1 || true)
+        [ -z "$spec" ] && break
+        spec=$(printf '%s\n' "$spec" | sed "s/^-A $CHAIN //")
+        "$IPT" -D "$CHAIN" $spec 2>/dev/null || break
+    done
+}
+
+# Delete every rule whose full spec exactly equals the given arguments.
+del_exact() {
+    while "$IPT" -S "$CHAIN" 2>/dev/null | grep -Fxq -- "-A $CHAIN $*"; do
+        "$IPT" -D "$CHAIN" "$@" 2>/dev/null || break
+    done
+}
+
+if [ "$have4" = 1 ]; then
+    drain_nym_scan
+    del_exact -p tcp -m conntrack --ctstate NEW -j DROP
+    del_exact -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+    # insert exactly one clean triplet (final order: established, rate-accept, drop)
+    "$IPT" -I "$CHAIN" -p tcp -m conntrack --ctstate NEW -j DROP
+    "$IPT" -I "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit \
         --hashlimit-mode srcip --hashlimit-upto "$RL_RATE" --hashlimit-burst "$RL_BURST" \
         --hashlimit-name nym_scan -j ACCEPT
-    iptables -I "$CHAIN" -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    "$IPT" -I "$CHAIN" -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
     echo "applied single rate-limit ($RL_RATE burst $RL_BURST) to $CHAIN"
+else
+    echo "skipped rate-limit: $CHAIN not present" >&2
 fi
 
-c4=0; c6=0
-while IFS= read -r line; do
-    ip="${line%%#*}"; ip="$(echo "$ip" | xargs)"
-    [ -z "$ip" ] && continue
-    if [[ "$ip" =~ $IP_RE ]]; then
-        [ "$have4" = 1 ] || continue
-        if ! iptables -C "$CHAIN" -d "$ip" -j REJECT --reject-with icmp-port-unreachable 2>/dev/null; then
-            iptables -I "$CHAIN" -d "$ip" -j REJECT --reject-with icmp-port-unreachable \
-                || { echo "v4 add failed: $ip" >&2; continue; }
+if [ -f "$CACHE" ]; then
+    c4=0; c6=0
+    while IFS= read -r line; do
+        ip="${line%%#*}"; ip="$(echo "$ip" | xargs)"
+        [ -z "$ip" ] && continue
+        if [[ "$ip" =~ $IP_RE ]]; then
+            [ "$have4" = 1 ] || continue
+            "$IPT" -C "$CHAIN" -d "$ip" -j REJECT --reject-with icmp-port-unreachable 2>/dev/null \
+                || "$IPT" -I "$CHAIN" -d "$ip" -j REJECT --reject-with icmp-port-unreachable || true
+            c4=$((c4+1))
+        elif [[ "$ip" == *:* && "$ip" =~ $IP6_RE ]]; then
+            [ "$have6" = 1 ] || continue
+            "$IPT6" -C "$CHAIN6" -d "$ip" -j REJECT --reject-with icmp6-port-unreachable 2>/dev/null \
+                || "$IPT6" -I "$CHAIN6" -d "$ip" -j REJECT --reject-with icmp6-port-unreachable || true
+            c6=$((c6+1))
         fi
-        c4=$((c4+1))
-    elif [[ "$ip" == *:* && "$ip" =~ $IP6_RE ]]; then
-        [ "$have6" = 1 ] || continue
-        if ! ip6tables -C "$CHAIN6" -d "$ip" -j REJECT --reject-with icmp6-port-unreachable 2>/dev/null; then
-            ip6tables -I "$CHAIN6" -d "$ip" -j REJECT --reject-with icmp6-port-unreachable \
-                || { echo "v6 add failed: $ip" >&2; continue; }
-        fi
-        c6=$((c6+1))
-    else
-        echo "skipping invalid entry: $ip" >&2
-    fi
-done < "$CACHE"
-
-echo "applied $c4 IPv4 + $c6 IPv6 block entries"
+    done < "$CACHE"
+    echo "applied $c4 IPv4 + $c6 IPv6 block entries"
+else
+    echo "no blocklist available; rate-limit applied, blocks skipped" >&2
+fi
 EOF
 chmod +x "$SCRIPT"
 
