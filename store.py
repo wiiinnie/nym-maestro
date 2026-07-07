@@ -51,6 +51,7 @@ SELECT n.uid AS uid, n.node_id AS node_id, n.name AS name, n.ip AS ip,
        st.boot_since AS boot_since,
        st.traffic_dir_json AS traffic_dir_json,
        st.throughput_dir_json AS throughput_dir_json,
+       st.disk_json AS disk_json,
        st.last_seen AS last_seen
 FROM nodes n
 LEFT JOIN node_status st ON st.uid = n.uid
@@ -78,6 +79,10 @@ class Store:
         if not have_nodes:
             self.db.executescript(schema)
             self.db.commit()
+            # a fresh DB still needs the post-schema.sql additions (history_cursor,
+            # unique history indexes, etc.), which live in _ensure_columns — it is
+            # idempotent, so run it on the fresh path too rather than returning early.
+            self._ensure_columns()
             return
         # existing DB: migrate the pre-uid layout (node_id was the PK) if needed
         cols = [r[1] for r in self.db.execute("PRAGMA table_info(nodes)").fetchall()]
@@ -100,6 +105,7 @@ class Store:
             ("node_status", "boot_since", "REAL"),
             ("node_status", "traffic_dir_json", "TEXT"),
             ("node_status", "throughput_dir_json", "TEXT"),
+            ("node_status", "disk_json", "TEXT"),
         }
         for table, col, decl in wanted:
             have = [r[1] for r in self.db.execute(f"PRAGMA table_info({table})").fetchall()]
@@ -115,12 +121,44 @@ class Store:
             " id INTEGER PRIMARY KEY AUTOINCREMENT, uid TEXT NOT NULL,"
             " ts REAL NOT NULL, json TEXT NOT NULL);"
             "CREATE INDEX IF NOT EXISTS idx_traf_uid_ts ON traffic_history(uid, ts);"
+            # per-node sync cursors: the latest agent bucket ts already pulled, per
+            # series kind. The history-sync task requests since=<cursor> each round.
+            "CREATE TABLE IF NOT EXISTS history_cursor ("
+            " uid TEXT NOT NULL, kind TEXT NOT NULL, last_ts REAL NOT NULL DEFAULT 0,"
+            " PRIMARY KEY (uid, kind));"
             "CREATE TABLE IF NOT EXISTS onwire_history ("
             " id INTEGER PRIMARY KEY AUTOINCREMENT, uid TEXT NOT NULL,"
             " ts REAL NOT NULL, json TEXT NOT NULL);"
             "CREATE INDEX IF NOT EXISTS idx_onwire_uid_ts ON onwire_history(uid, ts);"
         )
         self.db.commit()
+        self._ensure_history_unique_indexes()
+
+    def _ensure_history_unique_indexes(self):
+        """The agent now supplies minute-bucketed history and we backfill it with
+        INSERT OR IGNORE keyed on (uid, ts). That needs a UNIQUE index on (uid, ts).
+        Older DBs contain dense sub-minute rows from the previous polling model with
+        possibly-colliding ts once floored; collapse duplicates first, then add the
+        unique index. Idempotent: skips entirely once the unique index exists."""
+        with self.lock:
+            have = self.db.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+                " AND name IN ('idx_tput_uid_ts_uq','idx_traf_uid_ts_uq')"
+            ).fetchall()
+            existing = {r[0] for r in have}
+            for table, idx in (("throughput_history", "idx_tput_uid_ts_uq"),
+                               ("traffic_history", "idx_traf_uid_ts_uq")):
+                if idx in existing:
+                    continue
+                # collapse duplicate (uid, ts) keeping the highest id (newest write)
+                self.db.execute(
+                    f"DELETE FROM {table} WHERE id NOT IN ("
+                    f"  SELECT MAX(id) FROM {table} GROUP BY uid, ts)"
+                )
+                self.db.execute(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS {idx} ON {table}(uid, ts)"
+                )
+            self.db.commit()
 
     def _migrate_to_uid(self, schema: str):
         # Preserve the registry (incl. agent_fp cert pins). Telemetry and job/
@@ -240,7 +278,7 @@ class Store:
                       traffic_bytes=None, traffic=None, throughput=None,
                       agent_version=None, agent_sha=None, extra_blocks=None,
                       nym_node_since=None, uplink_device=None, boot_since=None,
-                      traffic_dir=None, throughput_dir=None):
+                      traffic_dir=None, throughput_dir=None, disk=None):
         with self.lock:
             traffic_json = None
             if traffic is not None:
@@ -252,14 +290,15 @@ class Store:
             extra_blocks_json = json.dumps(extra_blocks) if extra_blocks is not None else None
             traffic_dir_json = json.dumps(traffic_dir) if traffic_dir is not None else None
             throughput_dir_json = json.dumps(throughput_dir) if throughput_dir is not None else None
+            disk_json = json.dumps(disk) if disk is not None else None
             self.db.execute(
                 'INSERT INTO node_status (uid, reachable, version, mode, '
                 'mixnode, entry, "exit", wireguard, service_active, '
                 'fail2ban_banned, agent_version, agent_sha, traffic_bytes, '
                 'traffic_json, bandwidth_json, extra_blocks_json, '
                 'nym_node_since, uplink_device, boot_since, '
-                'traffic_dir_json, throughput_dir_json, last_seen) '
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now')) "
+                'traffic_dir_json, throughput_dir_json, disk_json, last_seen) '
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now')) "
                 'ON CONFLICT(uid) DO UPDATE SET '
                 'reachable=excluded.reachable, version=excluded.version, '
                 'mode=excluded.mode, mixnode=excluded.mixnode, '
@@ -278,28 +317,43 @@ class Store:
                 'boot_since=excluded.boot_since, '
                 'traffic_dir_json=excluded.traffic_dir_json, '
                 'throughput_dir_json=excluded.throughput_dir_json, '
+                'disk_json=excluded.disk_json, '
                 'last_seen=excluded.last_seen',
                 (uid, 1 if reachable else 0, version, mode,
                  _ob(mixnode), _ob(entry), _ob(exit), _ob(wireguard),
                  _ob(service_active), fail2ban_banned, agent_version, agent_sha,
                  traffic_bytes, traffic_json, throughput_json, extra_blocks_json,
                  nym_node_since, uplink_device, boot_since,
-                 traffic_dir_json, throughput_dir_json),
+                 traffic_dir_json, throughput_dir_json, disk_json),
             )
             self.db.commit()
 
-    def record_throughput(self, uid, ts, throughput):
-        """Append one per-device throughput sample ({device: bytes/sec})."""
-        if not throughput:
-            return
+    def backfill_throughput(self, uid, rows):
+        """Idempotently insert minute-bucketed throughput rows pulled from an agent.
+        rows: list of {"ts": epoch, "v": {device: bytes/sec}}. Duplicate (uid, ts)
+        buckets are ignored, so overlapping re-syncs are safe. Returns the count
+        actually inserted and the max ts seen (for the cursor)."""
+        if not rows:
+            return 0, None
+        inserted = 0
+        max_ts = None
         with self.lock:
-            self.db.execute(
-                "INSERT INTO throughput_history (uid, ts, json) VALUES (?,?,?)",
-                (uid, float(ts), json.dumps(throughput)),
-            )
+            for row in rows:
+                ts = row.get("ts")
+                v = row.get("v")
+                if ts is None or not v:
+                    continue
+                cur = self.db.execute(
+                    "INSERT OR IGNORE INTO throughput_history (uid, ts, json)"
+                    " VALUES (?,?,?)",
+                    (uid, float(ts), json.dumps(v)),
+                )
+                inserted += cur.rowcount
+                max_ts = ts if max_ts is None else max(max_ts, ts)
             self.db.commit()
+        return inserted, max_ts
 
-    def prune_throughput(self, max_age_s=26 * 3600):
+    def prune_throughput(self, max_age_s=30 * 24 * 3600):
         with self.lock:
             self.db.execute(
                 "DELETE FROM throughput_history WHERE ts < ?",
@@ -307,18 +361,50 @@ class Store:
             )
             self.db.commit()
 
-    def record_traffic(self, uid, ts, traffic):
-        """Append one CUMULATIVE per-device counter snapshot ({device: bytes})."""
-        if not traffic:
-            return
+    def backfill_traffic(self, uid, rows):
+        """Idempotently insert minute-bucketed CUMULATIVE traffic snapshots pulled
+        from an agent. rows: list of {"ts": epoch, "v": {device: bytes}}. Duplicate
+        (uid, ts) buckets are ignored. Returns (inserted_count, max_ts)."""
+        if not rows:
+            return 0, None
+        inserted = 0
+        max_ts = None
+        with self.lock:
+            for row in rows:
+                ts = row.get("ts")
+                v = row.get("v")
+                if ts is None or not v:
+                    continue
+                cur = self.db.execute(
+                    "INSERT OR IGNORE INTO traffic_history (uid, ts, json)"
+                    " VALUES (?,?,?)",
+                    (uid, float(ts), json.dumps(v)),
+                )
+                inserted += cur.rowcount
+                max_ts = ts if max_ts is None else max(max_ts, ts)
+            self.db.commit()
+        return inserted, max_ts
+
+    def get_history_cursor(self, uid, kind):
+        """Latest agent bucket ts already pulled for (uid, kind). 0 if never synced;
+        the sync task then pulls the agent's full retention window on first contact."""
+        with self.lock:
+            row = self.db.execute(
+                "SELECT last_ts FROM history_cursor WHERE uid=? AND kind=?",
+                (uid, kind),
+            ).fetchone()
+        return float(row[0]) if row else 0.0
+
+    def set_history_cursor(self, uid, kind, last_ts):
         with self.lock:
             self.db.execute(
-                "INSERT INTO traffic_history (uid, ts, json) VALUES (?,?,?)",
-                (uid, float(ts), json.dumps(traffic)),
+                "INSERT INTO history_cursor (uid, kind, last_ts) VALUES (?,?,?)"
+                " ON CONFLICT(uid, kind) DO UPDATE SET last_ts=excluded.last_ts",
+                (uid, kind, float(last_ts)),
             )
             self.db.commit()
 
-    def prune_traffic(self, max_age_s=26 * 3600):
+    def prune_traffic(self, max_age_s=30 * 24 * 3600):
         with self.lock:
             self.db.execute(
                 "DELETE FROM traffic_history WHERE ts < ?",
@@ -624,6 +710,7 @@ def _row_to_view(r: sqlite3.Row) -> dict:
             "boot_since": (r["boot_since"] if "boot_since" in r.keys() else None),
             "traffic_dir": (json.loads(r["traffic_dir_json"]) if ("traffic_dir_json" in r.keys() and r["traffic_dir_json"]) else None),
             "throughput_dir": (json.loads(r["throughput_dir_json"]) if ("throughput_dir_json" in r.keys() and r["throughput_dir_json"]) else None),
+            "disk": (json.loads(r["disk_json"]) if ("disk_json" in r.keys() and r["disk_json"]) else None),
             "last_seen": r["last_seen"],
         }
     return {

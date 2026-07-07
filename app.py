@@ -25,7 +25,7 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from store import Conflict, Store
@@ -527,11 +527,8 @@ async def poll_all(app: FastAPI) -> dict:
             boot_since=res.get("boot_since"),
             traffic_dir=res.get("traffic_dir"),
             throughput_dir=res.get("throughput_dir"),
+            disk=res.get("disk"),
         )
-        store.record_throughput(node["uid"], time.time(), res.get("throughput"))
-        store.record_traffic(node["uid"], time.time(), res.get("traffic"))
-    store.prune_throughput()
-    store.prune_traffic()
     return {"polled": len(nodes), "reachable": reachable}
 
 
@@ -588,9 +585,8 @@ async def repoll_nodes(app: FastAPI, nodes: list):
             boot_since=res.get("boot_since"),
             traffic_dir=res.get("traffic_dir"),
             throughput_dir=res.get("throughput_dir"),
+            disk=res.get("disk"),
         )
-        store.record_throughput(node["uid"], time.time(), res.get("throughput"))
-        store.record_traffic(node["uid"], time.time(), res.get("traffic"))
 
 
 async def _poll_loop(app: FastAPI, interval: int):
@@ -600,6 +596,88 @@ async def _poll_loop(app: FastAPI, interval: int):
         try:
             if app.state.pki.ready():
                 await poll_all(app)
+        except Exception:
+            pass
+        await asyncio.sleep(interval)
+
+
+# How many cursor-paginated /v1/history pages to pull per node per sync round. The
+# agent caps each page at HISTORY_MAX_ROWS (10000 minute-buckets ~= 7 days), so a
+# few pages cover any realistic backlog; the rest is caught up on later rounds.
+_HISTORY_MAX_PAGES = int(os.environ.get("MAESTRO_HISTORY_MAX_PAGES", "8"))
+
+
+async def _sync_history_one(client, store, node, kind):
+    """Pull minute-bucketed history for one node+kind from its agent, starting at
+    the stored cursor, following cursor pagination until caught up (bounded by
+    _HISTORY_MAX_PAGES), backfilling idempotently. Advances the cursor as it goes.
+
+    kind is 'tput' (throughput_history) or 'traffic' (traffic_history). The agent's
+    history survives orchestrator downtime, so this backfills any gap since the last
+    successful sync — that is what makes the throughput chart gap-free even when the
+    orchestrator was stopped or moved to another host."""
+    uid = node["uid"]
+    since = store.get_history_cursor(uid, kind)
+    base = f"https://{node['ip']}:{node['agent_port']}/v1/history"
+    total = 0
+    for _ in range(_HISTORY_MAX_PAGES):
+        url = f"{base}?kind={kind}&since={since}"
+        try:
+            r = await client.get(url)
+            r.raise_for_status()
+            data = r.json()
+        except Exception:
+            break
+        rows = data.get("rows") or []
+        if not rows:
+            break
+        if kind == "tput":
+            _, max_ts = store.backfill_throughput(uid, rows)
+        else:
+            _, max_ts = store.backfill_traffic(uid, rows)
+        total += len(rows)
+        if max_ts is None:
+            break
+        since = max_ts
+        store.set_history_cursor(uid, kind, since)
+        if not data.get("truncated"):
+            break
+    return total
+
+
+async def sync_history_all(app: FastAPI) -> dict:
+    """Backfill throughput + traffic history for every enabled node from its agent."""
+    store, pki = app.state.store, app.state.pki
+    nodes = [n for n in store.list_nodes() if n["enabled"]]
+    if not nodes:
+        return {"synced": 0}
+    synced = 0
+    async with httpx.AsyncClient(verify=pki.mtls_context(), timeout=30.0) as client:
+        for node in nodes:
+            for kind in ("tput", "traffic"):
+                try:
+                    synced += await _sync_history_one(client, store, node, kind)
+                except Exception:
+                    pass
+    # trim our own copy to the retention window (agent already trims its side)
+    store.prune_throughput()
+    store.prune_traffic()
+    return {"synced": synced}
+
+
+async def _history_loop(app: FastAPI, interval: int):
+    """Periodically backfill on-agent history. Runs less often than the status poll
+    since the agent buckets at 1 minute; the default 300s (5 min) keeps the chart
+    fresh while staying light. Agents older than 0.10.0 lack /v1/history and simply
+    return errors, which are swallowed — those nodes keep whatever history exists."""
+    if interval <= 0:
+        return
+    # small initial delay so the first status poll populates the node registry first
+    await asyncio.sleep(5)
+    while True:
+        try:
+            if app.state.pki.ready():
+                await sync_history_all(app)
         except Exception:
             pass
         await asyncio.sleep(interval)
@@ -659,12 +737,14 @@ async def lifespan(app: FastAPI):
     app.state.pki = Pki(pki_dir())
     interval = int(os.environ.get("MAESTRO_POLL", "30"))
     onwire_interval = int(os.environ.get("MAESTRO_ONWIRE_POLL", "60"))
+    history_interval = int(os.environ.get("MAESTRO_HISTORY_POLL", "300"))
     task = asyncio.create_task(_poll_loop(app, interval))
     onwire_task = asyncio.create_task(_onwire_loop(app, onwire_interval))
+    history_task = asyncio.create_task(_history_loop(app, history_interval))
     try:
         yield
     finally:
-        for t in (task, onwire_task):
+        for t in (task, onwire_task, history_task):
             t.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await t
@@ -836,6 +916,36 @@ def index():
         return HTMLResponse(INDEX_HTML)
 
 
+# Favicons live next to index.html in web/. Serving both .ico and .svg kills the
+# "GET /favicon.ico 404" noise and gives the browser tab the nym maestro mark.
+_WEB_DIR = BASE / "web"
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon_ico():
+    p = _WEB_DIR / "favicon.ico"
+    if p.exists():
+        return FileResponse(p, media_type="image/x-icon")
+    # fall back to the SVG if the .ico isn't present for some reason
+    svg = _WEB_DIR / "favicon.svg"
+    if svg.exists():
+        return FileResponse(svg, media_type="image/svg+xml")
+    return Response(status_code=404)
+
+
+@app.get("/favicon.svg", include_in_schema=False)
+def favicon_svg():
+    p = _WEB_DIR / "favicon.svg"
+    return FileResponse(p, media_type="image/svg+xml") if p.exists() else Response(status_code=404)
+
+
+@app.get("/apple-touch-icon.png", include_in_schema=False)
+@app.get("/apple-touch-icon-precomposed.png", include_in_schema=False)
+def apple_touch_icon():
+    p = _WEB_DIR / "apple-touch-icon.png"
+    return FileResponse(p, media_type="image/png") if p.exists() else Response(status_code=404)
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok", "version": VERSION}
@@ -948,6 +1058,16 @@ async def refresh(request: Request):
     if not request.app.state.pki.ready():
         raise HTTPException(400, "PKI not initialised — run: python pki.py init")
     return await poll_all(request.app)
+
+
+@app.post("/api/history/sync")
+async def history_sync(request: Request):
+    """Force an immediate on-agent history backfill for all nodes. Normally runs on
+    a timer (MAESTRO_HISTORY_POLL, default 5 min); this triggers it on demand, e.g.
+    right after starting the orchestrator so the chart catches up without waiting."""
+    if not request.app.state.pki.ready():
+        raise HTTPException(400, "PKI not initialised — run: python pki.py init")
+    return await sync_history_all(request.app)
 
 
 def _require_pki(request: Request):

@@ -28,6 +28,7 @@ import re
 import pwd
 import shlex
 import shutil
+import sqlite3
 import socket
 import ssl
 import subprocess
@@ -39,7 +40,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-AGENT_VERSION = "0.9.10"
+AGENT_VERSION = "0.10.1"
 
 try:
     with open(os.path.abspath(__file__), "rb") as _sf:
@@ -304,6 +305,148 @@ _THROUGHPUT = {}
 _THROUGHPUT_DIR = {}
 _TPUT_LOCK = threading.Lock()
 
+# ---- on-agent throughput history (rolling 30-day window, 1-minute buckets) ----
+# The agent is the source of truth for its own time-series. The orchestrator pulls
+# whatever it is missing via GET /v1/history, so history survives orchestrator
+# downtime, restarts, or being moved to another host. Storage is stdlib sqlite3.
+HISTORY_DIR = os.environ.get("MAESTRO_AGENT_HISTORY_DIR", "/var/lib/nym-maestro-agent")
+HISTORY_DB = os.path.join(HISTORY_DIR, "history.db")
+HISTORY_RETENTION_S = int(os.environ.get("MAESTRO_HISTORY_RETENTION_S", str(30 * 24 * 3600)))
+HISTORY_BUCKET_S = int(os.environ.get("MAESTRO_HISTORY_BUCKET_S", "60"))  # 1-minute buckets
+HISTORY_MAX_ROWS = int(os.environ.get("MAESTRO_HISTORY_MAX_ROWS", "10000"))  # response cap
+_HISTORY_LOCK = threading.Lock()
+_history_db = None  # module-level connection, opened once in start_sampler()
+
+# in-progress bucket accumulation (bucket_ts -> {"tput": {dev: [sum, n]},
+#                                                "traffic": {dev: last_bytes}})
+_HIST_ACC = {}
+
+
+def _history_connect():
+    """Open (once) the agent's history DB in WAL mode so the sampler thread can
+    write while the request handler reads. Returns the connection or None if the
+    directory can't be created (history is best-effort, never fatal)."""
+    global _history_db
+    if _history_db is not None:
+        return _history_db
+    try:
+        os.makedirs(HISTORY_DIR, exist_ok=True)
+    except Exception:
+        return None
+    try:
+        conn = sqlite3.connect(HISTORY_DB, check_same_thread=False, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS tput_history ("
+            " ts INTEGER PRIMARY KEY, json TEXT NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS traffic_history ("
+            " ts INTEGER PRIMARY KEY, json TEXT NOT NULL)"
+        )
+        conn.commit()
+        _history_db = conn
+        return conn
+    except Exception:
+        return None
+
+
+def _history_flush_bucket(bucket_ts):
+    """Persist one completed bucket to the history DB. Throughput is stored as the
+    per-device average bytes/sec over the bucket; traffic is stored as the last
+    cumulative counter snapshot seen in the bucket (so deltas across buckets remain
+    correct). Best-effort: any failure is swallowed so history never breaks polls."""
+    acc = _HIST_ACC.pop(bucket_ts, None)
+    if not acc:
+        return
+    conn = _history_connect()
+    if conn is None:
+        return
+    try:
+        tput = acc.get("tput") or {}
+        avg = {dev: (s / n) for dev, (s, n) in tput.items() if n > 0}
+        traffic = acc.get("traffic") or {}
+        with _HISTORY_LOCK:
+            if avg:
+                conn.execute(
+                    "INSERT OR REPLACE INTO tput_history (ts, json) VALUES (?, ?)",
+                    (int(bucket_ts), json.dumps(avg)),
+                )
+            if traffic:
+                conn.execute(
+                    "INSERT OR REPLACE INTO traffic_history (ts, json) VALUES (?, ?)",
+                    (int(bucket_ts), json.dumps(traffic)),
+                )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _history_prune():
+    """Drop rows older than the retention window. Called opportunistically from the
+    sampler; cheap because ts is the primary key (indexed)."""
+    conn = _history_connect()
+    if conn is None:
+        return
+    cutoff = int(time.time() - HISTORY_RETENTION_S)
+    try:
+        with _HISTORY_LOCK:
+            conn.execute("DELETE FROM tput_history WHERE ts < ?", (cutoff,))
+            conn.execute("DELETE FROM traffic_history WHERE ts < ?", (cutoff,))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _history_accumulate(rates, traffic, now):
+    """Fold one live sample into the current 1-minute bucket. When the wall clock
+    crosses into a new bucket, the previous bucket(s) are flushed to disk."""
+    bucket = int(now // HISTORY_BUCKET_S) * HISTORY_BUCKET_S
+    # flush any older buckets that are now complete
+    for old_ts in [b for b in _HIST_ACC if b < bucket]:
+        _history_flush_bucket(old_ts)
+    slot = _HIST_ACC.setdefault(bucket, {"tput": {}, "traffic": {}})
+    if rates:
+        for dev, v in rates.items():
+            a = slot["tput"].setdefault(dev, [0.0, 0])
+            a[0] += v
+            a[1] += 1
+    if traffic:
+        # keep the latest cumulative snapshot in the bucket
+        for dev, v in traffic.items():
+            slot["traffic"][dev] = v
+
+
+def history_query(since, until, kind):
+    """Return up to HISTORY_MAX_ROWS rows in (since, until], oldest first, for the
+    orchestrator to backfill. kind is 'tput' or 'traffic'. Each row is
+    {"ts": epoch, "v": {device: value}}. The response is capped; if truncated the
+    caller re-requests with since = last returned ts (cursor pagination)."""
+    table = "tput_history" if kind == "tput" else "traffic_history"
+    conn = _history_connect()
+    if conn is None:
+        return {"rows": [], "truncated": False}
+    try:
+        with _HISTORY_LOCK:
+            cur = conn.execute(
+                f"SELECT ts, json FROM {table} WHERE ts > ? AND ts <= ?"
+                f" ORDER BY ts LIMIT ?",
+                (int(since), int(until), HISTORY_MAX_ROWS + 1),
+            )
+            fetched = cur.fetchall()
+    except Exception:
+        return {"rows": [], "truncated": False}
+    truncated = len(fetched) > HISTORY_MAX_ROWS
+    fetched = fetched[:HISTORY_MAX_ROWS]
+    rows = []
+    for ts, js in fetched:
+        try:
+            rows.append({"ts": int(ts), "v": json.loads(js)})
+        except Exception:
+            continue
+    return {"rows": rows, "truncated": truncated}
+
 
 def read_throughput():
     with _TPUT_LOCK:
@@ -327,6 +470,8 @@ def _sampler_loop():
     except Exception:
         prev, prev_d = {}, {}
     prev_t = time.monotonic()
+    _history_connect()
+    last_prune = 0.0
     while True:
         time.sleep(SAMPLE_INTERVAL)
         try:
@@ -341,6 +486,14 @@ def _sampler_loop():
                 _THROUGHPUT = rates
                 _THROUGHPUT_DIR = rates_d
             prev, prev_d, prev_t = cur, cur_d, t
+            # fold this sample into the rolling on-agent history. `cur` is the raw
+            # cumulative counter snapshot per device (summed rx+tx bytes).
+            now_wall = time.time()
+            _history_accumulate(rates, cur, now_wall)
+            # prune the retention window at most once an hour
+            if now_wall - last_prune > 3600:
+                _history_prune()
+                last_prune = now_wall
         except Exception:
             pass
 
@@ -379,6 +532,29 @@ def nym_node_since(svc):
     return round(btime + mono_us / 1_000_000)
 
 
+def read_disk():
+    """Usage of the filesystem holding the root partition (the main disk). Uses
+    os.statvfs on "/", so it works regardless of the underlying device name, which
+    differs per VPS. Returns {total, used, free, percent_used} in bytes, or None if
+    it can't be read. This is what surfaces the "disk nearly full" risk in the UI."""
+    try:
+        st = os.statvfs("/")
+        total = st.f_blocks * st.f_frsize
+        free = st.f_bavail * st.f_frsize           # available to non-root
+        # "used" as seen by df: total minus free-to-root, but for the bar we want
+        # the space that is unavailable to us, so base percent on bavail vs blocks.
+        used = total - (st.f_bfree * st.f_frsize)
+        pct = (used / total * 100.0) if total > 0 else 0.0
+        return {
+            "total": total,
+            "used": used,
+            "free": free,
+            "percent_used": round(pct, 1),
+        }
+    except Exception:
+        return None
+
+
 def build_status():
     active, svc = service_state()
     traffic = read_traffic()
@@ -398,6 +574,7 @@ def build_status():
         "boot_since": _proc_btime(),
         "traffic_dir": read_traffic_dir(),
         "throughput_dir": read_throughput_dir(),
+        "disk": read_disk(),
     }
 
 
@@ -2363,10 +2540,37 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"status": "ok", "agent_version": AGENT_VERSION})
         elif self.path == "/v1/status":
             self._send(200, build_status())
+        elif self.path.startswith("/v1/history"):
+            self._serve_history()
         elif self.path.startswith("/v1/backup"):
             self._serve_backup()
         else:
             self._send(404, {"error": "not found"})
+
+    def _serve_history(self):
+        """GET /v1/history?since=<epoch>&until=<epoch>&kind=tput|traffic
+
+        Returns rolling on-agent history for orchestrator backfill. Bounded to
+        HISTORY_MAX_ROWS rows; when truncated the caller re-requests with
+        since=<last ts> (cursor pagination). Timestamps are the agent's clock, so
+        a late pull still lands data at the correct historical position."""
+        try:
+            q = urllib.parse.urlparse(self.path).query
+            p = urllib.parse.parse_qs(q)
+            since = float(p.get("since", ["0"])[0])
+            until = float(p.get("until", [str(time.time())])[0])
+            kind = (p.get("kind", ["tput"])[0]).strip()
+            if kind not in ("tput", "traffic"):
+                kind = "tput"
+        except Exception:
+            self._send(400, {"error": "bad query params"})
+            return
+        result = history_query(since, until, kind)
+        result["kind"] = kind
+        result["retention_s"] = HISTORY_RETENTION_S
+        result["bucket_s"] = HISTORY_BUCKET_S
+        result["server_time"] = time.time()
+        self._send(200, result)
 
     def _serve_backup(self):
         q = urllib.parse.urlparse(self.path).query

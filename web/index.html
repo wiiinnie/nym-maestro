@@ -4,6 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>nym maestro</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="alternate icon" type="image/x-icon" href="/favicon.ico">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="theme-color" content="#1a1916">
 <style>
   :root{
     --bg:#fbfaf7; --surface:#ffffff; --surface-2:#f3f1ea; --line:#e4e1d7;
@@ -211,6 +215,9 @@
   .empty{text-align:center;padding:48px 20px;color:var(--muted)}
   .empty h3{color:var(--text);font-weight:600;margin:0 0 6px}
   .overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:center;justify-content:center;padding:20px;z-index:20}
+  /* overlays that must float ABOVE an already-open modal (command results,
+     throughput preview) — otherwise they render behind the triggering modal */
+  .overlay.overlay-top{z-index:40}
   .overlay.open{display:flex}
   body:has(.overlay.open){overflow:hidden}
   .flag{font-size:15px;line-height:1}
@@ -253,7 +260,7 @@
   .spark{display:block;cursor:pointer}
   .spark-wrap{display:inline-flex;align-items:center;min-width:84px;cursor:pointer}
   .spark-na{color:var(--faint);font-family:var(--mono);font-size:12px}
-  .tput-pop{position:absolute;z-index:30;background:var(--surface);border:1px solid var(--line);border-radius:10px;
+  .tput-pop{position:absolute;z-index:50;background:var(--surface);border:1px solid var(--line);border-radius:10px;
     padding:12px;box-shadow:0 10px 30px rgba(0,0,0,.28);width:380px;display:none}
   .tput-pop.open{display:block}
   .tput-head{display:flex;gap:9px;margin-bottom:10px}
@@ -281,7 +288,7 @@
   .modal-actions{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;
     position:sticky;bottom:0;background:var(--surface);margin:20px -24px 0;padding:14px 24px 0;border-top:1px solid var(--line)}
   .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--text);color:var(--bg);
-    padding:10px 16px;border-radius:var(--r);font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:30}
+    padding:10px 16px;border-radius:var(--r);font-size:13px;opacity:0;z-index:50;transition:opacity .2s;pointer-events:none;z-index:50}
   .toast.show{opacity:1}
   .toast.bad{background:var(--danger)}
   .modal.wide{max-width:640px}
@@ -664,7 +671,7 @@
   </div>
 </div>
 
-<div class="overlay" id="res-overlay">
+<div class="overlay overlay-top" id="res-overlay">
   <div class="modal wide">
     <h2 id="res-title">Results</h2>
     <div id="res-body"></div>
@@ -675,7 +682,7 @@
   </div>
 </div>
 
-<div class="overlay" id="tput-overlay">
+<div class="overlay overlay-top" id="tput-overlay">
   <div class="modal wide">
     <h2 id="tput-title">Throughput · last 24h</h2>
     <div id="tput-modal-body"></div>
@@ -1919,6 +1926,7 @@ function sortKeyVal(n, key){
     case 'eblocks':   { const e = s.extra_blocks; return !e || !e.installed ? 0 : (e.active ? 2 : 1); }
     case 'traffic':   { const v = trafficVal(s); return v == null ? -1 : v; }
     case 'throughput': { const v = sumDevices(s.throughput); return v == null ? -1 : v; }
+    case 'disk':      { const d = s.disk; return (d && d.percent_used != null) ? d.percent_used : -1; }
     default:          return '';
   }
 }
@@ -1997,6 +2005,7 @@ function renderTable(){
   htr.append(sortHeader('Traffic', 'traffic'));
   htr.append(sortHeader('Throughput', 'throughput'));
   htr.append(el('th', null, '24h'));
+  htr.append(sortHeader('Disk', 'disk'));
   htr.append(el('th', null, ''));
   thead.append(htr); table.append(thead);
 
@@ -2100,6 +2109,10 @@ function renderTable(){
     sp.addEventListener('click', () => openTputModal(n.uid));
     gTd.append(sp);
     tr.append(gTd);
+
+    const dTd = el('td');
+    dTd.append(diskPie(s && s.disk));
+    tr.append(dTd);
 
     const aTd = el('td');
     const ra = el('div','row-actions');
@@ -2723,6 +2736,63 @@ function fmtBurstShort(n){
   if(n >= 1000 && n % 1000 === 0) return (n/1000) + 'k';
   if(n >= 1000) return (n/1000).toFixed(1).replace(/\.0$/,'') + 'k';
   return String(n);
+}
+
+function diskPie(disk){
+  // green = free, red = used, on the main (root) partition. Colour of the whole
+  // pie shifts toward amber/red as it fills so a nearly-full disk is obvious at a
+  // glance in the fleet table.
+  if(!disk || disk.percent_used == null){
+    const dash = el('span','sub','—');
+    dash.title = 'No disk data (agent 0.10.1+ required)';
+    return dash;
+  }
+  const pct = Math.max(0, Math.min(100, disk.percent_used));
+  const used = disk.used, free = disk.free, total = disk.total;
+
+  // colour thresholds: <70% green ring, 70-90% amber, >90% red
+  const usedColor = pct >= 90 ? '#e5484d' : (pct >= 70 ? '#e0912f' : '#e5484d');
+  const freeColor = '#2ecc71';
+  // for the ring we always draw used in red-ish and free in green; the numeric
+  // label colour escalates with fill.
+  const labelColor = pct >= 90 ? '#e5484d' : (pct >= 70 ? '#e0912f' : 'var(--muted)');
+
+  const r = 9, cx = 11, cy = 11, C = 2 * Math.PI * r;
+  const usedLen = C * (pct / 100);
+  const wrap = el('div');
+  wrap.style.display = 'flex';
+  wrap.style.alignItems = 'center';
+  wrap.style.gap = '7px';
+
+  const svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
+  svg.setAttribute('viewBox','0 0 22 22');
+  svg.setAttribute('width','22'); svg.setAttribute('height','22');
+  svg.style.flex = '0 0 auto';
+  svg.style.transform = 'rotate(-90deg)';
+  // free (green) full ring underneath
+  const bg = document.createElementNS('http://www.w3.org/2000/svg','circle');
+  bg.setAttribute('cx',cx); bg.setAttribute('cy',cy); bg.setAttribute('r',r);
+  bg.setAttribute('fill','none'); bg.setAttribute('stroke',freeColor);
+  bg.setAttribute('stroke-width','4');
+  svg.appendChild(bg);
+  // used (red/amber) arc on top
+  const arc = document.createElementNS('http://www.w3.org/2000/svg','circle');
+  arc.setAttribute('cx',cx); arc.setAttribute('cy',cy); arc.setAttribute('r',r);
+  arc.setAttribute('fill','none'); arc.setAttribute('stroke',usedColor);
+  arc.setAttribute('stroke-width','4');
+  arc.setAttribute('stroke-dasharray', usedLen.toFixed(2) + ' ' + (C - usedLen).toFixed(2));
+  svg.appendChild(arc);
+  wrap.appendChild(svg);
+
+  const lbl = el('span','mono', pct.toFixed(0) + '%');
+  lbl.style.fontSize = '12px';
+  lbl.style.color = labelColor;
+  wrap.appendChild(lbl);
+
+  wrap.title = 'Main partition (/) · ' + pct.toFixed(1) + '% used\n' +
+    fmtBytes(used) + ' used of ' + fmtBytes(total) + '\n' +
+    fmtBytes(free) + ' free';
+  return wrap;
 }
 
 function extraBlocksBadge(s){
