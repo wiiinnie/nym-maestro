@@ -40,7 +40,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-AGENT_VERSION = "0.10.1"
+AGENT_VERSION = "0.10.2"
 
 try:
     with open(os.path.abspath(__file__), "rb") as _sf:
@@ -1911,6 +1911,24 @@ def _eb_is(state_cmd):
     return out.strip()
 
 
+def _eb_entries_cached():
+    """Valid IPv4/IPv6 (optionally CIDR) blocklist entries from the ON-DISK cache
+    only — never the network. Used by the per-poll status path so building status
+    can't block on a slow GitHub fetch. Returns [] if the cache is missing."""
+    text = _read_file(EB_CACHE)
+    out = []
+    for line in (text or "").splitlines():
+        e = line.split("#", 1)[0].strip()
+        if not e:
+            continue
+        try:
+            ipaddress.ip_network(e, strict=False)
+        except ValueError:
+            continue
+        out.append(e)
+    return out
+
+
 def _eb_chain_summary():
     """Live summary for the fleet column. Returns (blocked_count, blocklist_size,
     rate, burst).
@@ -1926,7 +1944,11 @@ def _eb_chain_summary():
     blocked = None
     blocklist_size = None
     try:
-        entries = _eb_fetch_entries(None)
+        # IMPORTANT: read the blocklist from the LOCAL cache only, never the network.
+        # This runs on every status poll; a network fetch here (even with a timeout)
+        # can stall the whole /v1/status endpoint and take the node offline when the
+        # path to GitHub is slow. The extra-blocks installer keeps EB_CACHE current.
+        entries = _eb_entries_cached()
         v4 = [e for e in entries if _eb_family(e) == 4]
         v6 = [e for e in entries if _eb_family(e) == 6]
         _, d4 = _eb_chain_rules("iptables", EB_CHAIN)
