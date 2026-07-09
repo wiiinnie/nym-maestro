@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import contextlib
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -428,7 +429,9 @@ async def ssh_verify_login(node: dict, port: int = 22, timeout: float = 20.0, at
         return False, "no managed key yet"
     khdir = SSH_DIR / "known_hosts.d"
     khdir.mkdir(parents=True, exist_ok=True)
-    kh = khdir / node["ip"].replace(":", "_")
+    # ip is validated as a bare address on create/patch; sanitize here too so a
+    # legacy/bad stored value can never traverse out of known_hosts.d.
+    kh = khdir / re.sub(r"[^0-9A-Za-z._-]", "_", node["ip"])
     cmd = ["ssh", "-i", str(key), "-o", "BatchMode=yes",
            "-o", "StrictHostKeyChecking=accept-new",
            "-o", f"UserKnownHostsFile={kh}",
@@ -759,13 +762,35 @@ app = FastAPI(title="nym maestro", version=VERSION, lifespan=lifespan)
 # the operator's browser resolves to a public name and is rejected here, even
 # though it would otherwise be same-origin to the local server.
 _ALLOWED_API_HOSTS = {"127.0.0.1", "localhost", "::1"}
+_API_TOKEN = (os.environ.get("MAESTRO_API_TOKEN") or "").strip()
+
+
+def _request_token(request: Request) -> str:
+    auth = request.headers.get("authorization") or ""
+    if auth[:7].lower() == "bearer ":
+        return auth[7:].strip()
+    return request.query_params.get("token") or request.cookies.get("maestro_token") or ""
 
 
 @app.middleware("http")
 async def _guard_host(request: Request, call_next):
-    host = (request.headers.get("host") or "").rsplit(":", 1)[0].strip("[]")
-    if host and host not in _ALLOWED_API_HOSTS:
-        return JSONResponse(status_code=403, content={"error": "forbidden host"})
+    # Loopback-only mode (no token configured): reject any non-loopback Host to
+    # defeat DNS-rebinding. When a token IS configured the operator has opted into
+    # remote access, so the token (below) is the gate instead of the Host header.
+    if not _API_TOKEN:
+        host = (request.headers.get("host") or "").rsplit(":", 1)[0].strip("[]")
+        if host and host not in _ALLOWED_API_HOSTS:
+            return JSONResponse(status_code=403, content={"error": "forbidden host"})
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def _require_token(request: Request, call_next):
+    # Per-request auth, active only when MAESTRO_API_TOKEN is set (i.e. the API is
+    # exposed beyond loopback). Token may arrive as `Authorization: Bearer <t>`, a
+    # `?token=` query param, or the `maestro_token` cookie the dashboard stores.
+    if _API_TOKEN and not hmac.compare_digest(_request_token(request).encode(), _API_TOKEN.encode()):
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
     return await call_next(request)
 
 
@@ -780,6 +805,18 @@ async def _validation_exc(request: Request, exc: RequestValidationError):
     return JSONResponse(status_code=400, content={"error": "invalid request body"})
 
 
+def _validate_ip(v):
+    """Reject anything that isn't a bare IPv4/IPv6 address. node['ip'] flows into
+    ssh argv, https URLs and a per-node known_hosts filename, so a value with '/'
+    or path components must never be stored."""
+    v = (v or "").strip()
+    try:
+        ipaddress.ip_address(v)
+    except ValueError:
+        raise ValueError("ip must be a valid IPv4/IPv6 address")
+    return v
+
+
 class NodeCreate(BaseModel):
     node_id: str
     name: str
@@ -791,6 +828,11 @@ class NodeCreate(BaseModel):
     binary_path: str = ""
     notes: str = ""
     enabled: bool = True
+
+    @field_validator("ip")
+    @classmethod
+    def _check_ip(cls, v):
+        return _validate_ip(v)
 
 
 class NodePatch(BaseModel):
@@ -804,6 +846,11 @@ class NodePatch(BaseModel):
     binary_path: str | None = None
     notes: str | None = None
     enabled: bool | None = None
+
+    @field_validator("ip")
+    @classmethod
+    def _check_ip(cls, v):
+        return v if v is None else _validate_ip(v)
 
 
 class ExecRequest(BaseModel):
@@ -951,11 +998,18 @@ def _require_node(request: Request, uid: str) -> dict:
 
 
 @app.get("/", response_class=HTMLResponse)
-def index():
+def index(request: Request):
     try:
-        return HTMLResponse(INDEX_PATH.read_bytes())   # fresh each load; no app restart for UI changes
+        resp = HTMLResponse(INDEX_PATH.read_bytes())   # fresh each load; no app restart for UI changes
     except Exception:
-        return HTMLResponse(INDEX_HTML)
+        resp = HTMLResponse(INDEX_HTML)
+    # When token auth is on, opening /?token=<t> once stores it as a cookie so the
+    # dashboard's same-origin fetches carry it automatically thereafter.
+    if _API_TOKEN:
+        tok = request.query_params.get("token") or ""
+        if tok and hmac.compare_digest(tok.encode(), _API_TOKEN.encode()):
+            resp.set_cookie("maestro_token", tok, httponly=True, samesite="strict")
+    return resp
 
 
 # Favicons live next to index.html in web/. Serving both .ico and .svg kills the

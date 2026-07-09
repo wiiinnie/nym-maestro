@@ -260,5 +260,25 @@ wallet.delete_wallet("OLD01")
 check("delete removes from list", "OLD01" not in wallet.list_wallets())
 check("delete removes file", not (WDIR / "OLD01.enc").exists())
 
+
+# --- O3: wallet-name path traversal is rejected on the read/delete paths --------
+def _rejects(fn):
+    try:
+        fn()
+    except wallet.WalletError:
+        return True
+    except Exception:
+        return False
+    return False
+
+check("decrypt_mnemonic rejects a traversal wallet name",
+      _rejects(lambda: wallet.decrypt_mnemonic("../../etc/passwd", "pw")))
+check("delete_wallet rejects a traversal wallet name",
+      _rejects(lambda: wallet.delete_wallet("../../x")))
+check("valid names accepted, separators/dotfiles rejected",
+      wallet._valid_wallet_name("ok_wallet")
+      and not wallet._valid_wallet_name("a/b")
+      and not wallet._valid_wallet_name(".hidden"))
+
 print(f"\n{_passed} passed, {_failed} failed")
 sys.exit(1 if _failed else 0)

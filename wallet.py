@@ -166,8 +166,23 @@ def list_wallets() -> list[str]:
     return sorted(names)
 
 
+def _valid_wallet_name(name: str) -> bool:
+    """A wallet name maps to <WALLET_DIR>/<name>.enc, so it must stay a single path
+    component — reject separators, dot-leading (.., hidden) and NUL to prevent any
+    traversal out of WALLET_DIR on the read/delete paths."""
+    name = (name or "").strip()
+    return bool(name) and "/" not in name and "\\" not in name \
+        and not name.startswith(".") and "\x00" not in name
+
+
+def _check_wallet_name(name: str) -> str:
+    if not _valid_wallet_name(name):
+        raise WalletError("invalid wallet name")
+    return name.strip()
+
+
 def wallet_exists(name: str) -> bool:
-    return (WALLET_DIR / f"{name}.enc").exists()
+    return _valid_wallet_name(name) and (WALLET_DIR / f"{name.strip()}.enc").exists()
 
 
 def _register_name(name: str):
@@ -183,6 +198,7 @@ def _register_name(name: str):
 def decrypt_mnemonic(name: str, password: str) -> str:
     """Return the decrypted mnemonic, or raise WalletError. Password is passed to
     openssl via env (never argv)."""
+    name = _check_wallet_name(name)
     enc = WALLET_DIR / f"{name}.enc"
     if not enc.exists():
         raise WalletError(f"wallet '{name}' not found")
@@ -197,9 +213,7 @@ def decrypt_mnemonic(name: str, password: str) -> str:
 
 
 def add_wallet(name: str, mnemonic: str, password: str, overwrite: bool = False) -> None:
-    name = name.strip()
-    if not name or "/" in name or name.startswith("."):
-        raise WalletError("invalid wallet name")
+    name = _check_wallet_name(name)
     if not mnemonic.strip():
         raise WalletError("empty mnemonic")
     _ensure_dir()
@@ -220,6 +234,7 @@ def add_wallet(name: str, mnemonic: str, password: str, overwrite: bool = False)
 
 
 def delete_wallet(name: str) -> None:
+    name = _check_wallet_name(name)
     enc = WALLET_DIR / f"{name}.enc"
     if enc.exists():
         enc.unlink()
