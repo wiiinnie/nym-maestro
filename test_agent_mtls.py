@@ -141,7 +141,7 @@ try:
     # 6. full orchestrator path: register node, refresh, see cached status
     from fastapi.testclient import TestClient
     import app as appmod
-    with TestClient(appmod.app) as tc:
+    with TestClient(appmod.app, base_url="http://127.0.0.1") as tc:
         cr = tc.post("/api/nodes", json={"node_id": "default-nym-node", "name": "T1",
                                          "ip": "127.0.0.1", "agent_port": PORT})
         uid = cr.json()["uid"]

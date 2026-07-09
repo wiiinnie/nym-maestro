@@ -26,7 +26,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from store import Conflict, Store
 import wallet
@@ -754,6 +754,21 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="nym maestro", version=VERSION, lifespan=lifespan)
 
 
+# Anti-DNS-rebinding: the API has no per-request auth and drives the whole fleet,
+# so only serve requests whose Host header is a loopback name. A rebinding page in
+# the operator's browser resolves to a public name and is rejected here, even
+# though it would otherwise be same-origin to the local server.
+_ALLOWED_API_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+@app.middleware("http")
+async def _guard_host(request: Request, call_next):
+    host = (request.headers.get("host") or "").rsplit(":", 1)[0].strip("[]")
+    if host and host not in _ALLOWED_API_HOSTS:
+        return JSONResponse(status_code=403, content={"error": "forbidden host"})
+    return await call_next(request)
+
+
 # Keep the API's error shape as {"error": "..."} so the UI stays unchanged.
 @app.exception_handler(HTTPException)
 async def _http_exc(request: Request, exc: HTTPException):
@@ -846,10 +861,29 @@ class ExtraBlocksRequest(BaseModel):
     node_ids: list[str]
 
 
+# A blocklist URL is forwarded to every targeted agent, where it is persisted and
+# read by a root-run script. Validate it as a plain http(s) URL here (no quotes,
+# whitespace or shell metacharacters) so the control plane never hands an agent a
+# value that could break out of a shell context.
+_EB_URL_RE = re.compile(r"^https?://[\w.\-~:/?#\[\]@!$&()*+,;=%]+$")
+
+
 class ExtraBlocksInstallRequest(BaseModel):
     node_ids: list[str]
     restart_node: bool = False
     list_url: str | None = None
+
+    @field_validator("list_url")
+    @classmethod
+    def _check_list_url(cls, v):
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            return None
+        if len(v) >= 2000 or not _EB_URL_RE.match(v):
+            raise ValueError("list_url must be a plain http(s) URL")
+        return v
 
 
 class WalletQueryRequest(BaseModel):
@@ -899,6 +933,14 @@ def local_agent_source():
     if m:
         version = m.group(1)
     return text, version, hashlib.sha256(data).hexdigest()
+
+
+def local_installer_source():
+    """Read the orchestrator's own install-nym-extra-blocks.sh — the script whose
+    content is pushed to agents over mTLS and run as root. Returns (text, sha256).
+    Edit that file (e.g. rate-limit values) and the next 'Run installer' ships it."""
+    data = (BASE / "install-nym-extra-blocks.sh").read_bytes()
+    return data.decode("utf-8"), hashlib.sha256(data).hexdigest()
 
 
 def _require_node(request: Request, uid: str) -> dict:
@@ -1131,6 +1173,16 @@ async def exec_action(payload: ExecRequest, request: Request):
     return {"job_id": job_id, "status": status, "results": results}
 
 
+# The agent generates backup names to a fixed pattern and validates them on its
+# side; the orchestrator re-validates the name it gets back before using it as a
+# local write path, so a compromised node cannot traverse out of BACKUPS.
+_BACKUP_NAME_RE = re.compile(r"^nym-backup_[A-Za-z0-9._-]+_\d{8}_\d{6}\.tar\.gz$")
+
+
+def _safe_backup_name(name: str) -> bool:
+    return bool(name) and os.path.basename(name) == name and bool(_BACKUP_NAME_RE.match(name))
+
+
 @app.post("/api/backup")
 async def backup(payload: BackupRequest, request: Request):
     app_ = request.app
@@ -1150,19 +1202,24 @@ async def backup(payload: BackupRequest, request: Request):
             res = await agent_exec(app_, node, "backup", timeout=900)
             ok = bool(res.get("ok"))
             if ok:
-                dest = BACKUPS / res["filename"]
-                got = await download_backup(app_, node, res["filename"], dest)
-                if got != res.get("sha256"):
+                fname = res.get("filename") or ""
+                dest = BACKUPS / fname
+                if not _safe_backup_name(fname) or dest.resolve().parent != BACKUPS.resolve():
                     ok = False
-                    res["error"] = "sha256 mismatch after download"
-                    with contextlib.suppress(Exception):
-                        dest.unlink()
+                    res["error"] = "agent returned an unsafe backup filename"
                 else:
-                    res["saved_path"] = str(dest)
-                    res["local_size"] = dest.stat().st_size
-                    with contextlib.suppress(Exception):
-                        await agent_exec(app_, node, "backup_cleanup",
-                                         {"name": res["filename"]}, timeout=30)
+                    got = await download_backup(app_, node, fname, dest)
+                    if got != res.get("sha256"):
+                        ok = False
+                        res["error"] = "sha256 mismatch after download"
+                        with contextlib.suppress(Exception):
+                            dest.unlink()
+                    else:
+                        res["saved_path"] = str(dest)
+                        res["local_size"] = dest.stat().st_size
+                        with contextlib.suppress(Exception):
+                            await agent_exec(app_, node, "backup_cleanup",
+                                             {"name": fname}, timeout=30)
         except Exception as e:
             res, ok = {"ok": False, "error": str(e)}, False
         store.record_target(job_id, node["uid"], "done" if ok else "failed", None, json.dumps(res))
@@ -1301,6 +1358,38 @@ async def extra_blocks_remove(payload: ExtraBlocksRequest, request: Request):
     store, nodes = _eb_targets(request, payload.node_ids)
     results = await _f2b_fanout(request.app, store, nodes, "extra_blocks_remove", {}, 60,
                                 "extra_blocks_remove")
+    await repoll_nodes(request.app, nodes)
+    return {"results": results}
+
+
+@app.post("/api/extra-blocks/install-script")
+async def extra_blocks_install_script(payload: ExtraBlocksRequest, request: Request):
+    # Ship the orchestrator's own install-nym-extra-blocks.sh to the nodes over the
+    # mTLS channel with its sha256; the agent verifies the hash before running it as
+    # root. No node ever fetches installer code from the internet.
+    store, nodes = _eb_targets(request, payload.node_ids)
+    content, sha = local_installer_source()
+    params = {"content": content, "sha256": sha}
+    job_id = uuid.uuid4().hex
+    store.record_job(job_id, "extra_blocks_install_script",
+                     json.dumps({"nodes": len(nodes), "sha256": sha}), len(nodes))
+    results = await _f2b_fanout(request.app, store, nodes, "extra_blocks_install_script",
+                                params, 200, "extra_blocks_install_script")
+    for r in results:
+        store.record_target(job_id, r["uid"], "done" if r["ok"] else "failed", None,
+                            json.dumps(r["result"]))
+    ok_count = sum(1 for r in results if r["ok"])
+    status = "done" if ok_count == len(results) else ("failed" if ok_count == 0 else "partial")
+    store.finish_job(job_id, status)
+    await repoll_nodes(request.app, nodes)
+    return {"job_id": job_id, "status": status, "sha256": sha, "results": results}
+
+
+@app.post("/api/extra-blocks/restart-service")
+async def extra_blocks_restart_service(payload: ExtraBlocksRequest, request: Request):
+    store, nodes = _eb_targets(request, payload.node_ids)
+    results = await _f2b_fanout(request.app, store, nodes, "extra_blocks_restart_service", {},
+                                120, "extra_blocks_restart_service")
     await repoll_nodes(request.app, nodes)
     return {"results": results}
 
@@ -1703,9 +1792,16 @@ def main():
     args = ap.parse_args()
     os.environ["MAESTRO_DB"] = args.db
     host, _, port = args.addr.rpartition(":")
+    host = host or "127.0.0.1"
+
+    # The API is unauthenticated and controls the whole fleet + wallet, so refuse
+    # to bind anywhere but loopback unless the operator has explicitly set an
+    # access token (defence against an accidental `--addr 0.0.0.0` exposure).
+    if host not in ("127.0.0.1", "::1", "localhost") and not os.environ.get("MAESTRO_API_TOKEN"):
+        ap.error("refusing to bind to a non-loopback address without MAESTRO_API_TOKEN set")
 
     import uvicorn
-    uvicorn.run(app, host=host or "127.0.0.1", port=int(port))
+    uvicorn.run(app, host=host, port=int(port))
 
 
 if __name__ == "__main__":
