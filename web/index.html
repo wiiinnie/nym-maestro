@@ -766,10 +766,7 @@
 
       <div style="border:1px solid var(--line);border-radius:8px;padding:12px 14px">
         <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">1 · Install / Update script</div>
-        <p style="font-size:12px;color:var(--muted);margin:0 0 8px">Fetches <span class="mono" style="font-size:11px">install-nym-extra-blocks.sh</span> from GitHub and runs it as root. Sets up the systemd oneshot unit, installs the rate limiting and the IP blocklist. Use for first install or when the installer script has changed (e.g. new rate-limit values).</p>
-        <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:6px">Installer URL
-          <input id="eb-script-url" placeholder="https://raw.githubusercontent.com/wiiinnie/nym-maestro/refs/heads/main/install-nym-extra-blocks.sh" style="margin-top:3px;font-size:11px;font-family:var(--mono)">
-        </label>
+        <p style="font-size:12px;color:var(--muted);margin:0 0 8px">Ships the orchestrator's own <span class="mono" style="font-size:11px">install-nym-extra-blocks.sh</span> to the selected nodes over mTLS and runs it as root — sets up the systemd oneshot unit, the rate limiting and the IP blocklist. The script is integrity-checked (sha256) before it runs; nothing is fetched from the internet. To change rate-limit values, edit that local file, then run this.</p>
         <button id="eb-install-script" onclick="ebInstallScript()">Run installer</button>
       </div>
 
@@ -2805,39 +2802,56 @@ function extraBlocksBadge(s){
   wrap.style.gap = '3px';
   wrap.style.alignItems = 'flex-start';
 
-  // line 1: state pill
-  wrap.append(eb.active ? el('span','pill ok','Active') : el('span','pill warn','Inactive'));
-
-  // line 2: blocked IP count (our blocklist entries present in the chain)
-  if(eb.blocked_count != null){
-    const size = eb.blocklist_size;
-    const txt = (size != null && eb.blocked_count < size)
-      ? eb.blocked_count + '/' + size + ' IPs blocked'
-      : eb.blocked_count + ' IPs blocked';
-    const line = el('span','sub', txt);
-    line.style.fontSize = '11px';
-    line.style.whiteSpace = 'nowrap';
-    if(size != null && eb.blocked_count < size) line.style.color = 'var(--warn, #d9933a)';
-    line.title = 'Your blocklist REJECT rules present in NYM-EXIT (not the node-wide exit policy, which adds hundreds more).';
-    wrap.append(line);
+  // line 1: state pill — a running oneshot whose NYM-EXIT chain is gone applied
+  // nothing, so don't show a reassuring green "Active" in that case.
+  if(eb.active && eb.chain_present === false){
+    wrap.append(el('span','pill warn','Active · no NYM-EXIT'));
+  } else {
+    wrap.append(eb.active ? el('span','pill ok','Active') : el('span','pill warn','Inactive'));
   }
 
-  // line 3: rate / burst
-  if(eb.rate_limit_active && eb.rate_limit_rate){
-    const line = el('span','sub', eb.rate_limit_rate + ' · burst ' + fmtBurstShort(eb.rate_limit_burst));
+  if(eb.chain_present === false){
+    // The oneshot ran but NYM-EXIT (v4) was missing, so neither rate-limit nor
+    // blocks were applied — flag it instead of the misleading "0/N, no rate-limit".
+    const line = el('span','sub','NYM-EXIT missing — re-run network_tunnel_manager, then reinstall');
     line.style.fontSize = '11px';
-    line.style.whiteSpace = 'nowrap';
-    line.title = 'Per-source-IP connection rate-limit: new TCP connections up to ' +
-      eb.rate_limit_rate + ' (burst ' + (eb.rate_limit_burst != null ? eb.rate_limit_burst : '?') +
-      ') per source IP are accepted; excess dropped. Established flows never limited.';
-    wrap.append(line);
-  } else if(eb.rate_limit_active === false){
-    const line = el('span','sub','no rate-limit');
-    line.style.fontSize = '11px';
-    line.style.whiteSpace = 'nowrap';
     line.style.color = 'var(--warn, #d9933a)';
-    line.title = 'No per-source rate-limit rule in NYM-EXIT — run section 1 (Install / Update script) to apply it.';
+    line.title = 'The extra-blocks oneshot ran but the NYM-EXIT (v4) iptables chain was not present, ' +
+      'so neither the per-source rate-limit nor the block rules were applied. Recreate the chain ' +
+      '(network_tunnel_manager) and persist it (netfilter-persistent save), then re-run the installer.';
     wrap.append(line);
+  } else {
+    // line 2: blocked IP count (our blocklist entries present in the chain)
+    if(eb.blocked_count != null){
+      const size = eb.blocklist_size;
+      const txt = (size != null && eb.blocked_count < size)
+        ? eb.blocked_count + '/' + size + ' IPs blocked'
+        : eb.blocked_count + ' IPs blocked';
+      const line = el('span','sub', txt);
+      line.style.fontSize = '11px';
+      line.style.whiteSpace = 'nowrap';
+      if(size != null && eb.blocked_count < size) line.style.color = 'var(--warn, #d9933a)';
+      line.title = 'Your blocklist REJECT rules present in NYM-EXIT (not the node-wide exit policy, which adds hundreds more).';
+      wrap.append(line);
+    }
+
+    // line 3: rate / burst
+    if(eb.rate_limit_active && eb.rate_limit_rate){
+      const line = el('span','sub', eb.rate_limit_rate + ' · burst ' + fmtBurstShort(eb.rate_limit_burst));
+      line.style.fontSize = '11px';
+      line.style.whiteSpace = 'nowrap';
+      line.title = 'Per-source-IP connection rate-limit: new TCP connections up to ' +
+        eb.rate_limit_rate + ' (burst ' + (eb.rate_limit_burst != null ? eb.rate_limit_burst : '?') +
+        ') per source IP are accepted; excess dropped. Established flows never limited.';
+      wrap.append(line);
+    } else if(eb.rate_limit_active === false){
+      const line = el('span','sub','no rate-limit');
+      line.style.fontSize = '11px';
+      line.style.whiteSpace = 'nowrap';
+      line.style.color = 'var(--warn, #d9933a)';
+      line.title = 'No per-source rate-limit rule in NYM-EXIT — run section 1 (Install / Update script) to apply it.';
+      wrap.append(line);
+    }
   }
 
   return wrap;
@@ -2977,11 +2991,8 @@ async function ebRemove(){
 async function ebInstallScript(){
   const btn = document.getElementById('eb-install-script');
   btn.disabled = true; btn.textContent = 'Running installer…';
-  const url = (document.getElementById('eb-script-url').value || '').trim();
-  const body = {node_ids: ebTargets};
-  if(url) body.installer_url = url;
   try{
-    const r = await api('/api/extra-blocks/install-script', {method:'POST', body: JSON.stringify(body)});
+    const r = await api('/api/extra-blocks/install-script', {method:'POST', body: JSON.stringify({node_ids: ebTargets})});
     showResults('Extra blocks · install script', r.results);
     await loadEbStatus(); await load();
   }catch(e){ toast(e.message, true); }
