@@ -20,7 +20,8 @@ def check(label, cond):
         print(f"  FAIL  {label}")
 
 
-with TestClient(appmod.app) as c:
+# base_url on loopback so requests carry a Host the API's anti-rebinding guard allows
+with TestClient(appmod.app, base_url="http://127.0.0.1") as c:
     # health
     r = c.get("/api/health")
     check("health 200 + version", r.status_code == 200 and r.json()["version"] == appmod.VERSION)

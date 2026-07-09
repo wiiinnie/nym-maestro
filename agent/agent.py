@@ -1811,7 +1811,7 @@ EB_SCRIPT = r"""#!/usr/bin/env bash
 # nym-maestro-managed — do not edit by hand; reinstall via maestro instead.
 set -euo pipefail
 
-LIST_URL="__LIST_URL__"
+LIST_URL="$(cat /var/lib/nym-extra-blocks/list_url 2>/dev/null || true)"
 CACHE="/var/lib/nym-extra-blocks/blocklist.txt"
 CHAIN="NYM-EXIT"
 CHAIN6="__CHAIN6__"
@@ -1931,7 +1931,11 @@ def _eb_entries_cached():
 
 def _eb_chain_summary():
     """Live summary for the fleet column. Returns (blocked_count, blocklist_size,
-    rate, burst).
+    rate, burst, chain_present).
+
+    chain_present is whether the NYM-EXIT (v4) chain exists at all: when it does
+    not, the oneshot can apply neither rate-limit nor blocks, so the overview must
+    flag it rather than showing a reassuring "Active, 0/N".
 
     blocked_count is how many of OUR blocklist entries are actually present in the
     chain — NOT the total REJECT count. The NYM-EXIT chain also carries hundreds of
@@ -1943,6 +1947,7 @@ def _eb_chain_summary():
     be read come back as None."""
     blocked = None
     blocklist_size = None
+    chain_present = None
     try:
         # IMPORTANT: read the blocklist from the LOCAL cache only, never the network.
         # This runs on every status poll; a network fetch here (even with a timeout)
@@ -1951,7 +1956,7 @@ def _eb_chain_summary():
         entries = _eb_entries_cached()
         v4 = [e for e in entries if _eb_family(e) == 4]
         v6 = [e for e in entries if _eb_family(e) == 6]
-        _, d4 = _eb_chain_rules("iptables", EB_CHAIN)
+        chain_present, d4 = _eb_chain_rules("iptables", EB_CHAIN)
         if _eb_v6_supported():
             _, d6 = _eb_chain_rules("ip6tables", EB_CHAIN6)
         else:
@@ -1974,7 +1979,7 @@ def _eb_chain_summary():
     except Exception:
         pass
 
-    return blocked, blocklist_size, rate, burst
+    return blocked, blocklist_size, rate, burst, chain_present
 
 
 def _extra_blocks_state():
@@ -1986,9 +1991,10 @@ def _extra_blocks_state():
         return {"installed": False, "enabled": False, "active": False, "state": "missing"}
     active = _eb_is("is-active") == "active"
     enabled = _eb_is("is-enabled") in ("enabled", "enabled-runtime", "static", "alias")
-    blocked, blocklist_size, rate, burst = _eb_chain_summary()
+    blocked, blocklist_size, rate, burst, chain_present = _eb_chain_summary()
     return {"installed": True, "enabled": enabled, "active": active,
             "state": "active" if active else "inactive",
+            "chain_present": chain_present,
             "blocked_count": blocked,
             "blocklist_size": blocklist_size,
             "rate_limit_active": (rate is not None),
@@ -2159,14 +2165,18 @@ def _eb_write_files(list_url):
     try:
         os.makedirs(EB_STATE_DIR, exist_ok=True)
         os.makedirs(os.path.dirname(EB_SH), exist_ok=True)
+        # Write the URL the runtime script reads (via cat) BEFORE the script itself,
+        # so a concurrently-triggered oneshot always finds it. The URL is no longer
+        # baked into the script text — reading it from a file means its contents can
+        # never be re-parsed by the shell (closes the LIST_URL injection vector).
+        _write_file(EB_URL_FILE, list_url + "\n")
         tmp = EB_SH + ".tmp"
         with open(tmp, "w") as f:
-            f.write(EB_SCRIPT.replace("__LIST_URL__", list_url).replace("__CHAIN6__", EB_CHAIN6))
+            f.write(EB_SCRIPT.replace("__CHAIN6__", EB_CHAIN6))
         os.chmod(tmp, 0o755)
         os.replace(tmp, EB_SH)
         with open(EB_UNIT, "w") as f:
             f.write(EB_UNIT_TPL.replace("__NYM__", nym))
-        _write_file(EB_URL_FILE, list_url + "\n")
     except Exception as e:
         return False, f"could not write files: {e}", {}
     _run(["systemctl", "daemon-reload"], timeout=20)
@@ -2175,8 +2185,14 @@ def _eb_write_files(list_url):
                         "backups": backed}
 
 
+# Defence-in-depth alongside reading the URL from a file at runtime: reject any
+# value that isn't a plain http(s) URL (no quotes, whitespace, backticks or other
+# shell metacharacters) before it is ever persisted or handed to curl.
+_EB_URL_RE = re.compile(r"^https?://[\w.\-~:/?#\[\]@!$&()*+,;=%]+$")
+
+
 def _EB_URL_OK(url):
-    return isinstance(url, str) and url.startswith(("http://", "https://")) and len(url) < 2000
+    return isinstance(url, str) and len(url) < 2000 and bool(_EB_URL_RE.match(url))
 
 
 def _eb_wait_rules(want, deadline_s=90):
@@ -2254,57 +2270,6 @@ def act_extra_blocks_install(params):
     }
 
 
-def act_extra_blocks_restart_service(params):
-    """Restart nym-extra-blocks.service — re-fetches the blocklist and re-applies
-    all REJECT rules + rate-limit to the running NYM-EXIT chain."""
-    log = ["restarting nym-extra-blocks.service"]
-    rc, out, errx = _run(["systemctl", "restart", EB_UNIT_NAME], timeout=90)
-    log.append("restart: " + ("ok" if rc == 0 else "FAILED " + (errx or out).strip()))
-    return {
-        "ok": rc == 0,
-        "state": _extra_blocks_state(),
-        "output": "\n".join(log),
-        "error": None if rc == 0 else "service restart failed",
-    }
-
-
-def act_extra_blocks_install_script(params):
-    """Fetch install-nym-extra-blocks.sh from GitHub and run it as root.
-    Sets up the systemd unit, rate limiting, and applies the blocklist."""
-    import urllib.request, tempfile, os
-    installer_url = params.get("installer_url") or (
-        "https://raw.githubusercontent.com/wiiinnie/nym-maestro/"
-        "refs/heads/main/install-nym-extra-blocks.sh"
-    )
-    log = [f"fetching installer from {installer_url}"]
-    try:
-        with urllib.request.urlopen(installer_url, timeout=30) as resp:
-            script = resp.read()
-        log.append(f"downloaded {len(script)} bytes")
-    except Exception as e:
-        return {"ok": False, "error": f"fetch failed: {e}", "output": "\n".join(log)}
-
-    # write to a temp file and run as root
-    with tempfile.NamedTemporaryFile(suffix=".sh", delete=False, mode="wb") as f:
-        f.write(script)
-        tmp = f.name
-    try:
-        os.chmod(tmp, 0o700)
-        rc, out, errx = _run(["bash", tmp], timeout=120)
-        log.append(out or "")
-        if errx: log.append(errx)
-        log.append("installer: " + ("ok" if rc == 0 else "FAILED"))
-    finally:
-        try: os.unlink(tmp)
-        except: pass
-    return {
-        "ok": rc == 0,
-        "state": _extra_blocks_state(),
-        "output": "\n".join(log),
-        "error": None if rc == 0 else "installer exited with error",
-    }
-
-
 def act_extra_blocks_upgrade(params):
     """Rewrite the runtime script (EB_SH) from the agent's built-in template,
     preserving the currently configured list_url, then restart the service so
@@ -2326,126 +2291,6 @@ def act_extra_blocks_upgrade(params):
         "state": _extra_blocks_state(),
         "output": "\n".join(log),
         "error": None if rc == 0 else "service restart failed after script update",
-    }
-
-
-def act_extra_blocks_install_script(params):
-    """Fetch install-nym-extra-blocks.sh from GitHub and run it as root."""
-    installer_url = (params.get("installer_url") or "").strip() or (
-        "https://raw.githubusercontent.com/wiiinnie/nym-maestro/"
-        "refs/heads/main/install-nym-extra-blocks.sh"
-    )
-    # cache-bust raw.githubusercontent (its CDN caches aggressively) so we always
-    # get the current file, not a stale edge copy.
-    fetch_url = installer_url
-    sep = "&" if "?" in fetch_url else "?"
-    fetch_url = f"{fetch_url}{sep}t={int(time.time())}"
-    log = [f"fetching installer from {installer_url}"]
-    try:
-        req = urllib.request.Request(fetch_url, headers={
-            "User-Agent": "nym-maestro-agent",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-        })
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            script = resp.read()
-        log.append(f"downloaded {len(script)} bytes")
-    except Exception as e:
-        return {"ok": False, "error": f"fetch failed: {e}", "output": "\n".join(log)}
-    fd, tmp = tempfile.mkstemp(suffix=".sh", prefix="maestro-install-")
-    rc = 1
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(script)
-        os.chmod(tmp, 0o700)
-        rc, out, errx = _run(["bash", tmp], timeout=180)
-        log.append((out or "").strip())
-        if errx and errx.strip():
-            log.append(errx.strip())
-        log.append("installer: " + ("ok" if rc == 0 else f"FAILED (exit {rc})"))
-    except Exception as e:
-        return {"ok": False, "error": f"run failed: {e}", "output": "\n".join(log)}
-    finally:
-        with contextlib.suppress(Exception):
-            os.unlink(tmp)
-    return {
-        "ok": rc == 0,
-        "state": _extra_blocks_state(),
-        "output": "\n".join(log),
-        "error": None if rc == 0 else f"installer exited with code {rc}",
-    }
-
-
-def act_extra_blocks_restart_service(params):
-    """Restart nym-extra-blocks.service without touching nym-node."""
-    log = [f"restarting {EB_UNIT_NAME}"]
-    rc, out, errx = _run(["systemctl", "restart", EB_UNIT_NAME], timeout=90)
-    log.append("restart: " + ("ok" if rc == 0 else "FAILED " + (errx or out).strip()))
-    return {
-        "ok": rc == 0,
-        "state": _extra_blocks_state(),
-        "output": "\n".join(log),
-        "error": None if rc == 0 else "service restart failed",
-    }
-
-
-def act_extra_blocks_install_script(params):
-    """Fetch install-nym-extra-blocks.sh from GitHub and run it as root."""
-    installer_url = (params.get("installer_url") or "").strip() or (
-        "https://raw.githubusercontent.com/wiiinnie/nym-maestro/"
-        "refs/heads/main/install-nym-extra-blocks.sh"
-    )
-    # cache-bust raw.githubusercontent (its CDN caches aggressively) so we always
-    # get the current file, not a stale edge copy.
-    fetch_url = installer_url
-    sep = "&" if "?" in fetch_url else "?"
-    fetch_url = f"{fetch_url}{sep}t={int(time.time())}"
-    log = [f"fetching installer from {installer_url}"]
-    try:
-        req = urllib.request.Request(fetch_url, headers={
-            "User-Agent": "nym-maestro-agent",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-        })
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            script = resp.read()
-        log.append(f"downloaded {len(script)} bytes")
-    except Exception as e:
-        return {"ok": False, "error": f"fetch failed: {e}", "output": "\n".join(log)}
-    fd, tmp = tempfile.mkstemp(suffix=".sh", prefix="maestro-install-")
-    rc = 1
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(script)
-        os.chmod(tmp, 0o700)
-        rc, out, errx = _run(["bash", tmp], timeout=180)
-        log.append((out or "").strip())
-        if errx and errx.strip():
-            log.append(errx.strip())
-        log.append("installer: " + ("ok" if rc == 0 else f"FAILED (exit {rc})"))
-    except Exception as e:
-        return {"ok": False, "error": f"run failed: {e}", "output": "\n".join(log)}
-    finally:
-        with contextlib.suppress(Exception):
-            os.unlink(tmp)
-    return {
-        "ok": rc == 0,
-        "state": _extra_blocks_state(),
-        "output": "\n".join(log),
-        "error": None if rc == 0 else f"installer exited with code {rc}",
-    }
-
-
-def act_extra_blocks_restart_service(params):
-    """Restart nym-extra-blocks.service without touching nym-node."""
-    log = [f"restarting {EB_UNIT_NAME}"]
-    rc, out, errx = _run(["systemctl", "restart", EB_UNIT_NAME], timeout=90)
-    log.append("restart: " + ("ok" if rc == 0 else "FAILED " + (errx or out).strip()))
-    return {
-        "ok": rc == 0,
-        "state": _extra_blocks_state(),
-        "output": "\n".join(log),
-        "error": None if rc == 0 else "service restart failed",
     }
 
 
@@ -2488,6 +2333,59 @@ def act_extra_blocks_remove(params):
     log.append(f"removed unit + script; deleted {removed} REJECT rules from the exit chains")
     return {"ok": True, "removed_rules": removed, "state": _extra_blocks_state(),
             "output": "\n".join(log), "error": None}
+
+
+def act_extra_blocks_install_script(params):
+    """Run the extra-blocks installer that the orchestrator pushed over mTLS.
+
+    The script content and its sha256 come from the orchestrator, which vouches
+    for its own local install-nym-extra-blocks.sh. The agent NEVER fetches code
+    from the internet: the mTLS channel is the trusted transport, and the content
+    is integrity-checked against the supplied hash before it is ever run as root.
+    """
+    content = params.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return {"ok": False, "error": "no installer content provided"}
+    actual = hashlib.sha256(content.encode()).hexdigest()
+    want = (params.get("sha256") or "").strip().lower()
+    if not want or want != actual:
+        return {"ok": False, "error": "sha256 mismatch (transfer corrupted or hash missing)"}
+    log = [f"received installer over mTLS ({len(content)} bytes, sha256 {actual[:12]})"]
+    fd, tmp = tempfile.mkstemp(suffix=".sh", prefix="maestro-install-")
+    rc = 1
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.chmod(tmp, 0o700)
+        rc, out, errx = _run(["bash", tmp], timeout=180)
+        log.append((out or "").strip())
+        if errx and errx.strip():
+            log.append(errx.strip())
+        log.append("installer: " + ("ok" if rc == 0 else f"FAILED (exit {rc})"))
+    except Exception as e:
+        return {"ok": False, "error": f"run failed: {e}", "output": "\n".join(log)}
+    finally:
+        with contextlib.suppress(Exception):
+            os.unlink(tmp)
+    return {
+        "ok": rc == 0,
+        "state": _extra_blocks_state(),
+        "output": "\n".join(log),
+        "error": None if rc == 0 else f"installer exited with code {rc}",
+    }
+
+
+def act_extra_blocks_restart_service(params):
+    """Restart nym-extra-blocks.service without touching nym-node."""
+    log = [f"restarting {EB_UNIT_NAME}"]
+    rc, out, errx = _run(["systemctl", "restart", EB_UNIT_NAME], timeout=90)
+    log.append("restart: " + ("ok" if rc == 0 else "FAILED " + (errx or out).strip()))
+    return {
+        "ok": rc == 0,
+        "state": _extra_blocks_state(),
+        "output": "\n".join(log),
+        "error": None if rc == 0 else "service restart failed",
+    }
 
 
 EXEC_ACTIONS = {
