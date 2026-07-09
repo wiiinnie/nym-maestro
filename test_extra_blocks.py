@@ -235,5 +235,16 @@ check("status includes chain_present when installed", "chain_present" in _st)
 check("_eb_chain_summary returns the 5-tuple incl. chain_present",
       len(agent._eb_chain_summary()) == 5)
 
+# 15. act_upgrade hardening (A3): https required, sha256 mandatory, NTM path confined
+_up = agent.EXEC_ACTIONS["upgrade"]
+_r = _up({"url": "http://x/nym-node"})
+check("upgrade rejects a non-https download url",
+      _r.get("ok") is False and "https" in (_r.get("error") or ""))
+check("upgrade no longer skips the integrity check when no sha is given",
+      "skipping integrity check" not in inspect.getsource(_up)
+      and 'fullmatch(r"[0-9a-f]{64}"' in inspect.getsource(_up))
+check("upgrade confines the NTM script to a basename (no absolute path honoured)",
+      "os.path.basename(ntm.get" in inspect.getsource(_up))
+
 print(f"\n{ok} passed, {fail} failed")
 raise SystemExit(1 if fail else 0)

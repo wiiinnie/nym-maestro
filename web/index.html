@@ -636,7 +636,12 @@
     <div class="field">
       <label for="up-url">nym-node release URL</label>
       <input id="up-url" placeholder="https://github.com/nymtech/nym/releases/download/.../nym-node">
-      <div class="hint">Downloaded to each node; verified with --version before replacing the binary named in the unit file.</div>
+      <div class="hint">Must be https. Downloaded to each node; verified with --version before replacing the binary named in the unit file.</div>
+    </div>
+    <div class="field">
+      <label for="up-sha">SHA-256 of the release binary (required)</label>
+      <input id="up-sha" placeholder="64 hex chars — from the release page's checksums">
+      <div class="hint">The node refuses to install a binary whose hash doesn't match — this is what protects a root-run download against a hijacked host or wrong URL.</div>
     </div>
     <div class="checkrow" style="margin-top:4px">
       <input id="up-ntm" type="checkbox" onchange="document.getElementById('ntm-box').style.display=this.checked?'block':'none'">
@@ -2372,6 +2377,7 @@ function openUpgrade(){
   document.getElementById('up-sub').textContent = 'Applies to ' + sel.length + ' selected node(s): ' +
     sel.map(n => n.name).join(', ') + '.';
   document.getElementById('up-url').value = '';
+  document.getElementById('up-sha').value = '';
   document.getElementById('up-ntm').checked = false;
   document.getElementById('ntm-box').style.display = 'none';
   document.getElementById('up-ntm-url').value = '';
@@ -2385,7 +2391,10 @@ function closeUp(){ document.getElementById('up-overlay').classList.remove('open
 async function applyUpgrade(){
   const url = document.getElementById('up-url').value.trim();
   if(!url){ toast('A nym-node release URL is required', true); return; }
-  const params = { url, restart: document.getElementById('up-restart').checked };
+  if(!/^https:\/\//i.test(url)){ toast('The release URL must be https', true); return; }
+  const sha = document.getElementById('up-sha').value.trim().toLowerCase();
+  if(!/^[0-9a-f]{64}$/.test(sha)){ toast('A SHA-256 (64 hex chars) of the release binary is required', true); return; }
+  const params = { url, sha256: sha, restart: document.getElementById('up-restart').checked };
   if(document.getElementById('up-ntm').checked){
     const ntmUrl = document.getElementById('up-ntm-url').value.trim();
     if(!ntmUrl){ toast('NTM is checked but no script URL given', true); return; }
