@@ -531,6 +531,55 @@ class Store:
                 "total_bps": total_bps, "observed_hours": round(span / 3600.0, 2),
                 "window_hours": hours, "nodes": len(per_node)}
 
+    def traffic_daily(self, days=30):
+        """REAL fleet traffic per LOCAL calendar day, from cumulative-counter
+        snapshots — same delta/reset logic as traffic_window, bucketed by the
+        day of the later snapshot of each consecutive pair.
+
+        Returns one row per day that has data: {ts: local-midnight epoch,
+        dev_bytes: {device: bytes}, bytes: total}. The newest row is today and
+        therefore partial. History is pruned at 30 days, so that's the ceiling."""
+        days = max(1, min(int(days), 60))
+        now = time.localtime()
+        midnight_today = time.mktime((now.tm_year, now.tm_mon, now.tm_mday,
+                                      0, 0, 0, 0, 0, -1))
+        since = midnight_today - (days - 1) * 86400
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT uid, ts, json FROM traffic_history WHERE ts >= ?"
+                " ORDER BY uid, ts",
+                (since - 3600,),  # lead-in so the first day's first delta exists
+            ).fetchall()
+        per_node = {}
+        for r in rows:
+            try:
+                d = json.loads(r["json"]) or {}
+            except Exception:
+                continue
+            per_node.setdefault(r["uid"], []).append((r["ts"], d))
+        day_dev = {}  # local-midnight epoch -> {dev: bytes}
+        for _uid, snaps in per_node.items():
+            if len(snaps) < 2:
+                continue
+            prev = snaps[0][1]
+            for ts, cur in snaps[1:]:
+                if ts >= since:
+                    lt = time.localtime(ts)
+                    dkey = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
+                                        0, 0, 0, 0, 0, -1))
+                    bucket = day_dev.setdefault(dkey, {})
+                    for dev, v in cur.items():
+                        pv = prev.get(dev)
+                        if pv is None:
+                            continue
+                        delta = (v - pv) if v >= pv else v  # reset -> post-reset bytes
+                        if delta > 0:
+                            bucket[dev] = bucket.get(dev, 0.0) + delta
+                prev = cur
+        out = [{"ts": k, "dev_bytes": v, "bytes": sum(v.values())}
+               for k, v in sorted(day_dev.items())]
+        return {"days": out, "window_days": days}
+
     def throughput_series(self, hours=24, buckets=96):
         """Downsampled per-node, per-device throughput over the last `hours`.
 

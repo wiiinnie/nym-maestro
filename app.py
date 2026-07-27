@@ -1090,6 +1090,13 @@ def traffic_window(request: Request, hours: float = 24.0):
     return request.app.state.store.traffic_window(hours=hours)
 
 
+@app.get("/api/traffic/daily")
+def traffic_daily(request: Request, days: int = 30):
+    # per-LOCAL-calendar-day REAL traffic from counter snapshots (last row = today, partial)
+    days = max(1, min(days, 60))
+    return request.app.state.store.traffic_daily(days=days)
+
+
 @app.get("/api/onwire/avg")
 def onwire_average(request: Request, hours: float = 24.0):
     # fleet average ON-WIRE throughput (bits/s), split wg / mix
