@@ -52,6 +52,10 @@ with TestClient(appmod.app, base_url="http://127.0.0.1") as c:
     check("create rejects blank name (400 + error shape)",
           r.status_code == 400 and "error" in r.json())
 
+    # O4: ip must be a bare IPv4/IPv6 address (no path components / CIDR)
+    r = c.post("/api/nodes", json={"node_id": "z", "name": "BadIP", "ip": "../../etc/x"})
+    check("create rejects a non-IP ip (400)", r.status_code == 400 and "error" in r.json())
+
     # duplicate name -> 409
     r = c.post("/api/nodes", json={"node_id": "other-id", "name": "CH01", "ip": "9.9.9.9"})
     check("duplicate name 409", r.status_code == 409 and "error" in r.json())

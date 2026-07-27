@@ -812,6 +812,8 @@ def act_upgrade(params):
     url = (params.get("url") or "").strip()
     if not url:
         return {"ok": False, "error": "no download url provided"}
+    if not url.lower().startswith("https://"):
+        return {"ok": False, "error": "download url must be https:// (refusing an unverified transport)"}
 
     svc = resolve_service()
     _, _, cmd = _read_execstart(svc)
@@ -831,37 +833,40 @@ def act_upgrade(params):
     except Exception as e:
         return {"ok": False, "error": f"download failed: {e}", "output": "\n".join(log)}
 
-    # Optional integrity check: if the orchestrator supplied an expected sha256,
-    # verify it before we ever mark the file executable or run it. This binary is
-    # run as root, so a hijacked download host or a wrong URL would otherwise be
-    # arbitrary root code execution. Backward compatible: skipped if no hash given.
+    # Mandatory integrity check: this binary runs as root, so we refuse to install
+    # anything we cannot verify against an operator-supplied hash. A hijacked
+    # download host or a wrong URL is otherwise arbitrary root code execution.
     want_sha = (params.get("sha256") or "").strip().lower()
-    if want_sha:
+    if not re.fullmatch(r"[0-9a-f]{64}", want_sha):
         try:
-            h = hashlib.sha256()
-            with open(tmp, "rb") as f:
-                for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                    h.update(chunk)
-            got_sha = h.hexdigest()
-        except Exception as e:
-            try:
-                os.remove(tmp)
-            except Exception:
-                pass
-            return {"ok": False, "error": f"could not hash downloaded binary: {e}",
-                    "output": "\n".join(log)}
-        if got_sha != want_sha:
-            try:
-                os.remove(tmp)
-            except Exception:
-                pass
-            return {"ok": False,
-                    "error": f"sha256 mismatch: expected {want_sha}, got {got_sha}; "
-                             f"discarded download, old binary untouched",
-                    "output": "\n".join(log)}
-        log.append(f"sha256 verified: {got_sha}")
-    else:
-        log.append("no sha256 supplied — skipping integrity check")
+            os.remove(tmp)
+        except Exception:
+            pass
+        return {"ok": False, "error": "a sha256 (64 hex chars) of the release binary is required",
+                "output": "\n".join(log)}
+    try:
+        h = hashlib.sha256()
+        with open(tmp, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        got_sha = h.hexdigest()
+    except Exception as e:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return {"ok": False, "error": f"could not hash downloaded binary: {e}",
+                "output": "\n".join(log)}
+    if got_sha != want_sha:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return {"ok": False,
+                "error": f"sha256 mismatch: expected {want_sha}, got {got_sha}; "
+                         f"discarded download, old binary untouched",
+                "output": "\n".join(log)}
+    log.append(f"sha256 verified: {got_sha}")
 
     try:
         os.chmod(tmp, 0o755)
@@ -900,25 +905,34 @@ def act_upgrade(params):
     ntm_result = None
     ntm = params.get("ntm")
     if ntm and ntm.get("url"):
-        dest = ntm.get("path")
-        ntm_path = dest if (dest and os.path.isabs(dest)) else os.path.join(CERTDIR, "network_tunnel_manager.sh")
-        try:
-            log.append(f"pulling NTM script {ntm['url']} -> {ntm_path}")
-            _download(ntm["url"], ntm_path, timeout=60)
-            os.chmod(ntm_path, 0o755)
-        except Exception as e:
-            ntm_result = {"ok": False, "path": ntm_path, "error": f"NTM pull failed: {e}"}
+        ntm_url = (ntm.get("url") or "").strip()
+        # The NTM script is always written inside CERTDIR (basename only), so a
+        # caller can never turn this into an arbitrary root file write (e.g. into
+        # /etc/cron.d/*); the url must be https for the same reason as the binary.
+        base = os.path.basename(ntm.get("path") or "") or "network_tunnel_manager.sh"
+        if base in (".", ".."):
+            base = "network_tunnel_manager.sh"
+        ntm_path = os.path.join(CERTDIR, base)
+        if not ntm_url.lower().startswith("https://"):
+            ntm_result = {"ok": False, "path": ntm_path, "error": "NTM url must be https://"}
         else:
-            args = ntm.get("args") or ""
             try:
-                argv = [ntm_path] + (shlex.split(args) if isinstance(args, str) else list(args))
-            except ValueError:
-                argv = [ntm_path]
-            rc2, out2, _ = _run(argv, timeout=180, merge=True)
-            combined = (out2 or "").strip()
-            ntm_result = {"ok": rc2 == 0, "exit_code": rc2, "path": ntm_path,
-                          "command": " ".join(argv), "output": combined}
-            log.append(f"ran NTM ({' '.join(argv)}) -> exit {rc2}")
+                log.append(f"pulling NTM script {ntm_url} -> {ntm_path}")
+                _download(ntm_url, ntm_path, timeout=60)
+                os.chmod(ntm_path, 0o755)
+            except Exception as e:
+                ntm_result = {"ok": False, "path": ntm_path, "error": f"NTM pull failed: {e}"}
+            else:
+                args = ntm.get("args") or ""
+                try:
+                    argv = [ntm_path] + (shlex.split(args) if isinstance(args, str) else list(args))
+                except ValueError:
+                    argv = [ntm_path]
+                rc2, out2, _ = _run(argv, timeout=180, merge=True)
+                combined = (out2 or "").strip()
+                ntm_result = {"ok": rc2 == 0, "exit_code": rc2, "path": ntm_path,
+                              "command": " ".join(argv), "output": combined}
+                log.append(f"ran NTM ({' '.join(argv)}) -> exit {rc2}")
 
     restarted, active = False, None
     if params.get("restart"):
