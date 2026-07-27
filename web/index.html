@@ -138,6 +138,8 @@
   .dcard-sub.cli{color:#5bbcd6}
   .fcard-foot{font-size:11px;color:var(--muted);margin-top:4px}
   .fcard-rows{margin-top:6px;display:flex;flex-direction:column;gap:3px}
+  .fc-daily{margin-top:8px}
+  .fcd-axis{fill:var(--muted);font-family:var(--mono);font-size:12px}
   .fcrow{display:flex;justify-content:space-between;gap:8px;font-size:12px;font-variant-numeric:tabular-nums}
   .fcrow .cc{font-weight:600}
   .fcrow .v{color:var(--muted)}
@@ -386,9 +388,10 @@
       <div class="fcard-v" id="fc-traffic">—</div>
       <div class="fcard-split" id="fc-traffic-split"></div>
       <div class="fcard-foot" id="fc-traffic-foot">—</div>
+      <div class="fc-daily" id="fc-daily"></div>
     </div>
     <div class="fcard">
-      <div class="fcard-k"><span title="On-wire client activity by country, from live connections. WG ranks by dVPN clients (51822); Mixnet by mixnet clients (9000). Bytes are on-wire session bytes — for mixnet that's sphinx incl. cover, so a country here can exceed the mixnet EXIT total (different planes). Node-to-node relay (1789) is excluded." style="cursor:help">Top traffic · country</span></div>
+      <div class="fcard-k"><span title="On-wire client activity by country. WG ranks by dVPN clients (51822); Mixnet by mixnet clients (9000). Rates are REAL averages from per-client byte-counter deltas between node snapshots (~1–2 min window), so the column sums reconcile with the WireGuard card — only unlocated clients are missing. Bytes are cumulative on-wire session bytes — for mixnet that's sphinx incl. cover, so a country here can exceed the mixnet EXIT total (different planes). Node-to-node relay (1789) is excluded." style="cursor:help">Top traffic · country</span></div>
       <div class="cc-cols">
         <div>
           <div class="cc-hd wg">WG · 51822</div>
@@ -1087,6 +1090,37 @@ function sanitizePeers(r){
   return Object.assign({}, r, {peers: f(r.peers), clients: f(r.clients), wg_clients: f(r.wg_clients)});
 }
 
+// Store a node's /api/peers snapshot, deriving per-client REAL average rates
+// (abps) from the cumulative byte counters between this snapshot and the last
+// one, reset-safe. The agent's bps is a ~1s point sample taken at poll time —
+// fine for "live" feel on the map, but summing stale 1s samples wildly
+// under-reports; abps integrates everything between snapshots, so per-country
+// sums reconcile with the interface-counter cards.
+function ingestPeers(uid, r){
+  const prev = peerCache[uid];
+  const cur = Object.assign({at: Date.now()}, sanitizePeers(r));
+  if(prev && prev.at){
+    const dt = (cur.at - prev.at) / 1000;
+    if(dt > 5){
+      const diff = (prevList, curList) => {
+        const old = {};
+        (prevList || []).forEach(c => { if(c.bytes != null) old[c.ip] = c.bytes; });
+        (curList || []).forEach(c => {
+          const pb = old[c.ip];
+          if(pb != null && c.bytes != null){
+            const d = c.bytes >= pb ? c.bytes - pb : c.bytes;  // reset -> post-reset bytes
+            c.abps = d * 8 / dt;
+          }
+        });
+      };
+      diff(prev.wg_clients, cur.wg_clients);
+      diff(prev.clients, cur.clients);
+    }
+  }
+  peerCache[uid] = cur;
+  return cur;
+}
+
 function listItems(data){
   const items = [];
   (data.peers || []).forEach(p => items.push({cat: p.dir || 'down', ip: p.ip, host: p.host, bps: p.bps, bytes: p.bytes, dur: p.dur, conns: p.conns, lat: p.lat, lon: p.lon, cc: p.cc}));
@@ -1240,7 +1274,11 @@ function renderCards(){
   const set = cardNodes();
   let totalBps = 0, wgLiveBps = 0, mixLiveBps = 0, reporting = 0;
   const byCCwg = {}, byCCmix = {};
-  const addCC = (map, it) => { if(it.cc){ const e = map[it.cc] || (map[it.cc] = {bytes: 0, bps: 0}); e.bytes += it.bytes || 0; e.bps += it.bps || 0; } };
+  // abps = real average rate between snapshots (counter delta) so country sums
+  // reconcile with the interface-counter cards; bps (1s sample) only until a
+  // second snapshot exists for that node. Clients GeoIP can't place are kept
+  // under '??' so the panel can show them instead of silently dropping them.
+  const addCC = (map, it) => { const k = it.cc || '??'; const e = map[k] || (map[k] = {bytes: 0, bps: 0}); e.bytes += it.bytes || 0; e.bps += (it.abps != null ? it.abps : it.bps) || 0; };
   set.forEach(n => {
     const d = peerCache[n.uid];
     if(!d || !d.peers) return;
@@ -1325,14 +1363,38 @@ function renderCards(){
   const selN = selectedNodes().length;
   g('fc-scope').textContent = (selN && selN < nodes.length) ? selN + ' selected' : 'all nodes';
 
-  // Top traffic · country — WG and Mixnet side by side (on-wire client geography)
+  // Top traffic · country — WG and Mixnet side by side (on-wire client geography).
+  // Row count adapts to the height the grid row already has (set by the traffic
+  // card with its daily graph) so this card never becomes the one that grows it.
+  const ccBudget = () => {
+    const rowsEl = g('fc-countries-wg'), refCard = g('fc-traffic') && g('fc-traffic').closest('.fcard');
+    const card = rowsEl && rowsEl.closest('.fcard');
+    if(!rowsEl || !card || !refCard) return 3;
+    const top = rowsEl.getBoundingClientRect().top - card.getBoundingClientRect().top;
+    const probe = rowsEl.querySelector('.fcrow');
+    const rowH = (probe ? probe.offsetHeight : 16) + 3;           // + fcard-rows gap
+    return Math.max(3, Math.floor((refCard.offsetHeight - top - 11) / rowH));
+  };
+  const maxRows = ccBudget();
   const renderCC = (byCC, elId, emptyKind) => {
-    const rows = Object.entries(byCC).sort((a, b) => b[1].bytes - a[1].bytes).slice(0, 3);
     const el = g(elId); if(!el) return;
+    const un = byCC['??'];   // clients GeoIP couldn't (yet) place
+    const all = Object.entries(byCC).filter(([cc]) => cc !== '??').sort((a, b) => b[1].bytes - a[1].bytes);
+    // if not everything fits, the last country slot becomes a roll-up so the
+    // column still sums to the full total (reconciles with the WG card)
+    const slots = un ? maxRows - 1 : maxRows;
+    const overflow = all.length > slots;
+    const shown = overflow ? all.slice(0, slots - 1) : all;
+    const rest = overflow ? all.slice(slots - 1) : [];
     const emptyMsg = reporting ? ('no ' + emptyKind + ' located — turn on locate') : 'gathering…';
-    el.innerHTML = rows.length
-      ? rows.map(([cc, v]) => `<div class="fcrow"><span class="cc">${flagFromCC(cc)} ${cc}</span><span class="v">${fmtBytesSI(v.bytes)} · ${fmtBitrate(v.bps)}</span></div>`).join('')
-      : `<div class="fcard-foot">${emptyMsg}</div>`;
+    let html = shown.map(([cc, v]) => `<div class="fcrow"><span class="cc">${flagFromCC(cc)} ${cc}</span><span class="v">${fmtBytesSI(v.bytes)} · ${fmtBitrate(v.bps)}</span></div>`).join('');
+    if(rest.length){
+      const rb = rest.reduce((a, [, v]) => a + v.bytes, 0), rr = rest.reduce((a, [, v]) => a + v.bps, 0);
+      html += `<div class="fcrow"><span class="cc" style="color:var(--muted)">+${rest.length} more</span><span class="v">${fmtBytesSI(rb)} · ${fmtBitrate(rr)}</span></div>`;
+    }
+    if(un) html += `<div class="fcrow"><span class="cc" style="color:var(--muted)">unlocated</span><span class="v">${fmtBytesSI(un.bytes)} · ${fmtBitrate(un.bps)}</span></div>`;
+    if(!all.length && un) html += `<div class="fcard-foot">${emptyMsg}</div>`;
+    el.innerHTML = html || `<div class="fcard-foot">${emptyMsg}</div>`;
   };
   renderCC(byCCwg, 'fc-countries-wg', 'WireGuard clients');
   renderCC(byCCmix, 'fc-countries-mix', 'mixnet clients');
@@ -1348,7 +1410,7 @@ async function cardTick(){
   if(pick && (!peerCache[pick.uid] || (Date.now() - peerCache[pick.uid].at) > 30000)){
     try{
       const r = await api('/api/peers', {method: 'POST', body: JSON.stringify({node_id: pick.uid})});
-      peerCache[pick.uid] = Object.assign({at: Date.now()}, sanitizePeers(r));
+      ingestPeers(pick.uid, r);
     }catch(e){}
   }
   renderCards();
@@ -1632,7 +1694,7 @@ async function hoverNode(uid, pinned){
   if(!data || (Date.now() - data.at) > 20000){
     try{
       const r = await api('/api/peers', {method:'POST', body: JSON.stringify({node_id: uid})});
-      data = peerCache[uid] = Object.assign({at: Date.now()}, sanitizePeers(r));
+      data = ingestPeers(uid, r);
     }catch(e){ data = {peers: [], total_peers: 0, located: 0}; }
   }
   drawWeb(n, p, data);
@@ -2441,6 +2503,119 @@ async function fetchTraffic24(){
   try{ traf24 = await api('/api/traffic/window?hours=24'); renderCards(); }catch(e){}
 }
 setInterval(fetchTraffic24, 60000);
+// REAL per-day exit traffic (local calendar days) for the daily trend line on
+// the Total-exit-traffic card: {days: [{ts, dev_bytes, bytes}], window_days}
+let trafDaily = null;
+async function fetchTrafficDaily(){
+  try{ trafDaily = await api('/api/traffic/daily?days=30'); renderDailyGraph(); }catch(e){}
+}
+setInterval(fetchTrafficDaily, 600000);
+
+// one datapoint per local calendar day (exit devices only, matching the card's
+// total); today is partial and drawn as a hollow dot. Same counter-delta data
+// as the 24h figure, so the numbers reconcile.
+function renderDailyGraph(){
+  const box = document.getElementById('fc-daily'); if(!box) return;
+  const rows = (trafDaily && trafDaily.days) || [];
+  const EXITDEV = {nymtun0: 1, nymwg: 1};
+  const pts = rows.map(d => {
+    let s = 0;
+    for(const k in (d.dev_bytes || {})) if(EXITDEV[k]) s += d.dev_bytes[k] || 0;
+    return {ts: d.ts, v: s};
+  });
+  if(pts.length < 2){
+    box.innerHTML = '<div class="fcard-foot" title="One datapoint per local calendar day, from the same gap-immune counter deltas as the 24h figure. Fills in up to 30 days as history accrues." style="cursor:help">daily trend appears after 2+ days of history</div>';
+    return;
+  }
+  // 1:1 pixel coordinates (viewBox == rendered size) so labels keep a fixed
+  // CSS font size (12px, matching the fcard-split line) instead of scaling
+  // with the card width
+  const w = Math.max(200, box.clientWidth || 280), h = 110, mt = 8, mb = 18, mr = 8;
+  const trim0 = s => s.replace(/\.(\d*?)0+ /, (m, d) => (d ? '.' + d : '') + ' ');
+  const nm = niceCeil(Math.max(...pts.map(p => p.v), 1));
+  const ylabels = [trim0(fmtBytesSI(nm)), trim0(fmtBytesSI(nm / 2))];
+  const ml = 12 + 7.3 * Math.max(...ylabels.map(s => s.length));
+  const x0 = ml, x1 = w - mr, y0 = mt, y1 = h - mb;
+  const n = pts.length;
+  const t0 = pts[0].ts, tN = pts[n - 1].ts, tspan = Math.max(1, tN - t0);
+  const X = ts => x0 + (x1 - x0) * ((ts - t0) / tspan);
+  const Y = v => y1 - (y1 - y0) * (v / nm);
+  const midToday = new Date(); midToday.setHours(0, 0, 0, 0);
+  const lastIsToday = Math.abs(tN * 1000 - midToday.getTime()) < 1000;
+  const dlab = ts => new Date(ts * 1000).toLocaleDateString(undefined, {day: 'numeric', month: 'short'});
+
+  let grid = '', ylab = '';
+  for(let k = 0; k <= 2; k++){
+    const yy = y0 + (y1 - y0) * k / 2;
+    grid += `<line class="tput-grid" x1="${x0}" y1="${yy.toFixed(1)}" x2="${x1}" y2="${yy.toFixed(1)}"/>`;
+    if(k < 2) ylab += `<text class="fcd-axis" x="${x0 - 6}" y="${(yy + 4).toFixed(1)}" text-anchor="end">${ylabels[k]}</text>`;
+  }
+  const xlab =
+    `<text class="fcd-axis" x="${x0}" y="${h - 4}" text-anchor="start">${dlab(t0)}</text>` +
+    `<text class="fcd-axis" x="${x1}" y="${h - 4}" text-anchor="end">${lastIsToday ? 'today' : dlab(tN)}</text>`;
+
+  // line/area segments, broken where days are missing (>1.5d gap = no data)
+  let line = '', area = '', dots = '', seg = [];
+  const flush = () => {
+    if(seg.length > 1){
+      const p = seg.map(q => q[0].toFixed(1) + ' ' + q[1].toFixed(1));
+      line += `<path class="tput-line" d="M${p.join(' L')}"/>`;
+      area += `<path class="tput-area" d="M${seg[0][0].toFixed(1)} ${y1} L${p.join(' L')} L${seg[seg.length - 1][0].toFixed(1)} ${y1} Z"/>`;
+    }
+    seg = [];
+  };
+  for(let i = 0; i < n; i++){
+    if(i && pts[i].ts - pts[i - 1].ts > 1.5 * 86400) flush();
+    seg.push([X(pts[i].ts), Y(pts[i].v)]);
+  }
+  flush();
+  for(let i = 0; i < n; i++){
+    const cx = X(pts[i].ts).toFixed(1), cy = Y(pts[i].v).toFixed(1);
+    dots += (i === n - 1 && lastIsToday)
+      ? `<circle cx="${cx}" cy="${cy}" r="2.4" fill="var(--surface)" stroke="var(--accent)" stroke-width="1.4"/>`
+      : `<circle class="tput-dot" cx="${cx}" cy="${cy}" r="2"/>`;
+  }
+
+  box.innerHTML =
+    `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" style="display:block">
+       ${grid}${area}${line}${dots}${ylab}${xlab}
+       <line class="tput-guide fcd-guide" style="display:none"/>
+       <circle class="tput-dot fcd-hover" r="3" style="display:none"/>
+       <g class="tput-tipg fcd-tipg" style="display:none">
+         <rect class="tput-tipbg" rx="4" width="118" height="34"/>
+         <text class="tput-tip fcd-tip-t" x="6" y="14"></text>
+         <text class="tput-tip fcd-tip-v" x="6" y="28"></text>
+       </g>
+     </svg>`;
+
+  const svgEl = box.querySelector('svg');
+  const guide = box.querySelector('.fcd-guide');
+  const dot = box.querySelector('.fcd-hover');
+  const tipg = box.querySelector('.fcd-tipg');
+  const tipT = box.querySelector('.fcd-tip-t');
+  const tipV = box.querySelector('.fcd-tip-v');
+  const hide = () => { guide.style.display = dot.style.display = tipg.style.display = 'none'; };
+  svgEl.addEventListener('mousemove', ev => {
+    const r = svgEl.getBoundingClientRect();
+    const vx = (ev.clientX - r.left) / r.width * w;
+    let bi = 0, bd = Infinity;
+    for(let i = 0; i < n; i++){ const d = Math.abs(X(pts[i].ts) - vx); if(d < bd){ bd = d; bi = i; } }
+    const px = X(pts[bi].ts), py = Y(pts[bi].v);
+    guide.setAttribute('x1', px); guide.setAttribute('x2', px);
+    guide.setAttribute('y1', y0); guide.setAttribute('y2', y1); guide.style.display = '';
+    dot.setAttribute('cx', px); dot.setAttribute('cy', py); dot.style.display = '';
+    tipT.textContent = dlab(pts[bi].ts) + (bi === n - 1 && lastIsToday ? ' · so far' : '');
+    tipV.textContent = fmtBytesSI(pts[bi].v);
+    let tx = px + 8; if(tx + 118 > x1) tx = px - 126; if(tx < x0) tx = x0;
+    tipg.setAttribute('transform', `translate(${tx.toFixed(1)}, ${Math.max(y0, py - 40).toFixed(1)})`);
+    tipg.style.display = '';
+  });
+  svgEl.addEventListener('mouseleave', hide);
+}
+// the graph is drawn in 1:1 pixels, so a width change needs a redraw
+let fcdResizeT = null;
+window.addEventListener('resize', () => { clearTimeout(fcdResizeT); fcdResizeT = setTimeout(renderDailyGraph, 150); });
+
 // REAL average ON-WIRE throughput (bits/s), split wg/mix: {wg_bps,mix_bps,total_bps,observed_hours,window_hours}
 let onwireAvg = null;
 async function fetchOnwireAvg(){
@@ -3518,6 +3693,7 @@ health();
 load();
 loadWalletList().catch(()=>{});   // populate the wallet-bar nym-cli note
 fetchTraffic24();                 // real 24h fleet traffic (counter-delta) for the cards
+fetchTrafficDaily();              // per-day exit-traffic trend line on the total card
 fetchOnwireAvg();                 // real on-wire average (peers sampler) for the throughput card
 loadThroughput().then(renderTable);
 loadWorld().then(renderMap);
@@ -3533,7 +3709,7 @@ async function refreshPinned(){
   if(!n || !p) return;
   try{
     const r = await api('/api/peers', {method: 'POST', body: JSON.stringify({node_id: mapPinned})});
-    peerCache[mapPinned] = Object.assign({at: Date.now()}, sanitizePeers(r));
+    ingestPeers(mapPinned, r);
   }catch(e){ return; }
   drawWeb(n, p, peerCache[mapPinned]);
   refreshList();
