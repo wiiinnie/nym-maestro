@@ -62,7 +62,7 @@
     color:var(--muted);display:flex;align-items:center;justify-content:space-between;gap:6px}
   .map-sort{display:flex;gap:4px}
   .map-sort button{font-size:11px;padding:2px 7px;border-radius:5px;border:1px solid var(--line);
-    background:transparent;color:var(--muted);cursor:pointer}
+    background:transparent;color:var(--muted);cursor:pointer;text-transform:none;letter-spacing:normal}
   .map-sort button.on{background:var(--surface-2);color:var(--text);border-color:var(--accent)}
   .map-row .meta{min-width:0}
   .map-list-rows{overflow-y:auto;max-height:480px}
@@ -391,7 +391,7 @@
       <div class="fc-daily" id="fc-daily"></div>
     </div>
     <div class="fcard">
-      <div class="fcard-k"><span title="On-wire client activity by country. WG ranks by dVPN clients (51822); Mixnet by mixnet clients (9000). Rates are REAL averages from per-client byte-counter deltas between node snapshots (~1–2 min window), so the column sums reconcile with the WireGuard card — only unlocated clients are missing. Bytes are cumulative on-wire session bytes — for mixnet that's sphinx incl. cover, so a country here can exceed the mixnet EXIT total (different planes). Node-to-node relay (1789) is excluded." style="cursor:help">Top traffic · country</span></div>
+      <div class="fcard-k" style="display:flex;justify-content:space-between;align-items:center"><span title="On-wire client activity by country. WG ranks dVPN clients (51822); Mixnet ranks mixnet clients (9000) — sorted by the selected metric (rate or traffic). Rates are REAL averages from per-client byte-counter deltas between node snapshots (~1–2 min window), so the column sums reconcile with the WireGuard card — only unlocated clients are missing. Bytes are cumulative on-wire session bytes — for mixnet that's sphinx incl. cover, so a country here can exceed the mixnet EXIT total (different planes). Node-to-node relay (1789) is excluded." style="cursor:help">Top countries</span><span class="map-sort"><button id="cc-sort-bps" onclick="setCCSort('bps')">rate</button><button id="cc-sort-bytes" class="on" onclick="setCCSort('bytes')">traffic</button></span></div>
       <div class="cc-cols">
         <div>
           <div class="cc-hd wg">WG · 51822</div>
@@ -1066,7 +1066,16 @@ function focusNode(uid){
 
 const ROW_COLORS = {up: 'var(--accent)', down: '#d9933a', both: '#a779e0', client: '#5bbcd6', wg: '#9b8cff'};
 let listSort = 'bps';   // 'bps' (throughput) or 'bytes' (traffic)
+let ccSort = 'bytes';   // Top-countries card: 'bytes' (traffic) or 'bps' (rate)
 const LIST_CAP = 250;
+
+function setCCSort(mode){
+  ccSort = mode;
+  const b = document.getElementById('cc-sort-bps'), t = document.getElementById('cc-sort-bytes');
+  if(b) b.classList.toggle('on', mode === 'bps');
+  if(t) t.classList.toggle('on', mode === 'bytes');
+  renderCards();
+}
 
 function setListSort(mode){
   listSort = mode;
@@ -1379,7 +1388,8 @@ function renderCards(){
   const renderCC = (byCC, elId, emptyKind) => {
     const el = g(elId); if(!el) return;
     const un = byCC['??'];   // clients GeoIP couldn't (yet) place
-    const all = Object.entries(byCC).filter(([cc]) => cc !== '??').sort((a, b) => b[1].bytes - a[1].bytes);
+    const key = ccSort === 'bps' ? 'bps' : 'bytes';
+    const all = Object.entries(byCC).filter(([cc]) => cc !== '??').sort((a, b) => b[1][key] - a[1][key]);
     // if not everything fits, the last country slot becomes a roll-up so the
     // column still sums to the full total (reconciles with the WG card)
     const slots = un ? maxRows - 1 : maxRows;
@@ -1387,12 +1397,16 @@ function renderCards(){
     const shown = overflow ? all.slice(0, slots - 1) : all;
     const rest = overflow ? all.slice(slots - 1) : [];
     const emptyMsg = reporting ? ('no ' + emptyKind + ' located — turn on locate') : 'gathering…';
-    let html = shown.map(([cc, v]) => `<div class="fcrow"><span class="cc">${flagFromCC(cc)} ${cc}</span><span class="v">${fmtBytesSI(v.bytes)} · ${fmtBitrate(v.bps)}</span></div>`).join('');
+    // selected metric first so the sort column is the one the eye scans
+    const vals = v => key === 'bps'
+      ? `${fmtBitrate(v.bps)} · ${fmtBytesSI(v.bytes)}`
+      : `${fmtBytesSI(v.bytes)} · ${fmtBitrate(v.bps)}`;
+    let html = shown.map(([cc, v]) => `<div class="fcrow"><span class="cc">${flagFromCC(cc)} ${cc}</span><span class="v">${vals(v)}</span></div>`).join('');
     if(rest.length){
       const rb = rest.reduce((a, [, v]) => a + v.bytes, 0), rr = rest.reduce((a, [, v]) => a + v.bps, 0);
-      html += `<div class="fcrow"><span class="cc" style="color:var(--muted)">+${rest.length} more</span><span class="v">${fmtBytesSI(rb)} · ${fmtBitrate(rr)}</span></div>`;
+      html += `<div class="fcrow"><span class="cc" style="color:var(--muted)">+${rest.length} more</span><span class="v">${vals({bytes: rb, bps: rr})}</span></div>`;
     }
-    if(un) html += `<div class="fcrow"><span class="cc" style="color:var(--muted)">unlocated</span><span class="v">${fmtBytesSI(un.bytes)} · ${fmtBitrate(un.bps)}</span></div>`;
+    if(un) html += `<div class="fcrow"><span class="cc" style="color:var(--muted)">unlocated</span><span class="v">${vals(un)}</span></div>`;
     if(!all.length && un) html += `<div class="fcard-foot">${emptyMsg}</div>`;
     el.innerHTML = html || `<div class="fcard-foot">${emptyMsg}</div>`;
   };
