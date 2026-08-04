@@ -499,7 +499,6 @@
     <button id="btn-fail2ban" onclick="openFail2ban()" disabled>Fail2ban</button>
     <button id="btn-ssh" onclick="openSsh()" disabled>SSH keys</button>
     <button id="btn-extra-blocks" onclick="openExtraBlocks()" disabled title="Install/verify NYM-EXIT abuse blocklist">Extra blocks</button>
-    <button disabled>Run…</button>
     <button id="btn-update-agent" onclick="openAgentUpdate()" disabled title="Push the local agent to selected nodes">Update agent</button>
     <span class="spacer"></span>
     <div class="filter"><input id="filter" type="text" placeholder="filter nodes" autocomplete="off"></div>
@@ -639,10 +638,10 @@
     <div class="field">
       <label for="up-url">nym-node release URL</label>
       <input id="up-url" placeholder="https://github.com/nymtech/nym/releases/download/.../nym-node">
-      <div class="hint">Must be https. Downloaded to each node; verified with --version before replacing the binary named in the unit file.</div>
+      <div class="hint">Must be https. Downloaded to each node; verified with --version before replacing the binary named in the unit file. Leave empty to skip the binary swap and only re-run NTM (check the box below).</div>
     </div>
     <div class="field">
-      <label for="up-sha">SHA-256 of the release binary (required)</label>
+      <label for="up-sha">SHA-256 of the release binary (required with a release URL)</label>
       <input id="up-sha" placeholder="64 hex chars — from the release page's checksums">
       <div class="hint">The node refuses to install a binary whose hash doesn't match — this is what protects a root-run download against a hijacked host or wrong URL.</div>
     </div>
@@ -660,15 +659,15 @@
         <input id="up-ntm-args" placeholder="e.g. apply_iptables_rules">
       </div>
       <div class="field">
-        <label for="up-ntm-path">Install NTM to (optional)</label>
-        <input id="up-ntm-path" placeholder="/etc/nym-maestro-agent/network_tunnel_manager.sh (default)">
-        <div class="hint">Blank keeps it in the maestro directory. Set a path (e.g. /root/nym/network-tunnel-manager.sh) to overwrite your node's own copy.</div>
+        <label for="up-ntm-path">NTM script filename (optional)</label>
+        <input id="up-ntm-path" placeholder="network_tunnel_manager.sh (default)">
+        <div class="hint">The script is always stored inside the maestro agent directory on each node — only the filename is used, directory parts are stripped.</div>
       </div>
       <p class="hint">Runs the pulled script as root with these arguments on each node. Output is captured and shown below.</p>
     </div>
     <div class="checkrow" style="margin-top:4px">
       <input id="up-restart" type="checkbox">
-      <label for="up-restart" style="margin:0">Restart service after swapping the binary</label>
+      <label for="up-restart" style="margin:0">Restart nym-node service afterwards</label>
     </div>
     <p class="hint">The old binary is backed up to &lt;dir&gt;/old/ before it is replaced.</p>
     <div class="modal-actions">
@@ -2466,27 +2465,36 @@ function closeUp(){ document.getElementById('up-overlay').classList.remove('open
 
 async function applyUpgrade(){
   const url = document.getElementById('up-url').value.trim();
-  if(!url){ toast('A nym-node release URL is required', true); return; }
-  if(!/^https:\/\//i.test(url)){ toast('The release URL must be https', true); return; }
-  const sha = document.getElementById('up-sha').value.trim().toLowerCase();
-  if(!/^[0-9a-f]{64}$/.test(sha)){ toast('A SHA-256 (64 hex chars) of the release binary is required', true); return; }
-  const params = { url, sha256: sha, restart: document.getElementById('up-restart').checked };
-  if(document.getElementById('up-ntm').checked){
+  const ntmChecked = document.getElementById('up-ntm').checked;
+  if(!url && !ntmChecked){
+    toast('Give a nym-node release URL, or check the NTM option for an NTM-only run', true); return;
+  }
+  const params = { restart: document.getElementById('up-restart').checked };
+  if(url){
+    if(!/^https:\/\//i.test(url)){ toast('The release URL must be https', true); return; }
+    const sha = document.getElementById('up-sha').value.trim().toLowerCase();
+    if(!/^[0-9a-f]{64}$/.test(sha)){ toast('A SHA-256 (64 hex chars) of the release binary is required', true); return; }
+    params.url = url; params.sha256 = sha;
+  }
+  if(ntmChecked){
     const ntmUrl = document.getElementById('up-ntm-url').value.trim();
     if(!ntmUrl){ toast('NTM is checked but no script URL given', true); return; }
     params.ntm = { url: ntmUrl, args: document.getElementById('up-ntm-args').value.trim(),
                    path: document.getElementById('up-ntm-path').value.trim() };
   }
-  if(!confirm('Upgrade nym-node on ' + upTargets.length + ' node(s)?' +
-              (params.restart ? ' Services will restart (exit traffic drops briefly).' : ''))) return;
+  const ntmOnly = !url;
+  const restartNote = params.restart ? ' Services will restart (exit traffic drops briefly).' : '';
+  if(!confirm(ntmOnly
+      ? 'Re-pull and run NTM on ' + upTargets.length + ' node(s)? The nym-node binary is not touched.' + restartNote
+      : 'Upgrade nym-node on ' + upTargets.length + ' node(s)?' + restartNote)) return;
 
   const btn = document.getElementById('up-apply');
-  btn.disabled = true; btn.textContent = 'Upgrading…';
+  btn.disabled = true; btn.textContent = ntmOnly ? 'Running NTM…' : 'Upgrading…';
   try{
     const r = await api('/api/exec', {method:'POST', body: JSON.stringify(
       {action:'upgrade', node_ids: upTargets.map(n => n.uid), params})});
     closeUp();
-    showResults('Upgrade results', r.results);
+    showResults(ntmOnly ? 'NTM results' : 'Upgrade results', r.results);
   }catch(e){ toast(e.message, true); }
   btn.disabled = false; btn.textContent = 'Upgrade';
   await load();

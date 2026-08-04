@@ -40,7 +40,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-AGENT_VERSION = "0.10.2"
+AGENT_VERSION = "0.10.3"
 
 try:
     with open(os.path.abspath(__file__), "rb") as _sf:
@@ -805,107 +805,116 @@ def _binary_from_execstart(cmd):
 def act_upgrade(params):
     """Swap the nym-node binary the unit runs, optionally re-pull/run NTM and restart.
 
-    The binary location is read from the unit's ExecStart, not assumed. The new
-    binary is verified with --version before it replaces the old one, which is
-    backed up first. NTM runs the pulled script with the given args (not a shell).
+    With no release url the binary swap is skipped entirely: an NTM-only call
+    (params.ntm.url set) just re-pulls and re-runs the script, plus the
+    optional restart. The binary location is read from the unit's ExecStart,
+    not assumed. The new binary is verified with --version before it replaces
+    the old one, which is backed up first. NTM runs the pulled script with the
+    given args (not a shell).
     """
     url = (params.get("url") or "").strip()
-    if not url:
-        return {"ok": False, "error": "no download url provided"}
-    if not url.lower().startswith("https://"):
-        return {"ok": False, "error": "download url must be https:// (refusing an unverified transport)"}
+    ntm = params.get("ntm") if isinstance(params.get("ntm"), dict) else {}
+    ntm_url = (ntm.get("url") or "").strip()
+    if not url and not ntm_url:
+        return {"ok": False,
+                "error": "no download url provided (need a nym-node release url, an NTM script url, or both)"}
 
     svc = resolve_service()
-    _, _, cmd = _read_execstart(svc)
-    if cmd is None:
-        return {"ok": False, "error": "could not read ExecStart to locate the binary"}
-    binary = _binary_from_execstart(cmd)
-    if not binary or not os.path.isabs(binary):
-        return {"ok": False, "error": f"could not determine binary path from ExecStart (got {binary!r})"}
+    binary, new_version, backup = None, None, None
+    log = []
+    if url:
+        if not url.lower().startswith("https://"):
+            return {"ok": False, "error": "download url must be https:// (refusing an unverified transport)"}
+        _, _, cmd = _read_execstart(svc)
+        if cmd is None:
+            return {"ok": False, "error": "could not read ExecStart to locate the binary"}
+        binary = _binary_from_execstart(cmd)
+        if not binary or not os.path.isabs(binary):
+            return {"ok": False, "error": f"could not determine binary path from ExecStart (got {binary!r})"}
 
-    bindir = os.path.dirname(binary)
-    log = [f"target binary (from ExecStart): {binary}"]
+        bindir = os.path.dirname(binary)
+        log.append(f"target binary (from ExecStart): {binary}")
 
-    tmp = os.path.join(bindir, ".nym-node.new")
-    try:
-        log.append(f"downloading {url}")
-        _download(url, tmp, timeout=300)
-    except Exception as e:
-        return {"ok": False, "error": f"download failed: {e}", "output": "\n".join(log)}
-
-    # Mandatory integrity check: this binary runs as root, so we refuse to install
-    # anything we cannot verify against an operator-supplied hash. A hijacked
-    # download host or a wrong URL is otherwise arbitrary root code execution.
-    want_sha = (params.get("sha256") or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{64}", want_sha):
+        tmp = os.path.join(bindir, ".nym-node.new")
         try:
-            os.remove(tmp)
-        except Exception:
-            pass
-        return {"ok": False, "error": "a sha256 (64 hex chars) of the release binary is required",
-                "output": "\n".join(log)}
-    try:
-        h = hashlib.sha256()
-        with open(tmp, "rb") as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                h.update(chunk)
-        got_sha = h.hexdigest()
-    except Exception as e:
-        try:
-            os.remove(tmp)
-        except Exception:
-            pass
-        return {"ok": False, "error": f"could not hash downloaded binary: {e}",
-                "output": "\n".join(log)}
-    if got_sha != want_sha:
-        try:
-            os.remove(tmp)
-        except Exception:
-            pass
-        return {"ok": False,
-                "error": f"sha256 mismatch: expected {want_sha}, got {got_sha}; "
-                         f"discarded download, old binary untouched",
-                "output": "\n".join(log)}
-    log.append(f"sha256 verified: {got_sha}")
-
-    try:
-        os.chmod(tmp, 0o755)
-    except Exception:
-        pass
-
-    rc, out, err = _run([tmp, "--version"], timeout=30)
-    if rc != 0:
-        try:
-            os.remove(tmp)
-        except Exception:
-            pass
-        return {"ok": False, "error": "downloaded binary failed --version; left old binary in place",
-                "output": "\n".join(log + [out, err]).strip()}
-    m = re.search(r"\d+\.\d+\.\d+", (out or "") + (err or ""))
-    new_version = m.group(0) if m else "unknown"
-    log.append(f"new binary reports version {new_version}")
-
-    backup = None
-    if os.path.isfile(binary):
-        olddir = os.path.join(bindir, "old")
-        try:
-            os.makedirs(olddir, exist_ok=True)
-            backup = os.path.join(olddir, f"nym-node.backup.{time.strftime('%Y%m%d_%H%M%S')}")
-            shutil.copy2(binary, backup)
-            log.append(f"backed up current binary -> {backup}")
+            log.append(f"downloading {url}")
+            _download(url, tmp, timeout=300)
         except Exception as e:
-            return {"ok": False, "error": f"backup failed: {e}", "output": "\n".join(log)}
-    try:
-        os.replace(tmp, binary)
-        os.chmod(binary, 0o755)
-        log.append(f"installed new binary at {binary}")
-    except Exception as e:
-        return {"ok": False, "error": f"install failed: {e}", "output": "\n".join(log)}
+            return {"ok": False, "error": f"download failed: {e}", "output": "\n".join(log)}
+
+        # Mandatory integrity check: this binary runs as root, so we refuse to
+        # install anything we cannot verify against an operator-supplied hash. A
+        # hijacked download host or a wrong URL is otherwise arbitrary root code
+        # execution.
+        want_sha = (params.get("sha256") or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", want_sha):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            return {"ok": False, "error": "a sha256 (64 hex chars) of the release binary is required",
+                    "output": "\n".join(log)}
+        try:
+            h = hashlib.sha256()
+            with open(tmp, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+            got_sha = h.hexdigest()
+        except Exception as e:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            return {"ok": False, "error": f"could not hash downloaded binary: {e}",
+                    "output": "\n".join(log)}
+        if got_sha != want_sha:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            return {"ok": False,
+                    "error": f"sha256 mismatch: expected {want_sha}, got {got_sha}; "
+                             f"discarded download, old binary untouched",
+                    "output": "\n".join(log)}
+        log.append(f"sha256 verified: {got_sha}")
+
+        try:
+            os.chmod(tmp, 0o755)
+        except Exception:
+            pass
+
+        rc, out, err = _run([tmp, "--version"], timeout=30)
+        if rc != 0:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            return {"ok": False, "error": "downloaded binary failed --version; left old binary in place",
+                    "output": "\n".join(log + [out, err]).strip()}
+        m = re.search(r"\d+\.\d+\.\d+", (out or "") + (err or ""))
+        new_version = m.group(0) if m else "unknown"
+        log.append(f"new binary reports version {new_version}")
+
+        if os.path.isfile(binary):
+            olddir = os.path.join(bindir, "old")
+            try:
+                os.makedirs(olddir, exist_ok=True)
+                backup = os.path.join(olddir, f"nym-node.backup.{time.strftime('%Y%m%d_%H%M%S')}")
+                shutil.copy2(binary, backup)
+                log.append(f"backed up current binary -> {backup}")
+            except Exception as e:
+                return {"ok": False, "error": f"backup failed: {e}", "output": "\n".join(log)}
+        try:
+            os.replace(tmp, binary)
+            os.chmod(binary, 0o755)
+            log.append(f"installed new binary at {binary}")
+        except Exception as e:
+            return {"ok": False, "error": f"install failed: {e}", "output": "\n".join(log)}
+    else:
+        log.append("NTM-only run: no release url given, binary swap skipped")
 
     ntm_result = None
-    ntm = params.get("ntm")
-    if ntm and ntm.get("url"):
-        ntm_url = (ntm.get("url") or "").strip()
+    if ntm_url:
         # The NTM script is always written inside CERTDIR (basename only), so a
         # caller can never turn this into an arbitrary root file write (e.g. into
         # /etc/cron.d/*); the url must be https for the same reason as the binary.
@@ -942,9 +951,17 @@ def act_upgrade(params):
         active, _ = service_state()
         log.append(f"restart {'ok' if restarted else 'FAILED'}; service active={active}")
 
-    return {"ok": True, "service": svc, "binary": binary, "new_version": new_version,
-            "backup": backup, "ntm": ntm_result, "restarted": restarted,
-            "active": active, "output": "\n".join(log)}
+    # A bundled NTM failure after a successful binary swap stays ok=True (the
+    # upgrade itself worked; the ntm sub-result carries the failure). On an
+    # NTM-only run the script IS the job, so its failure fails the action.
+    result = {"ok": True, "service": svc, "binary": binary, "new_version": new_version,
+              "backup": backup, "ntm": ntm_result, "restarted": restarted,
+              "active": active, "output": "\n".join(log)}
+    if not url and not (ntm_result and ntm_result.get("ok")):
+        result["ok"] = False
+        result["error"] = ((ntm_result or {}).get("error")
+                           or f"NTM exited with code {(ntm_result or {}).get('exit_code')}")
+    return result
 
 
 def _nym_id_from_execstart(cmd):
