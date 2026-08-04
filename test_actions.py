@@ -208,15 +208,16 @@ check("missing traffic payload leaves columns null",
 # history: record -> downsampled series -> prune
 import time as _time
 _now = _time.time()
-for _h in range(24):
-    _s.record_throughput(_uid, _now - (24 - _h) * 3600 + 1,
-                         {"nymwg": float(_h * 1_000_000), "nymtun0": 500000.0})
+_s.backfill_throughput(_uid, [
+    {"ts": _now - (24 - _h) * 3600 + 1,
+     "v": {"nymwg": float(_h * 1_000_000), "nymtun0": 500000.0}}
+    for _h in range(24)])
 _ser = _s.throughput_series(hours=24, buckets=24)
 check("series returns per-node, per-device buckets",
       _uid in _ser and set(_ser[_uid]["dev"]) == {"nymwg", "nymtun0"} and len(_ser[_uid]["ts"]) == 24)
 _wg = [x for x in _ser[_uid]["dev"]["nymwg"] if x is not None]
 check("series captures the ramp (max ~23 MB/s)", _wg and max(_wg) >= 22_000_000)
-_s.record_throughput(_uid, _now, None)  # None payload is ignored
+_s.backfill_throughput(_uid, [{"ts": _now, "v": None}])  # None payload is ignored
 _s.prune_throughput(max_age_s=1)
 check("prune empties the rolling window", _s.throughput_series(hours=24, buckets=24) == {})
 _s.upsert_status(_uid, reachable=True, agent_version="0.6.0", agent_sha="deadbeef" * 8)
@@ -224,6 +225,22 @@ _av = _s.get_node(_uid)["status"]
 check("store persists agent version + sha",
       _av["agent_version"] == "0.6.0" and _av["agent_sha"] == "deadbeef" * 8)
 _s.close()
+
+# --- act_upgrade: NTM-only mode (no binary swap) ---------------------------
+_u = agent.act_upgrade({})
+check("upgrade with neither url fails and names both options",
+      _u["ok"] is False and "url" in _u["error"] and "NTM" in _u["error"])
+
+_u = agent.act_upgrade({"ntm": {"url": "http://example.invalid/ntm.sh"}})
+check("NTM-only rejects a non-https script url",
+      _u["ok"] is False and "https" in _u.get("error", ""))
+
+_u = agent.act_upgrade({"ntm": {"url": "https://nonexistent.invalid/ntm.sh"}})
+check("NTM-only pull failure fails the whole action",
+      _u["ok"] is False and "NTM pull failed" in _u.get("error", ""))
+check("NTM-only leaves binary fields empty and logs the skip",
+      _u.get("binary") is None and _u.get("new_version") is None
+      and "binary swap skipped" in _u.get("output", ""))
 
 # --- fail2ban: log parse, config write (scoped to sshd), validation --------
 import os as _os3, tempfile as _tf3, time as _tm3
@@ -276,6 +293,7 @@ def _fake_user_paths(user):
 
 
 agent._user_paths = _fake_user_paths
+agent.SSH_USER_DEFAULT = "hermes"  # in production this comes from MAESTRO_SSH_USER
 _authk = _os3.path.join(_home, ".ssh", "authorized_keys")
 
 _a1 = agent.act_ssh_add_key({"public_keys": [_ED]})
@@ -290,7 +308,15 @@ check("add_key rejects malformed keys", agent.act_ssh_add_key({"public_keys": ["
 check("add_key rejects an unknown login user",
       agent.act_ssh_add_key({"public_keys": [_ED], "user": "nobody"})["ok"] is False)
 
-agent.SSH_DROPIN = _os3.path.join(_sd, "sshd_dropin.conf")
+# point every sshd path the agent touches into the temp dir — harden also
+# edits SSH_MAIN and scans SSH_DROPIN_DIR, not just its own drop-in
+agent.SSH_MAIN = _os3.path.join(_sd, "sshd_config_main")
+agent.SSH_DROPIN_DIR = _os3.path.join(_sd, "sshd_config.d")
+_os3.makedirs(agent.SSH_DROPIN_DIR, exist_ok=True)
+agent.SSH_DROPIN = _os3.path.join(agent.SSH_DROPIN_DIR, "00-nym-maestro.conf")
+agent.SSH_DROPIN_LEGACY = _os3.path.join(agent.SSH_DROPIN_DIR, "nym-maestro.conf")
+with open(agent.SSH_MAIN, "w") as _f:
+    _f.write("Include /etc/ssh/sshd_config.d/*.conf\nPort 22\n")
 agent.unit_exists = lambda u: u == "ssh"
 _SAMPLE = "passwordauthentication no\npubkeyauthentication yes\npermitrootlogin no\nport 22\n"
 agent._run = lambda cmd, timeout=6, merge=False: (0, _SAMPLE, "") if cmd[:1] == ["sshd"] and "-T" in cmd else (0, "", "")
