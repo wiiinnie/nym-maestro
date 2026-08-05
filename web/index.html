@@ -277,6 +277,10 @@
   .tput-line{fill:none;stroke:var(--accent);stroke-width:1.5}
   .tput-guide{stroke:var(--faint);stroke-dasharray:3 3}
   .tput-dot{fill:var(--accent)}
+  /* daily-trend small multiples on the traffic card: series colors match the
+     WG/Mixnet scheme used everywhere else (fcard-split, cc-hd, map legend) */
+  .fcd-wg .tput-line{stroke:#9b8cff} .fcd-wg .tput-dot{fill:#9b8cff} .fcd-wg .tput-area{fill:rgba(155,140,255,.14)}
+  .fcd-mix .tput-line{stroke:#5bbcd6} .fcd-mix .tput-dot{fill:#5bbcd6} .fcd-mix .tput-area{fill:rgba(91,188,214,.12)}
   .tput-tipbg{fill:var(--surface-2);stroke:var(--line)}
   .tput-tip{fill:var(--text);font-family:var(--mono);font-size:11px}
   .modal{background:var(--surface);border:1px solid var(--line);border-radius:12px;width:100%;max-width:460px;padding:22px 24px;max-height:calc(100vh - 40px);overflow-y:auto}
@@ -2533,106 +2537,122 @@ async function fetchTrafficDaily(){
 }
 setInterval(fetchTrafficDaily, 600000);
 
-// one datapoint per local calendar day (exit devices only, matching the card's
-// total); today is partial and drawn as a hollow dot. Same counter-delta data
-// as the 24h figure, so the numbers reconcile.
+// one datapoint per local calendar day, split into two stacked mini-charts —
+// WG (nymwg) and Mixnet (nymtun0) — each with its own y-scale, since WG dwarfs
+// mixnet by orders of magnitude and would flatline it on a shared axis. Today
+// is partial and drawn as a hollow dot. Same counter-delta data as the 24h
+// figure, so the numbers reconcile.
 function renderDailyGraph(){
   const box = document.getElementById('fc-daily'); if(!box) return;
   const rows = (trafDaily && trafDaily.days) || [];
-  const EXITDEV = {nymtun0: 1, nymwg: 1};
-  const pts = rows.map(d => {
-    let s = 0;
-    for(const k in (d.dev_bytes || {})) if(EXITDEV[k]) s += d.dev_bytes[k] || 0;
-    return {ts: d.ts, v: s};
-  });
-  if(pts.length < 2){
+  if(rows.length < 2){
     box.innerHTML = '<div class="fcard-foot" title="One datapoint per local calendar day, from the same gap-immune counter deltas as the 24h figure. Fills in up to 30 days as history accrues." style="cursor:help">daily trend appears after 2+ days of history</div>';
     return;
   }
+  const SERIES = [
+    {dev: 'nymwg',   label: 'WG',     hd: 'wg',  cls: 'fcd-wg',  color: '#9b8cff'},
+    {dev: 'nymtun0', label: 'Mixnet', hd: 'mix', cls: 'fcd-mix', color: '#5bbcd6'},
+  ];
   // 1:1 pixel coordinates (viewBox == rendered size) so labels keep a fixed
   // CSS font size (12px, matching the fcard-split line) instead of scaling
   // with the card width
-  const w = Math.max(200, box.clientWidth || 280), h = 110, mt = 8, mb = 18, mr = 8;
+  const w = Math.max(200, box.clientWidth || 280), mr = 8;
   const trim0 = s => s.replace(/\.(\d*?)0+ /, (m, d) => (d ? '.' + d : '') + ' ');
-  const nm = niceCeil(Math.max(...pts.map(p => p.v), 1));
-  const ylabels = [trim0(fmtBytesSI(nm)), trim0(fmtBytesSI(nm / 2))];
-  const ml = 12 + 7.3 * Math.max(...ylabels.map(s => s.length));
-  const x0 = ml, x1 = w - mr, y0 = mt, y1 = h - mb;
-  const n = pts.length;
-  const t0 = pts[0].ts, tN = pts[n - 1].ts, tspan = Math.max(1, tN - t0);
-  const X = ts => x0 + (x1 - x0) * ((ts - t0) / tspan);
-  const Y = v => y1 - (y1 - y0) * (v / nm);
   const midToday = new Date(); midToday.setHours(0, 0, 0, 0);
-  const lastIsToday = Math.abs(tN * 1000 - midToday.getTime()) < 1000;
   const dlab = ts => new Date(ts * 1000).toLocaleDateString(undefined, {day: 'numeric', month: 'short'});
 
-  let grid = '', ylab = '';
-  for(let k = 0; k <= 2; k++){
-    const yy = y0 + (y1 - y0) * k / 2;
-    grid += `<line class="tput-grid" x1="${x0}" y1="${yy.toFixed(1)}" x2="${x1}" y2="${yy.toFixed(1)}"/>`;
-    if(k < 2) ylab += `<text class="fcd-axis" x="${x0 - 6}" y="${(yy + 4).toFixed(1)}" text-anchor="end">${ylabels[k]}</text>`;
+  // per-series points + y-scale first, so both charts share one left margin
+  // and their plots align vertically
+  for(const s of SERIES){
+    s.pts = rows.map(d => ({ts: d.ts, v: (d.dev_bytes || {})[s.dev] || 0}));
+    s.nm = niceCeil(Math.max(...s.pts.map(p => p.v), 1));
+    s.ylabels = [trim0(fmtBytesSI(s.nm)), trim0(fmtBytesSI(s.nm / 2))];
   }
-  const xlab =
-    `<text class="fcd-axis" x="${x0}" y="${h - 4}" text-anchor="start">${dlab(t0)}</text>` +
-    `<text class="fcd-axis" x="${x1}" y="${h - 4}" text-anchor="end">${lastIsToday ? 'today' : dlab(tN)}</text>`;
+  const ml = 12 + 7.3 * Math.max(...SERIES.flatMap(s => s.ylabels.map(t => t.length)));
 
-  // line/area segments, broken where days are missing (>1.5d gap = no data)
-  let line = '', area = '', dots = '', seg = [];
-  const flush = () => {
-    if(seg.length > 1){
-      const p = seg.map(q => q[0].toFixed(1) + ' ' + q[1].toFixed(1));
-      line += `<path class="tput-line" d="M${p.join(' L')}"/>`;
-      area += `<path class="tput-area" d="M${seg[0][0].toFixed(1)} ${y1} L${p.join(' L')} L${seg[seg.length - 1][0].toFixed(1)} ${y1} Z"/>`;
+  box.innerHTML = '';
+  SERIES.forEach((s, si) => {
+    const pts = s.pts, n = pts.length, nm = s.nm;
+    const showX = si === SERIES.length - 1;   // date labels once, under the bottom chart
+    const mt = 8, mb = showX ? 18 : 6, h = showX ? 96 : 84;
+    const x0 = ml, x1 = w - mr, y0 = mt, y1 = h - mb;
+    const t0 = pts[0].ts, tN = pts[n - 1].ts, tspan = Math.max(1, tN - t0);
+    const X = ts => x0 + (x1 - x0) * ((ts - t0) / tspan);
+    const Y = v => y1 - (y1 - y0) * (v / nm);
+    const lastIsToday = Math.abs(tN * 1000 - midToday.getTime()) < 1000;
+
+    let grid = '', ylab = '';
+    for(let k = 0; k <= 2; k++){
+      const yy = y0 + (y1 - y0) * k / 2;
+      grid += `<line class="tput-grid" x1="${x0}" y1="${yy.toFixed(1)}" x2="${x1}" y2="${yy.toFixed(1)}"/>`;
+      if(k < 2) ylab += `<text class="fcd-axis" x="${x0 - 6}" y="${(yy + 4).toFixed(1)}" text-anchor="end">${s.ylabels[k]}</text>`;
     }
-    seg = [];
-  };
-  for(let i = 0; i < n; i++){
-    if(i && pts[i].ts - pts[i - 1].ts > 1.5 * 86400) flush();
-    seg.push([X(pts[i].ts), Y(pts[i].v)]);
-  }
-  flush();
-  for(let i = 0; i < n; i++){
-    const cx = X(pts[i].ts).toFixed(1), cy = Y(pts[i].v).toFixed(1);
-    dots += (i === n - 1 && lastIsToday)
-      ? `<circle cx="${cx}" cy="${cy}" r="2.4" fill="var(--surface)" stroke="var(--accent)" stroke-width="1.4"/>`
-      : `<circle class="tput-dot" cx="${cx}" cy="${cy}" r="2"/>`;
-  }
+    const xlab = !showX ? '' :
+      `<text class="fcd-axis" x="${x0}" y="${h - 4}" text-anchor="start">${dlab(t0)}</text>` +
+      `<text class="fcd-axis" x="${x1}" y="${h - 4}" text-anchor="end">${lastIsToday ? 'today' : dlab(tN)}</text>`;
 
-  box.innerHTML =
-    `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" style="display:block">
-       ${grid}${area}${line}${dots}${ylab}${xlab}
-       <line class="tput-guide fcd-guide" style="display:none"/>
-       <circle class="tput-dot fcd-hover" r="3" style="display:none"/>
-       <g class="tput-tipg fcd-tipg" style="display:none">
-         <rect class="tput-tipbg" rx="4" width="118" height="34"/>
-         <text class="tput-tip fcd-tip-t" x="6" y="14"></text>
-         <text class="tput-tip fcd-tip-v" x="6" y="28"></text>
-       </g>
-     </svg>`;
+    // line/area segments, broken where days are missing (>1.5d gap = no data)
+    let line = '', area = '', dots = '', seg = [];
+    const flush = () => {
+      if(seg.length > 1){
+        const p = seg.map(q => q[0].toFixed(1) + ' ' + q[1].toFixed(1));
+        line += `<path class="tput-line" d="M${p.join(' L')}"/>`;
+        area += `<path class="tput-area" d="M${seg[0][0].toFixed(1)} ${y1} L${p.join(' L')} L${seg[seg.length - 1][0].toFixed(1)} ${y1} Z"/>`;
+      }
+      seg = [];
+    };
+    for(let i = 0; i < n; i++){
+      if(i && pts[i].ts - pts[i - 1].ts > 1.5 * 86400) flush();
+      seg.push([X(pts[i].ts), Y(pts[i].v)]);
+    }
+    flush();
+    for(let i = 0; i < n; i++){
+      const cx = X(pts[i].ts).toFixed(1), cy = Y(pts[i].v).toFixed(1);
+      dots += (i === n - 1 && lastIsToday)
+        ? `<circle cx="${cx}" cy="${cy}" r="2.4" fill="var(--surface)" stroke="${s.color}" stroke-width="1.4"/>`
+        : `<circle class="tput-dot" cx="${cx}" cy="${cy}" r="2"/>`;
+    }
 
-  const svgEl = box.querySelector('svg');
-  const guide = box.querySelector('.fcd-guide');
-  const dot = box.querySelector('.fcd-hover');
-  const tipg = box.querySelector('.fcd-tipg');
-  const tipT = box.querySelector('.fcd-tip-t');
-  const tipV = box.querySelector('.fcd-tip-v');
-  const hide = () => { guide.style.display = dot.style.display = tipg.style.display = 'none'; };
-  svgEl.addEventListener('mousemove', ev => {
-    const r = svgEl.getBoundingClientRect();
-    const vx = (ev.clientX - r.left) / r.width * w;
-    let bi = 0, bd = Infinity;
-    for(let i = 0; i < n; i++){ const d = Math.abs(X(pts[i].ts) - vx); if(d < bd){ bd = d; bi = i; } }
-    const px = X(pts[bi].ts), py = Y(pts[bi].v);
-    guide.setAttribute('x1', px); guide.setAttribute('x2', px);
-    guide.setAttribute('y1', y0); guide.setAttribute('y2', y1); guide.style.display = '';
-    dot.setAttribute('cx', px); dot.setAttribute('cy', py); dot.style.display = '';
-    tipT.textContent = dlab(pts[bi].ts) + (bi === n - 1 && lastIsToday ? ' · so far' : '');
-    tipV.textContent = fmtBytesSI(pts[bi].v);
-    let tx = px + 8; if(tx + 118 > x1) tx = px - 126; if(tx < x0) tx = x0;
-    tipg.setAttribute('transform', `translate(${tx.toFixed(1)}, ${Math.max(y0, py - 40).toFixed(1)})`);
-    tipg.style.display = '';
+    const wrap = document.createElement('div');
+    wrap.className = s.cls;
+    wrap.innerHTML =
+      `<div class="cc-hd ${s.hd}" style="margin:${si ? 8 : 6}px 0 2px">${s.label}</div>
+       <svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" style="display:block">
+         ${grid}${area}${line}${dots}${ylab}${xlab}
+         <line class="tput-guide fcd-guide" style="display:none"/>
+         <circle class="tput-dot fcd-hover" r="3" style="display:none"/>
+         <g class="tput-tipg fcd-tipg" style="display:none">
+           <rect class="tput-tipbg" rx="4" width="118" height="34"/>
+           <text class="tput-tip fcd-tip-t" x="6" y="14"></text>
+           <text class="tput-tip fcd-tip-v" x="6" y="28"></text>
+         </g>
+       </svg>`;
+    box.appendChild(wrap);
+
+    const svgEl = wrap.querySelector('svg');
+    const guide = wrap.querySelector('.fcd-guide');
+    const dot = wrap.querySelector('.fcd-hover');
+    const tipg = wrap.querySelector('.fcd-tipg');
+    const tipT = wrap.querySelector('.fcd-tip-t');
+    const tipV = wrap.querySelector('.fcd-tip-v');
+    const hide = () => { guide.style.display = dot.style.display = tipg.style.display = 'none'; };
+    svgEl.addEventListener('mousemove', ev => {
+      const r = svgEl.getBoundingClientRect();
+      const vx = (ev.clientX - r.left) / r.width * w;
+      let bi = 0, bd = Infinity;
+      for(let i = 0; i < n; i++){ const d = Math.abs(X(pts[i].ts) - vx); if(d < bd){ bd = d; bi = i; } }
+      const px = X(pts[bi].ts), py = Y(pts[bi].v);
+      guide.setAttribute('x1', px); guide.setAttribute('x2', px);
+      guide.setAttribute('y1', y0); guide.setAttribute('y2', y1); guide.style.display = '';
+      dot.setAttribute('cx', px); dot.setAttribute('cy', py); dot.style.display = '';
+      tipT.textContent = dlab(pts[bi].ts) + (bi === n - 1 && lastIsToday ? ' · so far' : '');
+      tipV.textContent = fmtBytesSI(pts[bi].v);
+      let tx = px + 8; if(tx + 118 > x1) tx = px - 126; if(tx < x0) tx = x0;
+      tipg.setAttribute('transform', `translate(${tx.toFixed(1)}, ${Math.max(y0, py - 40).toFixed(1)})`);
+      tipg.style.display = '';
+    });
+    svgEl.addEventListener('mouseleave', hide);
   });
-  svgEl.addEventListener('mouseleave', hide);
 }
 // the graph is drawn in 1:1 pixels, so a width change needs a redraw
 let fcdResizeT = null;
