@@ -51,7 +51,7 @@ agent.urllib.request.urlopen = lambda url, timeout=15: _Resp(BLOCKLIST.encode())
 
 # --- simulated host state --------------------------------------------------
 SIM = {"chain_present": True, "blocked": set(), "active": False,
-       "enabled": False, "nym_restarts": 0, "eb_runs": 0}
+       "enabled": False, "nym_restarts": 0, "eb_runs": 0, "nym_pid": 100}
 
 
 def _norm(ip):
@@ -72,7 +72,11 @@ def sim_run(cmd, timeout=6, merge=False):
     EB = agent.EB_UNIT_NAME
     if cmd[:1] == ["systemctl"]:
         sub = cmd[1] if len(cmd) > 1 else ""
-        tgt = cmd[2] if len(cmd) > 2 else ""
+        # skip flags like --no-block so the unit name is found either way
+        units = [a for a in cmd[2:] if not a.startswith("-")]
+        tgt = units[0] if units else ""
+        if sub == "show":  # ActiveState/MainPID polling by _restart_service
+            return (0, f"ActiveState=active\nMainPID={SIM['nym_pid']}\n", "")
         if sub == "daemon-reload":
             return (0, "", "")
         if sub == "enable":
@@ -89,6 +93,7 @@ def sim_run(cmd, timeout=6, merge=False):
             # nym-node restart: chain is flushed + recreated, then the oneshot
             # (WantedBy nym-node) fires and re-applies on top.
             SIM["nym_restarts"] += 1
+            SIM["nym_pid"] += 1
             SIM["chain_present"] = True
             SIM["blocked"] = set()
             _apply_list()

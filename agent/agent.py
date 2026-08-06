@@ -188,6 +188,80 @@ def service_state():
     return (out.strip() == "active"), svc
 
 
+def _show_props(svc, *props):
+    """Query systemd unit properties; returns {prop: value} (empty on failure)."""
+    cmd = ["systemctl", "show", svc]
+    for p in props:
+        cmd += ["-p", p]
+    rc, out, _ = _run(cmd, timeout=10)
+    if rc != 0:
+        return {}
+    d = {}
+    for line in out.splitlines():
+        k, sep, v = line.partition("=")
+        if sep:
+            d[k] = v.strip()
+    return d
+
+
+def _restart_service(svc, wait=150):
+    """Queue a restart with --no-block, then poll until the new instance is up.
+
+    nym-node can take well over a minute to stop: its sqlite pool guard waits
+    on OS file handles, then the task manager force-shutdown kicks in, and
+    systemd's TimeoutStopSec (default 90s) is the last resort before SIGKILL.
+    A blocking `systemctl restart` under a short subprocess timeout kills only
+    the systemctl *client* mid-job — systemd finishes the restart anyway and
+    the action misreports failure. Queueing and polling ActiveState/MainPID
+    gives the truthful outcome instead. Success requires an active state with
+    a MainPID different from the pre-restart one, so the still-running old
+    instance can't count as "restarted".
+
+    Returns (restarted, active, error, elapsed_s).
+    """
+    old_pid = _show_props(svc, "MainPID").get("MainPID", "0")
+    rc, out, err = _run(["systemctl", "restart", "--no-block", svc], timeout=15)
+    if rc != 0:
+        return False, service_state()[0], (err or out or "systemctl restart failed").strip(), 0
+    start = time.monotonic()
+    seen_transition = old_pid in ("", "0")  # no old instance: any active pid is the new one
+    failed_reads = 0
+    while time.monotonic() - start < wait:
+        p = _show_props(svc, "ActiveState", "MainPID")
+        state, pid = p.get("ActiveState", ""), p.get("MainPID", "0")
+        elapsed = int(time.monotonic() - start)
+        if state != "active" or pid != old_pid:
+            seen_transition = True
+        if seen_transition and state == "active" and pid not in ("", "0"):
+            return True, True, None, elapsed
+        # a Restart= unit can show "failed" for a moment before auto-restart
+        # is scheduled — only give up if it stays failed across two reads
+        failed_reads = failed_reads + 1 if state == "failed" else 0
+        if failed_reads >= 2:
+            return False, False, f"{svc} entered failed state after restart", elapsed
+        time.sleep(2)
+    active, _ = service_state()
+    return False, active, f"timed out after {wait}s waiting for {svc} to come back active", wait
+
+
+def _stop_service(svc, wait=150):
+    """Queue a stop with --no-block, then poll until the unit is down.
+
+    Same rationale as _restart_service: a slow nym-node stop outlives short
+    subprocess timeouts. Returns (stopped, error, elapsed_s).
+    """
+    rc, out, err = _run(["systemctl", "stop", "--no-block", svc], timeout=15)
+    if rc != 0:
+        return False, (err or out or "systemctl stop failed").strip(), 0
+    start = time.monotonic()
+    while time.monotonic() - start < wait:
+        state = _show_props(svc, "ActiveState").get("ActiveState", "")
+        if state in ("inactive", "failed"):
+            return True, None, int(time.monotonic() - start)
+        time.sleep(2)
+    return False, f"timed out after {wait}s waiting for {svc} to stop", wait
+
+
 def fail2ban_banned():
     rc, out, _ = _run(["fail2ban-client", "status", "sshd"])
     if rc != 0:
@@ -678,12 +752,11 @@ def act_get_execstart(params):
 
 def act_restart(params):
     svc = resolve_service()
-    rc, out, err = _run(["systemctl", "restart", svc], timeout=40)
-    if rc != 0:
-        return {"ok": False, "service": svc, "error": (err or out or "restart failed").strip()}
-    time.sleep(1)
-    active, _ = service_state()
-    return {"ok": True, "service": svc, "active": active, "output": f"restarted {svc}"}
+    restarted, active, err, elapsed = _restart_service(svc)
+    if not restarted:
+        return {"ok": False, "service": svc, "active": active, "error": err}
+    return {"ok": True, "service": svc, "active": active,
+            "output": f"restarted {svc} ({elapsed}s)"}
 
 
 def act_toggle(params):
@@ -720,9 +793,7 @@ def act_toggle(params):
     _run(["systemctl", "daemon-reload"])
     restarted, active = False, None
     if params.get("restart"):
-        rc, _, _ = _run(["systemctl", "restart", svc], timeout=40)
-        restarted = rc == 0
-        active, _ = service_state()
+        restarted, active, _rerr, _elapsed = _restart_service(svc)
     return {"ok": True, "service": svc, "changed": True, "fragment_path": path,
             "old_execstart": cmd.strip(), "new_execstart": new_cmd,
             "backup": backup, "restarted": restarted, "active": active}
@@ -945,11 +1016,11 @@ def act_upgrade(params):
 
     restarted, active = False, None
     if params.get("restart"):
-        rc3, _, _ = _run(["systemctl", "restart", svc], timeout=40)
-        restarted = rc3 == 0
-        time.sleep(1)
-        active, _ = service_state()
-        log.append(f"restart {'ok' if restarted else 'FAILED'}; service active={active}")
+        restarted, active, rerr, elapsed = _restart_service(svc)
+        if restarted:
+            log.append(f"restart ok ({elapsed}s); service active={active}")
+        else:
+            log.append(f"restart FAILED ({rerr}); service active={active}")
 
     # A bundled NTM failure after a successful binary swap stays ok=True (the
     # upgrade itself worked; the ntm sub-result carries the failure). On an
@@ -1025,11 +1096,11 @@ def act_backup(params):
     archive_path = os.path.join(BACKUP_DIR, fname)
     log = [f"node id: {nid}", f"data dir: {data_dir}"]
 
-    rc, out, err = _run(["systemctl", "stop", svc], timeout=60)
-    if rc != 0:
+    stopped, stop_err, stop_s = _stop_service(svc)
+    if not stopped:
         return {"ok": False, "error": f"failed to stop {svc}; backup aborted",
-                "output": "\n".join(log + [f"stop FAILED: {(err or out).strip()}"])}
-    log.append(f"stopped {svc}")
+                "output": "\n".join(log + [f"stop FAILED: {stop_err}"])}
+    log.append(f"stopped {svc} ({stop_s}s)")
 
     archive_err, size, sha = None, None, None
     try:
@@ -1038,11 +1109,11 @@ def act_backup(params):
     except Exception as e:
         archive_err = str(e)
 
-    rc2, _, _ = _run(["systemctl", "start", svc], timeout=60)
-    restarted = rc2 == 0
-    time.sleep(1)
-    active, _ = service_state()
-    log.append(f"restarted {svc}: {'ok' if restarted else 'FAILED'}; active={active}")
+    restarted, active, start_err, start_s = _restart_service(svc)
+    if restarted:
+        log.append(f"restarted {svc}: ok ({start_s}s); active={active}")
+    else:
+        log.append(f"restarted {svc}: FAILED ({start_err}); active={active}")
 
     if archive_err:
         return {"ok": False, "error": f"archive failed: {archive_err}",
@@ -2255,11 +2326,11 @@ def act_extra_blocks_install(params):
 
     if restart_node:
         svc = resolve_service()
-        rc, out, errx = _run(["systemctl", "restart", svc], timeout=90)
-        if rc != 0:
-            return {"ok": False, "error": f"failed to restart {svc}: {(errx or out).strip()}",
+        restarted, _active, rerr, elapsed = _restart_service(svc)
+        if not restarted:
+            return {"ok": False, "error": f"failed to restart {svc}: {rerr}",
                     "before": before, "output": "\n".join(log)}
-        log.append(f"restarted {svc}")
+        log.append(f"restarted {svc} ({elapsed}s)")
         # the oneshot is WantedBy nym-node and fires on its own; poll for the rules,
         # then nudge it once if they haven't landed yet
         after = _eb_wait_rules(want=before["blocklist_size"], deadline_s=75)

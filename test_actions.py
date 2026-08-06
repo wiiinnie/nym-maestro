@@ -242,6 +242,82 @@ check("NTM-only leaves binary fields empty and logs the skip",
       _u.get("binary") is None and _u.get("new_version") is None
       and "binary swap skipped" in _u.get("output", ""))
 
+# --- _restart_service / _stop_service: queue-and-poll over slow shutdown ---
+# nym-node can take >40s to stop (sqlite pool guard + force-shutdown +
+# TimeoutStopSec), so restarts are queued with --no-block and polled. Fake
+# the clock so the 2s poll sleeps cost nothing.
+_orig_run = agent._run
+_orig_mono, _orig_sleep = agent.time.monotonic, agent.time.sleep
+_clk = {"t": 0.0}
+agent.time.monotonic = lambda: _clk["t"]
+agent.time.sleep = lambda s: _clk.__setitem__("t", _clk["t"] + s)
+
+_seq = {"polls": 0}
+
+
+def _fake_run_restart(cmd, timeout=6, merge=False):
+    if cmd[:3] == ["systemctl", "restart", "--no-block"]:
+        return 0, "", ""
+    if cmd[:2] == ["systemctl", "show"] and "ActiveState" not in cmd:
+        return 0, "MainPID=111\n", ""  # pre-restart pid snapshot
+    if cmd[:2] == ["systemctl", "show"]:
+        _seq["polls"] += 1
+        if _seq["polls"] <= 2:  # old instance lingers in its slow shutdown
+            return 0, "ActiveState=active\nMainPID=111\n", ""
+        if _seq["polls"] == 3:
+            return 0, "ActiveState=deactivating\nMainPID=111\n", ""
+        if _seq["polls"] == 4:
+            return 0, "ActiveState=activating\nMainPID=0\n", ""
+        return 0, "ActiveState=active\nMainPID=222\n", ""
+    return 0, "", ""
+
+
+agent._run = _fake_run_restart
+_r = agent._restart_service("nym-node.service", wait=60)
+check("restart_service rides out a slow stop and confirms the new pid",
+      _r[0] is True and _r[1] is True and _r[2] is None)
+check("restart_service does not count the lingering old instance as restarted",
+      _seq["polls"] >= 5)
+
+_clk["t"] = 0.0
+
+
+def _fake_run_stuck(cmd, timeout=6, merge=False):
+    if cmd[:2] == ["systemctl", "is-active"]:
+        return 0, "active", ""
+    if cmd[:2] == ["systemctl", "show"] and "ActiveState" in cmd:
+        return 0, "ActiveState=active\nMainPID=111\n", ""
+    if cmd[:2] == ["systemctl", "show"]:
+        return 0, "MainPID=111\n", ""
+    return 0, "", ""
+
+
+agent._run = _fake_run_stuck
+_r = agent._restart_service("nym-node.service", wait=10)
+check("restart_service times out truthfully when the old instance never dies",
+      _r[0] is False and _r[1] is True and "timed out" in (_r[2] or ""))
+
+_clk["t"] = 0.0
+_seq2 = {"polls": 0}
+
+
+def _fake_run_stop(cmd, timeout=6, merge=False):
+    if cmd[:3] == ["systemctl", "stop", "--no-block"]:
+        return 0, "", ""
+    if cmd[:2] == ["systemctl", "show"]:
+        _seq2["polls"] += 1
+        state = "deactivating" if _seq2["polls"] < 3 else "inactive"
+        return 0, f"ActiveState={state}\n", ""
+    return 0, "", ""
+
+
+agent._run = _fake_run_stop
+_s = agent._stop_service("nym-node.service", wait=60)
+check("stop_service polls a slow stop through to inactive", _s[0] is True and _s[1] is None)
+
+agent._run = _orig_run
+agent.time.monotonic, agent.time.sleep = _orig_mono, _orig_sleep
+
 # --- fail2ban: log parse, config write (scoped to sshd), validation --------
 import os as _os3, tempfile as _tf3, time as _tm3
 _fd = _tf3.mkdtemp()

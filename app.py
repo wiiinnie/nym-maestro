@@ -1215,7 +1215,9 @@ async def exec_action(payload: ExecRequest, request: Request):
 
     async def run_one(node):
         try:
-            timeout = 300 if payload.action == "upgrade" else 40
+            # agent-side restarts now poll up to 150s (slow nym-node shutdown);
+            # upgrade worst case stacks download + NTM run + that restart
+            timeout = 600 if payload.action == "upgrade" else 180
             res = await agent_exec(app_, node, payload.action, payload.params, timeout=timeout)
             ok = bool(res.get("ok", True))
         except Exception as e:
@@ -1377,8 +1379,9 @@ async def extra_blocks_status(payload: ExtraBlocksRequest, request: Request):
 async def extra_blocks_install(payload: ExtraBlocksInstallRequest, request: Request):
     store, nodes = _eb_targets(request, payload.node_ids)
     params = {"restart_node": payload.restart_node, "list_url": payload.list_url}
-    # a restart waits for nym-node + the oneshot to re-apply, so give it room
-    timeout = 230 if payload.restart_node else 120
+    # a restart polls up to 150s for nym-node, then waits for the oneshot to
+    # re-apply (75s + 90s nudge + 45s), so give the full chain room
+    timeout = 420 if payload.restart_node else 120
     job_id = uuid.uuid4().hex
     store.record_job(job_id, "extra_blocks_install",
                      json.dumps({"nodes": len(nodes), "restart": payload.restart_node}), len(nodes))
