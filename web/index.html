@@ -181,6 +181,9 @@
   .viewopts label{display:inline-flex;align-items:center;gap:5px;cursor:pointer}
   .viewopts .vo-sep{margin-left:8px}
   .viewopts select{background:var(--surface-2);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:3px 7px;font-size:12px}
+  .fleet-summary{display:flex;gap:28px;flex-wrap:wrap;margin:0 0 10px;font-size:12px;color:var(--muted)}
+  .fleet-summary .fs-item{display:flex;flex-direction:column;gap:2px}
+  .fleet-summary .fs-val{font-family:var(--mono);font-size:14px;color:var(--text)}
   button{font-family:var(--sans);font-size:13px;display:inline-flex;align-items:center;gap:6px;
     padding:7px 12px;border-radius:var(--r);border:1px solid var(--line);background:var(--surface);
     color:var(--text);cursor:pointer}
@@ -525,6 +528,8 @@
     <label><input type="checkbox" id="dev-nymtun0" checked onchange="renderTable()"> nymtun0</label>
     <label><input type="checkbox" id="dev-nymwg" checked onchange="renderTable()"> nymwg</label>
   </div>
+
+  <div class="fleet-summary" id="fleet-summary"></div>
 
   <div id="tablewrap"></div>
 </div>
@@ -1995,12 +2000,11 @@ function trafficVal(s){
   return (devList().length === 2 && s.traffic_bytes != null) ? s.traffic_bytes : null;
 }
 
-// NYM token amount, compact ("127.6k NYM")
-function fmtNym(v){
+// whole-NYM stake amount with thousands separators ("256,556 NYM").
+// NOT named fmtNym — that name is taken by the wallet formatter further down.
+function fmtStake(v){
   if(v == null) return '—';
-  if(v >= 1e6) return (v / 1e6).toFixed(2) + 'M NYM';
-  if(v >= 1e3) return (v / 1e3).toFixed(1) + 'k NYM';
-  return Math.round(v) + ' NYM';
+  return Math.floor(v).toLocaleString() + ' NYM';
 }
 
 function sortKeyVal(n, key){
@@ -2055,7 +2059,40 @@ function sortHeader(label, key){
   return th;
 }
 
+// fleet-wide totals above the table — ALWAYS over all nodes, never the selection
+function renderFleetSummary(){
+  const box = document.getElementById('fleet-summary');
+  if(!box) return;
+  box.innerHTML = '';
+  if(nodes.length === 0){ box.style.display = 'none'; return; }
+  box.style.display = '';
+  let stake = null, traffic = null, tput = null;
+  nodes.forEach(n => {
+    const s = n.status;
+    if(n.stake && n.stake.total_stake != null) stake = (stake || 0) + n.stake.total_stake;
+    const tv = trafficVal(s);
+    if(tv != null) traffic = (traffic || 0) + tv;
+    const bw = s ? sumDevices(s.throughput) : null;
+    if(bw != null) tput = (tput || 0) + bw;
+  });
+  const item = (label, val, title) => {
+    const d = el('div','fs-item');
+    d.title = title;
+    d.append(el('span', null, label));
+    d.append(el('span','fs-val', val));
+    return d;
+  };
+  box.append(
+    item('Total stake', stake != null ? fmtStake(stake) : '—',
+         'On-chain stake summed over all ' + nodes.length + ' nodes'),
+    item('Total traffic', traffic != null ? fmtBytes(traffic) : '—',
+         'Traffic counters summed over all nodes (selected interfaces)'),
+    item('Total throughput', tput != null ? fmtRate(tput, bwUnit()) : '—',
+         'Live throughput summed over all nodes (selected interfaces)'));
+}
+
 function renderTable(){
+  renderFleetSummary();
   const wrap = document.getElementById('tablewrap');
   wrap.innerHTML = '';
   const q = (document.getElementById('filter').value || '').toLowerCase();
@@ -2169,7 +2206,9 @@ function renderTable(){
     if(n.stake && n.stake.total_stake != null){
       const sw = el('div');
       sw.style.display = 'flex'; sw.style.flexDirection = 'column'; sw.style.gap = '2px';
-      sw.append(el('span','mono', fmtNym(n.stake.total_stake)));
+      const sv = el('span','mono', fmtStake(n.stake.total_stake));
+      sv.style.whiteSpace = 'nowrap';
+      sw.append(sv);
       if(n.stake.saturation != null){
         const pct = Math.round(n.stake.saturation * 100);
         const sat = el('span','sub', pct + '% sat');
