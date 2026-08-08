@@ -1995,6 +1995,14 @@ function trafficVal(s){
   return (devList().length === 2 && s.traffic_bytes != null) ? s.traffic_bytes : null;
 }
 
+// NYM token amount, compact ("127.6k NYM")
+function fmtNym(v){
+  if(v == null) return '—';
+  if(v >= 1e6) return (v / 1e6).toFixed(2) + 'M NYM';
+  if(v >= 1e3) return (v / 1e3).toFixed(1) + 'k NYM';
+  return Math.round(v) + ' NYM';
+}
+
 function sortKeyVal(n, key){
   const s = n.status || {};
   switch(key){
@@ -2005,6 +2013,7 @@ function sortKeyVal(n, key){
     case 'service':   return s.service_active === true ? 1 : (s.service_active === false ? 0 : -1);
     case 'bans':      return s.fail2ban_banned == null ? -1 : s.fail2ban_banned;
     case 'eblocks':   { const e = s.extra_blocks; return !e || !e.installed ? 0 : (e.active ? 2 : 1); }
+    case 'stake':     { const v = n.stake; return v && v.total_stake != null ? v.total_stake : -1; }
     case 'traffic':   { const v = trafficVal(s); return v == null ? -1 : v; }
     case 'throughput': { const v = sumDevices(s.throughput); return v == null ? -1 : v; }
     case 'disk':      { const d = s.disk; return (d && d.percent_used != null) ? d.percent_used : -1; }
@@ -2079,6 +2088,7 @@ function renderTable(){
   htr.append(sortHeader('Node', 'name'));
   htr.append(sortHeader('Version', 'version'));
   htr.append(sortHeader('Roles', 'roles'));
+  htr.append(sortHeader('Stake', 'stake'));
   htr.append(sortHeader('WG', 'wg'));
   htr.append(sortHeader('Service', 'service'));
   htr.append(sortHeader('Jailed IPs', 'bans'));
@@ -2154,6 +2164,26 @@ function renderTable(){
     tr.append(vTd);
 
     tr.append(rolesCell(s));
+
+    const stTd = el('td');
+    if(n.stake && n.stake.total_stake != null){
+      const sw = el('div');
+      sw.style.display = 'flex'; sw.style.flexDirection = 'column'; sw.style.gap = '2px';
+      sw.append(el('span','mono', fmtNym(n.stake.total_stake)));
+      if(n.stake.saturation != null){
+        const pct = Math.round(n.stake.saturation * 100);
+        const sat = el('span','sub', pct + '% sat');
+        sat.style.fontSize = '11px'; sat.style.whiteSpace = 'nowrap';
+        if(pct > 100) sat.style.color = 'var(--warn, #d9933a)';
+        sat.title = 'Stake saturation — total stake vs the network saturation point' +
+          (pct > 100 ? '. Over-saturated: rewards per delegated NYM decrease.' : '');
+        sw.append(sat);
+      }
+      stTd.append(sw);
+    } else {
+      stTd.append(dash());
+    }
+    tr.append(stTd);
 
     const wgTd = el('td');
     wgTd.append(statePill(s ? s.wireguard : null, 'on', 'off'));

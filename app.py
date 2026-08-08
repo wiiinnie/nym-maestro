@@ -83,6 +83,18 @@ NYM_TOPOLOGY_URLS = [
 ]
 _NYM_TOPO_CACHE = {"at": 0.0, "map": {}}
 _NYM_TOPO_TTL = float(os.environ.get("MAESTRO_NYM_TOPOLOGY_TTL", "3600"))
+
+# --- Nym stake / saturation (per bonded node), for the fleet table -----------
+# total stake = rewarding_details.operator + .delegates (unym); saturation =
+# total / interval.stake_saturation_point from the epoch reward params.
+NYM_BONDED_URL = os.environ.get(
+    "MAESTRO_NYM_BONDED_URL",
+    "https://validator.nymtech.net/api/v1/nym-nodes/bonded")
+NYM_REWARD_PARAMS_URL = os.environ.get(
+    "MAESTRO_NYM_REWARD_PARAMS_URL",
+    "https://validator.nymtech.net/api/v1/epoch/reward_params")
+_NYM_STAKE_CACHE = {"at": 0.0, "map": {}}
+_NYM_STAKE_TTL = float(os.environ.get("MAESTRO_NYM_STAKE_TTL", "900"))
 _IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 _HEX6 = set("0123456789abcdefABCDEF:.")
 
@@ -194,6 +206,66 @@ async def fetch_nym_topology(force=False):
         _NYM_TOPO_CACHE["map"] = merged
         _NYM_TOPO_CACHE["at"] = now
     return _NYM_TOPO_CACHE["map"]
+
+
+def _harvest_stake(data, sat_point, into):
+    """Map bonded-node host (IP or hostname) -> stake record."""
+    for e in data.get("data") or []:
+        if not isinstance(e, dict):
+            continue
+        bi = e.get("bond_information") or {}
+        rd = e.get("rewarding_details") or {}
+        host = str((bi.get("node") or {}).get("host") or "").strip()
+        if not host:
+            continue
+        try:
+            total = float(rd.get("operator") or 0) + float(rd.get("delegates") or 0)
+        except (TypeError, ValueError):
+            continue
+        rec = {
+            "nym_node_id": bi.get("node_id"),
+            "total_stake": total / 1e6,                      # NYM
+            "saturation": (total / sat_point) if sat_point else None,
+        }
+        key = _norm_ip(host) or host.lower()
+        into.setdefault(key, rec)
+
+
+async def fetch_nym_stake(force=False):
+    now = time.time()
+    if not force and _NYM_STAKE_CACHE["map"] and (now - _NYM_STAKE_CACHE["at"]) < _NYM_STAKE_TTL:
+        return _NYM_STAKE_CACHE["map"]
+    merged = {}
+    try:
+        async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
+            rp = await client.get(NYM_REWARD_PARAMS_URL)
+            rp.raise_for_status()
+            sat_point = float((rp.json().get("interval") or {}).get("stake_saturation_point") or 0)
+            r = await client.get(NYM_BONDED_URL)
+            r.raise_for_status()
+            data = r.json()
+            _harvest_stake(data, sat_point, merged)
+            pg = data.get("pagination") if isinstance(data, dict) else None
+            if pg:
+                total = int(pg.get("total") or 0)
+                size = int(pg.get("size") or 0)
+                page = int(pg.get("page") or 0)
+                got = size
+                guard = 0
+                while size and got < total and guard < 30:
+                    page += 1
+                    guard += 1
+                    sep = "&" if "?" in NYM_BONDED_URL else "?"
+                    rn = await client.get(f"{NYM_BONDED_URL}{sep}page={page}&size={size}")
+                    rn.raise_for_status()
+                    _harvest_stake(rn.json(), sat_point, merged)
+                    got += size
+    except Exception:
+        return _NYM_STAKE_CACHE["map"]
+    if merged:
+        _NYM_STAKE_CACHE["map"] = merged
+        _NYM_STAKE_CACHE["at"] = now
+    return _NYM_STAKE_CACHE["map"]
 
 
 def _iso2(country: str):
@@ -1055,6 +1127,7 @@ async def list_nodes(request: Request):
     except Exception:
         local_ver = local_sha = None
     topo = await fetch_nym_topology()
+    stake = await fetch_nym_stake()
     for n in nodes:
         st = n.get("status")
         if st:
@@ -1066,6 +1139,11 @@ async def list_nodes(request: Request):
         cc = _iso2(rec.get("cc"))
         if cc:
             n["cc"] = cc
+        # on-chain stake + saturation (bonded host is usually the IP; fall back
+        # to the advertised hostname for nodes bonded under a DNS name)
+        srec = stake.get(nip) or stake.get((n.get("hostname") or "").strip().lower())
+        if srec:
+            n["stake"] = srec
     return nodes
 
 
