@@ -507,6 +507,7 @@
     <button id="btn-ssh" onclick="openSsh()" disabled>SSH keys</button>
     <button id="btn-extra-blocks" onclick="openExtraBlocks()" disabled title="Install/verify NYM-EXIT abuse blocklist">Extra blocks</button>
     <button id="btn-update-agent" onclick="openAgentUpdate()" disabled title="Push the local agent to selected nodes">Update agent</button>
+    <button id="btn-landing" onclick="openLanding()" title="Rebuild and deploy the public node-overview page">Landing page</button>
     <span class="spacer"></span>
     <div class="filter"><input id="filter" type="text" placeholder="filter nodes" autocomplete="off"></div>
     <button class="primary" onclick="openModal('add')">Add node</button>
@@ -816,6 +817,76 @@
     <div class="modal-actions">
       <button id="eb-remove" class="ghost" onclick="ebRemove()" style="margin-right:auto">Remove</button>
       <button onclick="closeExtraBlocks()">Close</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="lp-overlay">
+  <div class="modal wide">
+    <h2>Landing page · public node overview</h2>
+    <p class="sub" id="lp-intro">The page every gateway serves at <span class="mono">/var/www/&lt;hostname&gt;/index.html</span>. Only <span class="mono">name</span>, <span class="mono">IPv4</span>, <span class="mono">hostname</span> and <span class="mono">country</span> are published — nothing else from this dashboard leaves the machine. The page is static, so it works with JavaScript disabled.</p>
+    <div id="lp-status" class="f2b-status"></div>
+    <button class="ghost" id="lp-master-toggle" onclick="lpToggleMaster()" style="display:none;margin:-8px 0 10px">Replace master…</button>
+
+    <div style="display:flex;flex-direction:column;gap:12px;margin-bottom:14px">
+
+      <div id="lp-box-master" style="border:1px solid var(--line);border-radius:8px;padding:12px 14px">
+        <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">Master page</div>
+        <p style="font-size:12px;color:var(--muted);margin:0 0 8px">One master here is the single source of truth; every node gets the identical file. Seed it from a node that is already serving the page — the first rebuild replaces the old hand-written node section with the auto-markers and leaves the legal T&amp;C untouched.</p>
+        <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+          <label style="font-size:12px;color:var(--muted)">Fetch from node
+            <select id="lp-seed-node" style="margin-top:3px;font-size:12px"></select>
+          </label>
+          <button id="lp-seed" onclick="lpSeedFromNode()">Fetch</button>
+          <span class="spacer" style="flex:1"></span>
+          <button class="ghost" id="lp-paste-toggle" onclick="lpTogglePaste()">Paste HTML instead…</button>
+        </div>
+        <div id="lp-paste-box" style="display:none;margin-top:8px">
+          <textarea id="lp-paste" rows="5" placeholder="Paste the full current index.html here" style="width:100%;font-family:var(--mono);font-size:11px"></textarea>
+          <button id="lp-paste-save" onclick="lpSavePaste()" style="margin-top:6px">Save as master</button>
+        </div>
+      </div>
+
+      <div style="border:1px solid var(--line);border-radius:8px;padding:12px 14px">
+        <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">1 · Rebuild page</div>
+        <p style="font-size:12px;color:var(--muted);margin:0 0 8px">Regenerates the node block from the current fleet and rewrites the master. Publishes nothing — the nodes keep serving the old page until you deploy. Refuses to build if a node has a broken IP or hostname, or if the fleet list comes back empty.</p>
+        <label class="f2b-check" style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px"><input id="lp-disabled" type="checkbox">
+          Also list nodes marked disabled</label>
+        <label class="f2b-check" style="font-size:12px;color:var(--muted);display:block;margin-bottom:8px"><input id="lp-partial" type="checkbox">
+          Allow partial — exclude nodes with a broken IP/hostname instead of stopping</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="primary" id="lp-rebuild" onclick="lpRebuild(false)">Rebuild page</button>
+          <button id="lp-dryrun" onclick="lpRebuild(true)">Dry run</button>
+          <button id="lp-preview" onclick="lpPreview()">Preview ↗</button>
+        </div>
+        <div id="lp-result" style="margin-top:10px"></div>
+      </div>
+
+      <div style="border:1px solid var(--line);border-radius:8px;padding:12px 14px">
+        <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">2 · Deploy to nodes</div>
+        <p style="font-size:12px;color:var(--muted);margin:0 0 8px">Ships the rebuilt page over the mTLS agent channel. The agent verifies the sha256 before it touches anything, keeps the replaced page as <span class="mono" style="font-size:11px">index.html.bak-&lt;version&gt;</span>, and swaps atomically. Nodes already serving this version are skipped; a node without a webroot is reported, never created blindly.</p>
+        <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:6px">Target
+          <select id="lp-target" style="margin-top:3px;font-size:12px"></select>
+        </label>
+        <label class="f2b-check" style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px"><input id="lp-create" type="checkbox">
+          Create <span class="mono" style="font-size:11px">index.html</span> on nodes that don't have one yet</label>
+        <label class="f2b-check" style="font-size:12px;color:var(--muted);display:block;margin-bottom:8px"><input id="lp-force" type="checkbox">
+          Force — re-deploy even where this version is already served</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button id="lp-check" onclick="lpCheckNodes()">Check nodes</button>
+          <button class="primary" id="lp-deploy" onclick="lpDeploy()">Deploy</button>
+          <button class="ghost" id="lp-revert" onclick="lpRevert()">Revert to previous…</button>
+        </div>
+        <div id="lp-nodes" style="margin-top:10px"></div>
+      </div>
+
+    </div>
+
+    <p class="f2b-warn" style="margin-bottom:0">Deploy needs agent <span class="mono">0.11.0</span> or newer on the target node — older agents answer <span class="mono">unknown action</span>; push the agent first with <b>Update agent</b>. A decommissioned host keeps serving its last page until you retire its vhost.</p>
+
+    <div class="modal-actions">
+      <span class="spacer" style="flex:1"></span>
+      <button onclick="closeLanding()">Close</button>
     </div>
   </div>
 </div>
@@ -2309,6 +2380,9 @@ function updateBulk(){
   document.getElementById('btn-update-agent').disabled = reachable.length === 0;
   if(sel.length === 0) note.textContent = 'Select one or more nodes to act on them.';
   else note.textContent = sel.length + ' selected · ' + reachable.length + ' reachable';
+  // the landing modal's target picker counts the selection, so keep it in sync
+  const lp = document.getElementById('lp-overlay');
+  if(lp && lp.classList.contains('open')) lpFillPickers();
   if(typeof renderCards === 'function') renderCards();
 }
 
@@ -3305,6 +3379,285 @@ async function ebRestartService(){
   btn.disabled = false; btn.textContent = 'Restart nym-extra-blocks';
 }
 
+// ===== Landing page (public node overview) ================================
+// Two steps on purpose: Rebuild only rewrites the local master, Deploy is what
+// makes it public. So a failed deploy retries without regenerating, and a fresh
+// build can be previewed before any node serves it.
+let lpStatus = null, lpStatusError = null, lpMasterShown = false;
+
+function openLanding(){
+  document.getElementById('lp-overlay').classList.add('open');
+  document.getElementById('lp-result').innerHTML = '';
+  document.getElementById('lp-nodes').innerHTML = '';
+  lpMasterShown = false;
+  lpFillPickers();
+  lpLoadStatus();
+}
+function closeLanding(){ document.getElementById('lp-overlay').classList.remove('open'); }
+
+function lpReachable(){ return nodes.filter(n => n.status && n.status.reachable); }
+
+function lpFillPickers(){
+  // load() re-renders every 15s, so both pickers must keep the operator's
+  // choice across a refresh — otherwise Fetch silently seeds from another node
+  const seed = document.getElementById('lp-seed-node');
+  const keepSeed = seed.value;
+  seed.innerHTML = '';
+  lpReachable().filter(n => n.hostname).forEach(n => {
+    const o = el('option', null, n.name + ' · ' + n.hostname);
+    o.value = n.uid; seed.append(o);
+  });
+  if(!seed.options.length){
+    const o = el('option', null, 'no node with a hostname');
+    o.value = ''; o.disabled = true; seed.append(o);
+  }
+  if(keepSeed && [...seed.options].some(o => o.value === keepSeed)) seed.value = keepSeed;
+
+  const sel = selectedNodes().filter(n => n.status && n.status.reachable);
+  const all = lpReachable();
+  const t = document.getElementById('lp-target');
+  const keep = t.value;
+  t.innerHTML = '';
+  if(sel.length){
+    const o = el('option', null, 'selected nodes (' + sel.length + ')');
+    o.value = 'selected'; t.append(o);
+  }
+  const o2 = el('option', null, 'all reachable nodes (' + all.length + ')');
+  o2.value = 'all'; t.append(o2);
+  if(keep && [...t.options].some(o => o.value === keep)) t.value = keep;
+}
+
+function lpTargetNodes(){
+  if(document.getElementById('lp-target').value === 'selected')
+    return selectedNodes().filter(n => n.status && n.status.reachable);
+  return lpReachable();
+}
+
+function lpSkipText(reason){
+  if(reason === 'no-webroot') return 'no webroot on this node — check the vhost path';
+  if(reason === 'no-index') return 'no index.html yet — tick “create” to place one';
+  if(reason === 'already-current') return 'already serving this version';
+  if(reason === 'no-backup') return 'nothing to revert to';
+  if(reason === 'symlink') return 'index.html is a symlink — fix the vhost layout first';
+  return reason || 'skipped';
+}
+
+async function lpLoadStatus(){
+  const box = document.getElementById('lp-status');
+  box.textContent = 'Checking…';
+  try{
+    lpStatus = await api('/api/landing/status');
+    lpStatusError = null;
+  }catch(e){
+    lpStatus = null; lpStatusError = e.message;
+  }
+  lpRenderStatus();
+}
+
+function lpRenderStatus(){
+  const box = document.getElementById('lp-status');
+  box.innerHTML = '';
+  // never let a failed status call masquerade as "you have no master page"
+  if(lpStatus === null){
+    const row = el('div','f2b-node');
+    row.append(el('span','pill bad','status unavailable'));
+    row.append(el('span','sub', lpStatusError || 'could not read the landing-page status'));
+    box.append(row);
+    document.getElementById('lp-box-master').style.display = '';
+    document.getElementById('lp-deploy').disabled = true;
+    document.getElementById('lp-preview').disabled = true;
+    return;
+  }
+  const s = lpStatus;
+  const row = el('div','f2b-node');
+  if(!s.has_master){
+    row.append(el('span','pill warn','No master'));
+    row.append(el('span','sub', s.note || 'Seed a master page first.'));
+  }else{
+    row.append(el('span','pill ok','Master'));
+    if(s.version) row.append(el('span','mono', s.version));
+    else row.append(el('span','pill warn','never rebuilt'));
+    if(s.count != null) row.append(el('span','sub', s.count + ' nodes listed'));
+    if(s.generated) row.append(el('span','sub', 'generated ' + s.generated.slice(0,10)));
+    row.append(el('span','sub', fmtBytes(s.master_bytes)));
+    row.append(s.has_serve_copy ? el('span','pill ok','ready to deploy')
+                                : el('span','pill muted','not rebuilt yet'));
+  }
+  box.append(row);
+  // Collapse the seeding controls once a master exists, but keep them one click
+  // away — a master can need re-seeding (bad paste, mangled splice), and hiding
+  // them outright left no way back without DevTools.
+  document.getElementById('lp-box-master').style.display =
+    (s.has_master && !lpMasterShown) ? 'none' : '';
+  document.getElementById('lp-master-toggle').style.display = s.has_master ? '' : 'none';
+  document.getElementById('lp-master-toggle').textContent =
+    lpMasterShown ? 'Hide master controls' : 'Replace master…';
+  document.getElementById('lp-deploy').disabled = !s.has_serve_copy;
+  document.getElementById('lp-preview').disabled = !s.has_master;
+}
+
+function lpToggleMaster(){
+  lpMasterShown = !lpMasterShown;
+  lpRenderStatus();
+}
+
+function lpTogglePaste(){
+  const b = document.getElementById('lp-paste-box');
+  b.style.display = b.style.display === 'none' ? '' : 'none';
+}
+
+async function lpRun(btnId, label, fn){
+  const btn = document.getElementById(btnId);
+  const orig = btn.textContent; btn.disabled = true; btn.textContent = label;
+  try{ await fn(); }
+  catch(e){ toast(e.message, true); }
+  btn.disabled = false; btn.textContent = orig;
+  lpRenderStatus();
+}
+
+function lpSeedFromNode(){
+  const uid = document.getElementById('lp-seed-node').value;
+  if(!uid){ toast('no node to fetch from', true); return; }
+  return lpRun('lp-seed', 'Fetching…', async () => {
+    lpStatus = await api('/api/landing/master/fetch', {method:'POST', body: JSON.stringify({uid})});
+    toast('Seeded master from ' + (lpStatus.source || 'node'));
+  });
+}
+
+function lpSavePaste(){
+  const html = document.getElementById('lp-paste').value;
+  if(!html.trim()){ toast('paste the page first', true); return; }
+  return lpRun('lp-paste-save', 'Saving…', async () => {
+    lpStatus = await api('/api/landing/master', {method:'POST', body: JSON.stringify({html})});
+    document.getElementById('lp-paste').value = '';
+    lpTogglePaste();
+    toast('Master saved');
+  });
+}
+
+function lpPreview(){ window.open('/api/landing/preview', '_blank'); }
+
+function lpRebuild(dry){
+  return lpRun(dry ? 'lp-dryrun' : 'lp-rebuild', dry ? 'Checking…' : 'Rebuilding…', async () => {
+    const r = await api('/api/landing/rebuild', {method:'POST', body: JSON.stringify({
+      include_disabled: document.getElementById('lp-disabled').checked,
+      allow_partial: document.getElementById('lp-partial').checked,
+      dry_run: !!dry})});
+    if(r.status) lpStatus = r.status;
+    lpRenderRebuild(r, dry);
+    if(!r.ok){ toast(r.error, true); return; }
+    toast(dry ? 'Dry run: ' + r.counts.nodes + ' nodes would be listed'
+              : 'Rebuilt ' + r.version + ' · ' + r.counts.nodes + ' nodes');
+  });
+}
+
+function lpRenderRebuild(r, dry){
+  const box = document.getElementById('lp-result');
+  box.innerHTML = '';
+  if(!r.ok){
+    const e = el('div','sub', r.error); e.style.color = 'var(--danger)'; box.append(e);
+    (r.details || []).forEach(d => {
+      const l = el('div','sub', '· ' + d); l.style.color = 'var(--danger)'; box.append(l);
+    });
+    return;
+  }
+  const head = el('div','f2b-node');
+  head.append(el('span','pill ' + (dry ? 'info' : 'ok'), dry ? 'dry run' : 'rebuilt'));
+  head.append(el('span','mono', r.version));
+  head.append(el('span','sub', r.counts.nodes + ' gateways · ' + r.counts.countries + ' countries'));
+  if(r.splice_mode !== 'markers') head.append(el('span','pill warn', r.splice_mode));
+  box.append(head);
+
+  const d = r.diff || {};
+  if(d.first_run){
+    box.append(el('div','sub', 'first generation — the old hand-written section was replaced and the auto-markers inserted'));
+  }else{
+    const n = (d.added||[]).length + (d.removed||[]).length + (d.changed||[]).length;
+    box.append(el('div','sub', n === 0
+      ? 'no membership change since ' + (d.previous_version || 'the previous build')
+      : '+' + (d.added||[]).length + ' added · −' + (d.removed||[]).length +
+        ' removed · ~' + (d.changed||[]).length + ' changed'));
+    (d.added||[]).forEach(h => box.append(el('div','sub', '+ ' + h)));
+    (d.removed||[]).forEach(h => box.append(el('div','sub', '− ' + h)));
+    (d.changed||[]).forEach(h => box.append(el('div','sub', '~ ' + h)));
+  }
+  (r.warnings||[]).forEach(w => {
+    const l = el('div','sub', w); l.style.color = 'var(--warn)'; box.append(l);
+  });
+  (r.excluded||[]).forEach(x => {
+    const l = el('div','sub', 'excluded: ' + x); l.style.color = 'var(--danger)'; box.append(l);
+  });
+  if(!dry) box.append(el('div','sub', 'master rewritten — deploy in step 2 to publish it'));
+}
+
+function lpCheckNodes(){
+  const t = lpTargetNodes();
+  if(!t.length){ toast('no reachable target nodes', true); return; }
+  return lpRun('lp-check', 'Checking…', async () => {
+    const r = await api('/api/landing/nodes', {method:'POST',
+      body: JSON.stringify({node_ids: t.map(n => n.uid)})});
+    if(r.status) lpStatus = r.status;
+    lpRenderNodes(r.results);
+  });
+}
+
+function lpRenderNodes(results){
+  const box = document.getElementById('lp-nodes');
+  box.innerHTML = '';
+  const want = (lpStatus || {}).serve_version;
+  results.forEach(r => {
+    const res = r.result || {};
+    const row = el('div','f2b-node');
+    row.append(el('span','nm', r.name || r.node_id));
+    if(!r.ok) row.append(el('span','pill bad','error'));
+    else if(!res.dir_exists) row.append(el('span','pill warn','no webroot'));
+    else if(!res.file_exists) row.append(el('span','pill warn','no page'));
+    else if(want && res.version === want) row.append(el('span','pill ok','current'));
+    else if(res.version) row.append(el('span','pill info','older'));
+    else row.append(el('span','pill warn','unmanaged'));
+    if(res.version) row.append(el('span','mono', res.version));
+    if(res.count != null) row.append(el('span','sub', res.count + ' listed'));
+    if((res.backups||[]).length) row.append(el('span','sub', res.backups.length + ' backup(s)'));
+    if(res.error || res.note) row.append(el('span','sub', res.error || res.note));
+    box.append(row);
+  });
+}
+
+function lpDeploy(){
+  const t = lpTargetNodes();
+  if(!t.length){ toast('no reachable target nodes', true); return; }
+  const s = lpStatus || {};
+  if(!confirm('Publish page ' + (s.serve_version || '?') + ' to ' + t.length +
+              ' node(s)? This replaces the public index.html each one serves.')) return;
+  return lpRun('lp-deploy', 'Deploying…', async () => {
+    const r = await api('/api/landing/deploy', {method:'POST', body: JSON.stringify({
+      node_ids: t.map(n => n.uid),
+      create_missing: document.getElementById('lp-create').checked,
+      force: document.getElementById('lp-force').checked})});
+    showResults('Landing page · deploy ' + r.version, r.results);
+    const ok = r.results.filter(x => x.ok).length;
+    toast('Deployed to ' + ok + '/' + r.results.length + ' node(s)', ok < r.results.length);
+    await lpCheckNodes();
+  });
+}
+
+function lpRevert(){
+  const t = lpTargetNodes();
+  if(!t.length){ toast('no reachable target nodes', true); return; }
+  const raw = prompt('Revert to which version? Leave blank for the newest backup on each node.');
+  if(raw === null) return;   // cancelled — blank means "newest", so they differ
+  const v = raw.trim();
+  if(!confirm('Restore the previous page on ' + t.length + ' node(s)?')) return;
+  return lpRun('lp-revert', 'Reverting…', async () => {
+    const r = await api('/api/landing/revert', {method:'POST', body: JSON.stringify({
+      node_ids: t.map(n => n.uid), version: v || null})});
+    showResults('Landing page · revert', r.results);
+    const ok = r.results.filter(x => x.ok).length;
+    toast('Reverted ' + ok + '/' + r.results.length + ' node(s)', ok < r.results.length);
+    await lpCheckNodes();
+  });
+}
+
 // ===== SSH key access =====================================================
 let sshTargets = [];
 
@@ -3438,7 +3791,14 @@ function buildResultCards(container, results){
     if(res.added != null) card.append(el('div','sub',
       'keys: +' + res.added + ' added, ' + res.already_present + ' already present' +
       (res.user ? ' (user ' + res.user + ')' : '')));
-    if(res.verified !== undefined && !res.password_auth)
+    if(res.kind === 'landing'){
+      if(res.skipped) card.append(el('div','sub', 'skipped: ' + lpSkipText(res.reason)));
+      if(res.version) card.append(el('div','sub', 'now serving version ' + res.version +
+        (res.previous_version ? ' (was ' + res.previous_version + ')' : '') +
+        (res.verified ? ' · verified on disk' : '')));
+      if(res.path) card.append(el('div','sub', res.path));
+    }
+    if(res.verified !== undefined && !res.password_auth && res.kind !== 'landing')
       card.append(el('div','sub', res.verified ? 'key login verified' : 'key login NOT verified'));
     if(res.detail && res.verified !== undefined){ const e = el('div','sub', res.detail); if(!res.verified) e.style.color = 'var(--danger)'; card.append(e); }
     if(res.password_auth) card.append(el('div','sub', 'password auth now: ' + res.password_auth +
@@ -3798,7 +4158,8 @@ document.getElementById('f2b-overlay').addEventListener('click', e => { if(e.tar
 document.getElementById('ssh-overlay').addEventListener('click', e => { if(e.target.id === 'ssh-overlay') closeSsh(); });
 document.getElementById('w-overlay').addEventListener('click', e => { if(e.target.id === 'w-overlay') closeWallets(); });
 document.getElementById('wm-overlay').addEventListener('click', e => { if(e.target.id === 'wm-overlay') closeWalletManage(); });
-document.addEventListener('keydown', e => { if(e.key === 'Escape'){ closeModal(); closeToggle(); closeSF(); closeAU(); closeUp(); closeRes(); closeTput(); closeF2b(); closeSsh(); closeWallets(); closeWalletManage(); } });
+document.getElementById('lp-overlay').addEventListener('click', e => { if(e.target.id === 'lp-overlay') closeLanding(); });
+document.addEventListener('keydown', e => { if(e.key === 'Escape'){ closeModal(); closeToggle(); closeSF(); closeAU(); closeUp(); closeRes(); closeTput(); closeF2b(); closeSsh(); closeWallets(); closeWalletManage(); closeLanding(); } });
 
 health();
 load();
