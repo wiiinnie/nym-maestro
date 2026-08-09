@@ -30,6 +30,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, field_validator
 
 from store import Conflict, Store
+import landing
 import wallet
 
 # Python 3.14+ deprecated asyncio.iscoroutinefunction, but some stdlib asyncio
@@ -50,6 +51,13 @@ INDEX_HTML = INDEX_PATH.read_bytes()   # fallback if the file can't be read at r
 BACKUPS = Path(os.environ.get("MAESTRO_BACKUPS") or (BASE / "backups"))
 SSH_DIR = Path(os.environ.get("MAESTRO_SSH_DIR") or (Path.home() / ".nym-maestro" / "ssh"))
 SSH_USER = os.environ.get("MAESTRO_SSH_USER", "")
+# The public notice page each gateway serves. The master here is the single
+# source of truth; the copy under serve/ is what gets pushed to the nodes.
+LANDING_DIR = Path(os.environ.get("MAESTRO_LANDING_DIR")
+                   or (Path.home() / ".nym-maestro" / "landing"))
+LANDING_MASTER = LANDING_DIR / "master.html"
+LANDING_SERVE = LANDING_DIR / "serve" / "index.html"
+LANDING_MAX_BYTES = 4 << 20   # keep in step with the agent's own cap
 
 _COUNTRY_NAME_TO_ISO2 = {
     "austria": "AT", "belgium": "BE", "bulgaria": "BG", "switzerland": "CH",
@@ -1043,6 +1051,47 @@ class WalletDeleteRequest(BaseModel):
     confirm: bool = False
 
 
+class LandingRebuildRequest(BaseModel):
+    include_disabled: bool = False
+    allow_partial: bool = False
+    dry_run: bool = False
+
+
+class LandingMasterRequest(BaseModel):
+    html: str
+
+    @field_validator("html")
+    @classmethod
+    def _check_html(cls, v):
+        # bytes, not characters — the agent's cap is on the encoded size, and a
+        # page of multi-byte text would otherwise pass here and be refused by
+        # all 23 agents at deploy time
+        if len(v.encode("utf-8")) > LANDING_MAX_BYTES:
+            raise ValueError("page is too large")
+        if "</html>" not in v.lower():
+            raise ValueError("that does not look like a complete HTML page")
+        return v
+
+
+class LandingSeedRequest(BaseModel):
+    uid: str
+
+
+class LandingNodesRequest(BaseModel):
+    node_ids: list[str]
+
+
+class LandingDeployRequest(BaseModel):
+    node_ids: list[str]
+    create_missing: bool = False
+    force: bool = False
+
+
+class LandingRevertRequest(BaseModel):
+    node_ids: list[str]
+    version: str | None = None
+
+
 def local_agent_source():
     data = (BASE / "agent" / "agent.py").read_bytes()
     text = data.decode("utf-8")
@@ -1534,6 +1583,275 @@ async def extra_blocks_restart_service(payload: ExtraBlocksRequest, request: Req
                                 120, "extra_blocks_restart_service")
     await repoll_nodes(request.app, nodes)
     return {"results": results}
+
+
+# ------------------------------------------------------------------ landing page
+# Two deliberately separate steps. Rebuild regenerates the master locally and
+# changes nothing public; Deploy pushes the reviewed file to the nodes. Keeping
+# them apart means a failed deploy can be retried without regenerating, and a
+# rebuild can be inspected before anything is published.
+def landing_master_html():
+    """The master page, or None until one has been seeded."""
+    try:
+        return LANDING_MASTER.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+
+def local_landing_source():
+    """Read the rendered page that gets pushed to the nodes over mTLS, the way
+    local_installer_source() does for the extra-blocks script.
+    Returns (text, sha256, version)."""
+    data = LANDING_SERVE.read_bytes()
+    text = data.decode("utf-8")
+    return text, hashlib.sha256(data).hexdigest(), landing.extract_version(text)
+
+
+def _landing_summary():
+    """What the modal needs to describe the current state of the master."""
+    html = landing_master_html()
+    if html is None:
+        return {"has_master": False, "has_serve_copy": False,
+                "note": "No master page yet. Seed one from a node, or paste the "
+                        "current index.html."}
+    man = landing.extract_manifest(html) or {}
+    try:
+        mtime = int(LANDING_MASTER.stat().st_mtime)
+    except OSError:
+        mtime = None
+    out = {
+        "has_master": True,
+        "master_bytes": len(html.encode("utf-8")),
+        "master_mtime": mtime,
+        "version": landing.extract_version(html),
+        "generated": man.get("generated"),
+        "count": man.get("count"),
+        "has_markers": landing.START in html and landing.END in html,
+        "has_serve_copy": LANDING_SERVE.exists(),
+    }
+    if out["has_serve_copy"]:
+        try:
+            _, sha, ver = local_landing_source()
+            out["serve_sha256"] = sha
+            out["serve_version"] = ver
+        except Exception as e:
+            out["has_serve_copy"] = False
+            out["note"] = f"deploy copy unreadable: {e}"
+    return out
+
+
+@app.get("/api/landing/status")
+def landing_status(request: Request):
+    return _landing_summary()
+
+
+@app.get("/api/landing/preview", response_class=HTMLResponse)
+def landing_preview(request: Request):
+    """The master page itself, for previewing before a deploy.
+
+    Served sandboxed. The master is not our own markup — it is seeded from a
+    node over the network or pasted in — and this origin holds the dashboard's
+    session cookie, so without the sandbox any script in the previewed page
+    could drive the maestro API. `sandbox allow-scripts` (deliberately without
+    allow-same-origin) puts it in an opaque origin, so the page's own view
+    toggle still works but it can reach nothing of ours.
+    """
+    html = landing_master_html()
+    if html is None:
+        raise HTTPException(404, "no master page yet")
+    return HTMLResponse(html, headers={
+        "Content-Security-Policy": "sandbox allow-scripts",
+        "X-Content-Type-Options": "nosniff",
+    })
+
+
+@app.post("/api/landing/master")
+def landing_set_master(payload: LandingMasterRequest, request: Request):
+    """Seed or replace the master from pasted HTML."""
+    landing.atomic_write(LANDING_MASTER, payload.html)
+    request.app.state.store.audit(
+        "ui", "landing_master", None, None,
+        json.dumps({"source": "paste", "bytes": len(payload.html.encode("utf-8"))}))
+    return _landing_summary()
+
+
+@app.post("/api/landing/master/fetch")
+async def landing_fetch_master(payload: LandingSeedRequest, request: Request):
+    """Seed the master from what a node currently serves.
+
+    This is the one-time conversion path: the live page still carries the old
+    hand-written node section, and the first rebuild replaces it with the markers.
+    """
+    node = _require_node(request, payload.uid)
+    host = (node.get("hostname") or "").strip()
+    if not host:
+        raise HTTPException(400, "that node has no hostname to fetch from")
+    url = f"https://{host}/"
+    try:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            r = await client.get(url, headers={"Accept": "text/html"})
+            r.raise_for_status()
+            html = r.text
+    except Exception as e:
+        raise HTTPException(502, f"could not fetch {url}: {e}")
+    if "</html>" not in html.lower():
+        raise HTTPException(502, f"{url} did not return a complete HTML page")
+    landing.atomic_write(LANDING_MASTER, html)
+    request.app.state.store.audit(
+        "ui", "landing_master", None, node["uid"],
+        json.dumps({"source": url, "bytes": len(html.encode("utf-8"))}))
+    return dict(_landing_summary(), source=url)
+
+
+@app.post("/api/landing/rebuild")
+async def landing_rebuild(payload: LandingRebuildRequest, request: Request):
+    """Regenerate the node block inside the master. Publishes nothing.
+
+    Returns {"ok": false, ...} rather than an HTTP error for the states an
+    operator can act on (no master yet, a node with a broken IP/hostname), so the
+    modal can list the offending nodes instead of showing a bare error string.
+    """
+    master = landing_master_html()
+    if master is None:
+        return {"ok": False, "error": "No master page yet — seed one first.",
+                "details": [], "status": _landing_summary()}
+
+    nodes = await list_nodes(request)
+    try:
+        res = landing.build(nodes, master,
+                            include_disabled=payload.include_disabled,
+                            allow_partial=payload.allow_partial)
+    except landing.LandingError as e:
+        return {"ok": False, "error": e.message, "details": e.details,
+                "status": _landing_summary()}
+
+    out = {
+        "ok": True,
+        "dry_run": payload.dry_run,
+        "version": res["version"],
+        "generated": res["generated"],
+        "counts": res["counts"],
+        "diff": res["diff"],
+        "splice_mode": res["splice_mode"],
+        "warnings": res["warnings"],
+        "excluded": res["excluded"],
+        "ips": [r["ip"] for r in res["records"]],
+    }
+    if payload.dry_run:
+        out["status"] = _landing_summary()
+        return out
+
+    # Persist the master and the copy the deploy step ships. Nothing public has
+    # changed yet — the nodes still serve the previous page until Deploy runs.
+    landing.atomic_write(LANDING_MASTER, res["html"])
+    landing.atomic_write(LANDING_SERVE, res["html"])
+    sha = hashlib.sha256(res["html"].encode("utf-8")).hexdigest()
+    landing.atomic_write(str(LANDING_SERVE) + ".sha256", sha + "  index.html\n")
+    request.app.state.store.audit(
+        "ui", "landing_rebuild", None, None,
+        json.dumps({"version": res["version"], "sha256": sha,
+                    "counts": res["counts"], "diff": res["diff"],
+                    "splice_mode": res["splice_mode"]}))
+    out["sha256"] = sha
+    out["status"] = _landing_summary()
+    return out
+
+
+async def _landing_fanout(app_, store, nodes, action, params, timeout, label):
+    """Like _f2b_fanout, but each node gets its own hostname in params — the page
+    path is /var/www/<that node's hostname>/index.html."""
+    async def one(node):
+        p = dict(params or {})
+        p["hostname"] = (node.get("hostname") or "").strip()
+        try:
+            res = await agent_exec(app_, node, action, p, timeout=timeout)
+            ok = bool(res.get("ok", True))
+        except Exception as e:
+            # agent_exec raises for status, and httpx's message drops the body —
+            # so dig the agent's own error out of the response before reporting it
+            msg = str(e)
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                try:
+                    msg = ((resp.json() or {}).get("error") or "").strip() or msg
+                except Exception:
+                    pass
+            if "unknown action" in msg:
+                msg = ("this node's agent is too old for the landing-page actions — "
+                       "push the current agent to it first with Update agent")
+            res, ok = {"ok": False, "error": msg}, False
+        # tag the shape so the shared result renderer doesn't mistake fields like
+        # "verified" for the SSH action's meaning of the same name
+        if isinstance(res, dict):
+            res.setdefault("kind", "landing")
+        store.audit("ui", label, None, node["uid"], json.dumps(res))
+        return {"uid": node["uid"], "node_id": node["node_id"], "name": node["name"],
+                "ok": ok, "result": res}
+    return await asyncio.gather(*[one(n) for n in nodes])
+
+
+@app.post("/api/landing/nodes")
+async def landing_node_status(payload: LandingNodesRequest, request: Request):
+    """What each selected node currently serves."""
+    store, nodes = _eb_targets(request, payload.node_ids)
+    results = await _landing_fanout(request.app, store, nodes, "landing_status", None,
+                                    25, "landing_status")
+    return {"results": results, "status": _landing_summary()}
+
+
+@app.post("/api/landing/deploy")
+async def landing_deploy(payload: LandingDeployRequest, request: Request):
+    """Push the rebuilt page to the selected nodes over the mTLS agent channel.
+
+    Every node gets the identical file; only the target path differs. The agent
+    verifies the sha256 before it touches anything, backs up the page it is
+    replacing, and swaps atomically.
+    """
+    store, nodes = _eb_targets(request, payload.node_ids)
+    try:
+        content, sha, version = local_landing_source()
+    except Exception:
+        raise HTTPException(400, "no rebuilt page to deploy — run Rebuild first")
+    if not version:
+        raise HTTPException(400, "the rebuilt page has no version marker — rebuild it")
+
+    params = {"content": content, "sha256": sha,
+              "create_missing": payload.create_missing, "force": payload.force}
+    job_id = uuid.uuid4().hex
+    store.record_job(job_id, "landing_deploy",
+                     json.dumps({"nodes": len(nodes), "version": version, "sha256": sha}),
+                     len(nodes))
+    results = await _landing_fanout(request.app, store, nodes, "landing_deploy", params,
+                                    120, "landing_deploy")
+    for r in results:
+        store.record_target(job_id, r["uid"], "done" if r["ok"] else "failed", None,
+                            json.dumps(r["result"]))
+    ok_count = sum(1 for r in results if r["ok"])
+    status = "done" if ok_count == len(results) else ("failed" if ok_count == 0 else "partial")
+    store.finish_job(job_id, status)
+    return {"job_id": job_id, "status": status, "version": version, "sha256": sha,
+            "results": results}
+
+
+@app.post("/api/landing/revert")
+async def landing_revert(payload: LandingRevertRequest, request: Request):
+    """Put the previously served page back on the selected nodes, from the backup
+    the agent kept. Per-node, so one bad page doesn't need a fleet-wide rollback."""
+    store, nodes = _eb_targets(request, payload.node_ids)
+    params = {"version": (payload.version or "").strip().lower() or None}
+    job_id = uuid.uuid4().hex
+    store.record_job(job_id, "landing_revert",
+                     json.dumps({"nodes": len(nodes), "version": params["version"]}),
+                     len(nodes))
+    results = await _landing_fanout(request.app, store, nodes, "landing_revert", params,
+                                    60, "landing_revert")
+    for r in results:
+        store.record_target(job_id, r["uid"], "done" if r["ok"] else "failed", None,
+                            json.dumps(r["result"]))
+    ok_count = sum(1 for r in results if r["ok"])
+    status = "done" if ok_count == len(results) else ("failed" if ok_count == 0 else "partial")
+    store.finish_job(job_id, status)
+    return {"job_id": job_id, "status": status, "results": results}
 
 
 @app.get("/api/wallet/list")

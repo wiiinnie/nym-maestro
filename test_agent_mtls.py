@@ -58,10 +58,15 @@ check("enroll builds a bundle with certs + agent",
 check("enroll returns a fingerprint", len(fp) == 64)
 
 # 3. start the real agent against that bundle
+WEBROOT = TMP / "www"
+LANDING_HOST = "nym-exit-at01.hermes-stakepool.de"
+(WEBROOT / LANDING_HOST).mkdir(parents=True)
+
 agent_env = dict(os.environ,
                  MAESTRO_AGENT_HOST="127.0.0.1",
                  MAESTRO_AGENT_PORT=str(PORT),
                  MAESTRO_AGENT_CERTDIR=str(bundle),
+                 MAESTRO_WEBROOT=str(WEBROOT),
                  MAESTRO_NYM_PORT="59999",
                  MAESTRO_NYM_SERVICE="nonexistent.service")
 proc = subprocess.Popen([sys.executable, str(bundle / "agent.py")],
@@ -201,6 +206,61 @@ try:
         body = r.json()
         check("fail2ban_status routes + reports installed flag",
               r.status_code == 200 and body.get("ok") is True and body.get("installed") is False)
+
+    # landing page: the generated file has to survive JSON transport byte-for-byte,
+    # emoji flags and all, or the sha256 the agent checks won't match
+    import hashlib as _hl
+    sys.path.insert(0, str(ROOT))
+    import landing as _lp
+    _fleet = [{"name": "AT01", "ip": "152.53.92.255", "cc": "AT", "enabled": True,
+               "hostname": LANDING_HOST, "status": {"mode": "exit-gateway", "exit": True}},
+              {"name": "DE01", "ip": "10.0.0.9", "cc": "DE", "enabled": True,
+               "hostname": "nym-exit-de01.hermes-stakepool.de",
+               "status": {"mode": "exit-gateway", "exit": True}}]
+    _built = _lp.build(_fleet, "<html><body><p>T&amp;C</p></body></html>",
+                       generated="2026-08-09T12:00:00+00:00")
+    _page, _ver = _built["html"], _built["version"]
+    _sha = _hl.sha256(_page.encode("utf-8")).hexdigest()
+    _target = WEBROOT / LANDING_HOST / "index.html"
+
+    with httpx.Client(verify=cctx, timeout=20) as c:
+        def _lpx(action, params):
+            r = c.post(f"https://127.0.0.1:{PORT}/v1/exec",
+                       json={"action": action, "params": params})
+            return r.json()
+
+        body = _lpx("landing_deploy", {"hostname": LANDING_HOST, "content": _page,
+                                       "sha256": _sha})
+        check("landing_deploy refuses an unprovisioned node over mTLS",
+              body.get("ok") is False and body.get("reason") == "no-index")
+
+        body = _lpx("landing_deploy", {"hostname": LANDING_HOST, "content": _page,
+                                       "sha256": _sha, "create_missing": True})
+        check("landing_deploy installs and verifies the page over mTLS",
+              body.get("ok") is True and body.get("version") == _ver)
+        check("the page on the node is byte-identical to what was rendered",
+              _target.read_text(encoding="utf-8") == _page)
+        check("emoji flags survive JSON transport intact",
+              _target.read_text(encoding="utf-8").count("\U0001F1E6") == _page.count("\U0001F1E6"))
+
+        body = _lpx("landing_status", {"hostname": LANDING_HOST})
+        check("landing_status reports the served version",
+              body.get("version") == _ver and body.get("file_exists") is True)
+
+        body = _lpx("landing_deploy", {"hostname": LANDING_HOST, "content": _page,
+                                      "sha256": _sha})
+        check("landing_deploy is idempotent over mTLS", body.get("reason") == "already-current")
+
+        body = _lpx("landing_deploy", {"hostname": LANDING_HOST, "content": _page,
+                                      "sha256": "0" * 64, "create_missing": True})
+        check("a corrupted transfer is refused before the file is touched",
+              body.get("ok") is False and "sha256 mismatch" in body.get("error", "")
+              and _target.read_text(encoding="utf-8") == _page)
+
+        body = _lpx("landing_deploy", {"hostname": "../../../etc", "content": _page,
+                                      "sha256": _sha, "create_missing": True})
+        check("landing_deploy refuses a traversal hostname over mTLS",
+              body.get("ok") is False and "hostname" in body.get("error", ""))
 finally:
     proc.terminate()
     try:

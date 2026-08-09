@@ -40,7 +40,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-AGENT_VERSION = "0.10.3"
+AGENT_VERSION = "0.11.0"
 
 try:
     with open(os.path.abspath(__file__), "rb") as _sf:
@@ -2490,6 +2490,337 @@ def act_extra_blocks_restart_service(params):
     }
 
 
+# ---------------------------------------------------------------- landing page
+# The node serves a public notice page at /var/www/<hostname>/index.html listing
+# every exit gateway the operator runs. Maestro renders that page centrally and
+# ships the finished file here; the agent only validates and installs it.
+WEBROOT = os.environ.get("MAESTRO_WEBROOT", "/var/www")
+LANDING_MAX_BYTES = 4 << 20   # the real page is ~35 KB; this is a generous cap
+
+_LANDING_HOST_RE = re.compile(
+    r'^(?=.{1,253}$)([a-zA-Z0-9](-?[a-zA-Z0-9])*\.)+[a-zA-Z]{2,}$')
+_LANDING_VERSION_RE = re.compile(
+    r'<!-- NODES:VERSION ([0-9a-f]{6,64}) GENERATED (\S+) COUNT (\d+) -->')
+_LANDING_BAK_RE = re.compile(r'^index\.html\.bak-([0-9a-z]{6,64})$')
+
+
+def _landing_path(params):
+    """Resolve /var/www/<hostname>/index.html, returning (dir, file, error).
+
+    The hostname comes from the orchestrator and is the node's own FQDN — the
+    same value the page lists for it. It is matched against a strict FQDN
+    pattern and rejected if it is anything other than one path component, so a
+    bad or hostile value cannot walk out of the webroot.
+    """
+    host = (params.get("hostname") or "").strip().lower()
+    if not host or not _LANDING_HOST_RE.match(host) or os.path.basename(host) != host:
+        return None, None, "invalid or missing hostname"
+    d = os.path.join(WEBROOT, host)
+    return d, os.path.join(d, "index.html"), None
+
+
+def _landing_file_info(path):
+    """Describe a page on disk, or None if it can't be read."""
+    try:
+        st = os.stat(path)
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read(LANDING_MAX_BYTES + 1)
+    except Exception:
+        return None
+    m = _LANDING_VERSION_RE.search(text)
+    info = {"size": st.st_size, "mtime": int(st.st_mtime), "version": None,
+            "generated": None, "count": None}
+    with contextlib.suppress(Exception):
+        info["sha256"] = _sha256_file(path)
+    if m:
+        info["version"], info["generated"] = m.group(1), m.group(2)
+        info["count"] = int(m.group(3))
+    return info
+
+
+def _landing_backups(d):
+    """Previously installed pages, newest first."""
+    out = []
+    try:
+        names = os.listdir(d)
+    except Exception:
+        return out
+    for n in names:
+        m = _LANDING_BAK_RE.match(n)
+        if not m:
+            continue
+        try:
+            st = os.stat(os.path.join(d, n))
+        except Exception:
+            continue
+        out.append({"name": n, "version": m.group(1),
+                    "size": st.st_size, "mtime": int(st.st_mtime)})
+    out.sort(key=lambda b: b["mtime"], reverse=True)
+    return out
+
+
+def _landing_restore_context(path):
+    """Re-label after the rename. A temp file created in the webroot does not
+    inherit the target's SELinux context, and the web server would then get
+    EACCES on a file that looks fine to ls. No-op where restorecon is absent,
+    which is the normal case on Debian/Ubuntu."""
+    if shutil.which("restorecon"):
+        _run(["restorecon", "-F", path], timeout=20)
+
+
+def _landing_copy_nofollow(src, dst):
+    """Copy src to dst without ever writing through a symlink at dst.
+
+    shutil.copy2 opens the destination with 'wb', which follows a link — so a
+    symlink planted at the backup path by anything with write access to the
+    webroot would redirect a root-owned write anywhere on the box. O_NOFOLLOW
+    makes that fail instead.
+    """
+    with open(src, "rb") as fsrc:
+        data = fsrc.read()
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(dst, flags, 0o644)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    with contextlib.suppress(Exception):
+        shutil.copystat(src, dst)
+
+
+def _landing_write(path, text):
+    """Install text at path with no window where the page is missing or partly
+    written: temp file in the same directory, fsync, then rename over the top.
+    Mode and owner are carried over from the file being replaced so the page
+    stays web-readable."""
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".index.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.exists(path):
+            st = os.stat(path)
+            os.chmod(tmp, st.st_mode)
+            with contextlib.suppress(Exception):
+                os.chown(tmp, st.st_uid, st.st_gid)
+        else:
+            os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if tmp:
+            with contextlib.suppress(Exception):
+                os.unlink(tmp)
+    _landing_restore_context(path)
+
+
+def act_landing_status(params):
+    """Report what this node currently serves, without changing anything."""
+    d, path, err = _landing_path(params)
+    if err:
+        return {"ok": False, "error": err}
+    if not os.path.isdir(d):
+        return {"ok": True, "path": path, "dir_exists": False, "file_exists": False,
+                "backups": [], "note": f"{d} does not exist"}
+    info = _landing_file_info(path) if os.path.exists(path) else None
+    res = {"ok": True, "path": path, "dir_exists": True, "file_exists": info is not None,
+           "backups": _landing_backups(d)}
+    if info:
+        res.update(info)
+    else:
+        res["note"] = "webroot exists but index.html is missing"
+    return res
+
+
+def act_landing_deploy(params):
+    """Install the public notice page that maestro rendered.
+
+    The content and its sha256 arrive over the mTLS channel; the hash is checked
+    before anything on disk is touched, and the page must carry a NODES:VERSION
+    marker so an unrelated file can't be installed through this action. The page
+    being replaced is kept as index.html.bak-<version> so one node can be rolled
+    back without touching the rest of the fleet.
+    """
+    d, path, err = _landing_path(params)
+    if err:
+        return {"ok": False, "error": err}
+
+    content = params.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return {"ok": False, "error": "no page content provided"}
+    raw = content.encode()
+    if len(raw) > LANDING_MAX_BYTES:
+        return {"ok": False,
+                "error": f"page too large ({len(raw)} bytes, max {LANDING_MAX_BYTES})"}
+    actual = hashlib.sha256(raw).hexdigest()
+    want = (params.get("sha256") or "").strip().lower()
+    if not want or want != actual:
+        return {"ok": False, "error": "sha256 mismatch (transfer corrupted or hash missing)"}
+    m = _LANDING_VERSION_RE.search(content)
+    if not m:
+        return {"ok": False,
+                "error": "page carries no NODES:VERSION marker — not a maestro-generated page"}
+    version = m.group(1)
+
+    log = [f"received page over mTLS ({len(raw)} bytes, sha256 {actual[:12]}, "
+           f"version {version})"]
+
+    # Pre-flight: never create a webroot. A missing one means this is not a web
+    # node, or the vhost lives somewhere else — both need a human, not a mkdir.
+    if not os.path.isdir(d):
+        return {"ok": False, "skipped": True, "reason": "no-webroot", "path": path,
+                "error": f"{d} does not exist — not a web node, or a different webroot",
+                "output": "\n".join(log)}
+
+    # A symlink here is never something we should work through: the backup step
+    # would copy whatever it resolves to into the web-served directory, which is
+    # how an odd vhost layout turns into an information leak. Report it instead.
+    if os.path.islink(path):
+        return {"ok": False, "skipped": True, "reason": "symlink", "path": path,
+                "error": f"{path} is a symlink to "
+                         f"{os.path.realpath(path)} — refusing to touch it; "
+                         f"fix the vhost layout first",
+                "output": "\n".join(log)}
+
+    before = _landing_file_info(path) if os.path.exists(path) else None
+    if before is None and not params.get("create_missing"):
+        return {"ok": False, "skipped": True, "reason": "no-index", "path": path,
+                "error": f"{path} does not exist — unprovisioned node; re-run with "
+                         f"'create missing pages' to place it",
+                "output": "\n".join(log)}
+
+    # Compare the whole file, not just the version marker. The marker is derived
+    # from the node list alone, so an edit to the surrounding page (the legal
+    # T&C, say) leaves it unchanged — keying the skip on it would silently drop
+    # exactly the kind of change that most needs to reach the fleet.
+    if before and before.get("sha256") == actual and not params.get("force"):
+        log.append("already serving this exact file; nothing to do")
+        return {"ok": True, "skipped": True, "reason": "already-current", "path": path,
+                "version": version, "sha256": actual, "verified": True,
+                "output": "\n".join(log)}
+
+    backup = None
+    if before:
+        backup = path + ".bak-" + (before.get("version") or "unversioned")
+        if os.path.islink(backup):
+            return {"ok": False, "skipped": True, "reason": "symlink", "path": path,
+                    "error": f"{backup} is a symlink — refusing to write through it",
+                    "output": "\n".join(log)}
+        try:
+            _landing_copy_nofollow(path, backup)
+            log.append("backed up current page -> " + os.path.basename(backup))
+        except Exception as e:
+            return {"ok": False, "error": f"backup failed, refusing to overwrite: {e}",
+                    "path": path, "output": "\n".join(log)}
+
+    try:
+        _landing_write(path, content)
+    except Exception as e:
+        return {"ok": False, "error": f"write failed: {e}", "path": path,
+                "backup": backup, "output": "\n".join(log)}
+
+    after = _landing_file_info(path) or {}
+    verified = after.get("sha256") == actual and after.get("version") == version
+    log.append(("wrote " if before else "created ") + path +
+               (" · verified on disk" if verified else " · VERIFICATION FAILED"))
+    return {
+        "ok": verified,
+        "path": path,
+        "version": version,
+        "sha256": actual,
+        "backup": backup,
+        "verified": verified,
+        "created": before is None,
+        "previous_version": (before or {}).get("version"),
+        "output": "\n".join(log),
+        "error": None if verified else "page written but post-write verification failed",
+    }
+
+
+def act_landing_revert(params):
+    """Put a previously installed page back. Newest backup unless a version is
+    named. The page being replaced is itself backed up first, so a revert can be
+    undone."""
+    d, path, err = _landing_path(params)
+    if err:
+        return {"ok": False, "error": err}
+    if not os.path.isdir(d):
+        return {"ok": False, "skipped": True, "reason": "no-webroot", "path": path,
+                "error": f"{d} does not exist"}
+
+    if os.path.islink(path):
+        return {"ok": False, "skipped": True, "reason": "symlink", "path": path,
+                "error": f"{path} is a symlink — refusing to touch it"}
+
+    backups = _landing_backups(d)
+    if not backups:
+        return {"ok": False, "skipped": True, "reason": "no-backup", "path": path,
+                "error": "no index.html.bak-<version> to revert to"}
+    want = (params.get("version") or "").strip().lower()
+    pick = next((b for b in backups if b["version"] == want), None) if want else backups[0]
+    if pick is None:
+        return {"ok": False, "error": f"no backup for version {want}", "path": path,
+                "backups": backups}
+
+    src = os.path.join(d, pick["name"])
+    # A backup that is a symlink is not a backup we wrote. Following it would
+    # publish whatever it points at to the public page, so refuse outright.
+    if os.path.islink(src):
+        return {"ok": False, "skipped": True, "reason": "symlink", "path": path,
+                "error": f"{pick['name']} is a symlink, not a page we wrote — "
+                         f"refusing to publish what it points at"}
+    try:
+        with open(src, "r", encoding="utf-8") as f:
+            text = f.read(LANDING_MAX_BYTES + 1)
+    except Exception as e:
+        return {"ok": False, "error": f"cannot read {pick['name']}: {e}", "path": path}
+    if len(text.encode()) > LANDING_MAX_BYTES:
+        return {"ok": False, "error": f"{pick['name']} is too large to restore", "path": path}
+    # "unversioned" is the page that predates maestro and legitimately has no
+    # marker; anything claiming a version must actually carry it.
+    found = _LANDING_VERSION_RE.search(text)
+    if pick["version"] == "unversioned":
+        if found:
+            return {"ok": False, "path": path,
+                    "error": f"{pick['name']} claims to predate maestro but carries a "
+                             f"version marker — refusing to restore it"}
+    elif not found or found.group(1) != pick["version"]:
+        return {"ok": False, "path": path,
+                "error": f"{pick['name']} does not carry version {pick['version']} — "
+                         f"refusing to restore it"}
+
+    log = [f"reverting to {pick['name']}"]
+    current = _landing_file_info(path) if os.path.exists(path) else None
+    if current:
+        keep = path + ".bak-" + (current.get("version") or "unversioned")
+        with contextlib.suppress(Exception):
+            if os.path.abspath(keep) != os.path.abspath(src) and not os.path.islink(keep):
+                _landing_copy_nofollow(path, keep)
+                log.append("kept the replaced page -> " + os.path.basename(keep))
+
+    try:
+        _landing_write(path, text)
+    except Exception as e:
+        return {"ok": False, "error": f"write failed: {e}", "path": path,
+                "output": "\n".join(log)}
+
+    after = _landing_file_info(path) or {}
+    # The pre-maestro page has no marker, so "restored correctly" means None
+    # there — comparing against the literal "unversioned" would report every
+    # rollback to the original page as a failure.
+    want_marker = None if pick["version"] == "unversioned" else pick["version"]
+    ok = after.get("version") == want_marker
+    log.append("restored " + path + (" · verified on disk" if ok else " · VERIFICATION FAILED"))
+    return {"ok": ok, "path": path, "version": after.get("version"),
+            "restored": pick["version"], "sha256": after.get("sha256"),
+            "reverted_from": (current or {}).get("version"),
+            "verified": ok, "output": "\n".join(log),
+            "error": None if ok else "restored page does not carry the expected version"}
+
+
 EXEC_ACTIONS = {
     "restart": act_restart,
     "toggle": act_toggle,
@@ -2512,6 +2843,9 @@ EXEC_ACTIONS = {
     "extra_blocks_upgrade": act_extra_blocks_upgrade,
     "extra_blocks_verify": act_extra_blocks_verify,
     "extra_blocks_remove": act_extra_blocks_remove,
+    "landing_status": act_landing_status,
+    "landing_deploy": act_landing_deploy,
+    "landing_revert": act_landing_revert,
     "peers": act_peers,
 }
 
