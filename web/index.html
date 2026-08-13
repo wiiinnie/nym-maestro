@@ -238,6 +238,7 @@
                      gap:8px;flex-wrap:wrap;justify-content:flex-end}
   .w-selall .w-total b{font-weight:600;color:var(--text)}
   .w-selall .w-total .w-fiat{font-variant-numeric:tabular-nums}
+  .w-selall .w-total .w-split{color:var(--faint);font-size:12px}
   .wgrid{display:grid;grid-template-columns:20px 56px minmax(150px,max-content) max-content max-content;
          align-items:center;column-gap:12px;font-size:13px}
   .wgrid .wc{padding:8px 0;border-bottom:1px solid var(--line);min-height:20px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
@@ -3913,30 +3914,38 @@ function renderWalletList(){
   wUpdateTotal();
 }
 
-// Combined balance of the currently selected wallets, shown next to "select all".
+// Combined holdings of the currently selected wallets, shown next to "select all".
+// Total is balance + pending rewards: the rewards dwarf the on-wallet balances, so
+// a balance-only figure reads as wrong. The split stays visible next to it.
 // Summed from the NYM figures and converted once with the rate the query carried
 // (price_usd/price_eur, spot at query time) — adding up the per-row fiat amounts
-// would accumulate their rounding. Wallets that weren't queried, or whose balance
-// lookup failed, are left out of the sum and reported as a count instead.
+// would accumulate their rounding. A wallet counts once it contributed either
+// figure; anything unqueried or errored is left out and reported as a count.
 function wUpdateTotal(){
   const box = document.getElementById('w-total');
   if(!box) return;
   box.innerHTML = '';
   const sel = wSelectedNames();
-  let nym = 0, counted = 0, usd = null, eur = null;
+  let bal = 0, rew = 0, counted = 0, usd = null, eur = null;
   sel.forEach(name => {
     const q = walletQueried[name];
-    if(!q || q.error || typeof q.balance_nym !== 'number') return;
-    nym += q.balance_nym; counted++;
+    if(!q || q.error) return;
+    const b = typeof q.balance_nym === 'number' ? q.balance_nym : null;
+    const r = typeof q.rewards_nym === 'number' ? q.rewards_nym : null;
+    if(b === null && r === null) return;
+    bal += (b || 0); rew += (r || 0); counted++;
     if(q.price_usd != null) usd = q.price_usd;
     if(q.price_eur != null) eur = q.price_eur;
   });
   if(counted === 0) return;   // nothing queried yet — keep the row uncluttered
-  box.append(document.createTextNode('total balance'));
+  const nym = bal + rew;
+  box.append(document.createTextNode('total'));
   box.append(el('b', '', fmtNym(nym) + ' NYM'));
   if(usd != null) box.append(el('span','w-fiat', '· ' + fmtFiat(nym * usd, 'USD')));
   if(eur != null) box.append(el('span','w-fiat', '· ' + fmtFiat(nym * eur, 'EUR')));
   if(usd == null && eur == null) box.append(el('span','w-fiat','· no rate'));
+  box.append(el('span','w-split',   // 2 decimals here: the split is context, not a figure to reconcile
+    '· ' + fmtNym2(bal) + ' balance + ' + fmtNym2(rew) + ' rewards'));
   box.append(document.createTextNode(
     counted === sel.length ? '· ' + counted + ' wallet' + (counted === 1 ? '' : 's')
                            : '· ' + counted + ' of ' + sel.length + ' queried'));
@@ -3948,9 +3957,16 @@ function fmtNym(v){
   return n.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 6});
 }
 
+function fmtNym2(v){
+  const n = Number(v);
+  if(!isFinite(n)) return String(v);
+  return n.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+}
+
+// en-US pinned so USD stays "$" — the browser locale renders it "US$"
 function fmtFiat(v, cur){
   try{
-    return v.toLocaleString(undefined, {style:'currency', currency:cur,
+    return v.toLocaleString('en-US', {style:'currency', currency:cur,
       minimumFractionDigits:2, maximumFractionDigits:2});
   }catch(e){ return (cur === 'EUR' ? '€' : '$') + v.toFixed(2); }
 }
