@@ -234,6 +234,10 @@
   /* wallet list: single shared grid so columns align across rows */
   .w-selall{display:flex;align-items:center;gap:8px;font-weight:600;padding:8px 2px;font-size:13px;border-bottom:1px solid var(--line)}
   .w-selall input{width:auto}
+  .w-selall .w-total{margin-left:auto;font-weight:400;color:var(--muted);display:flex;align-items:center;
+                     gap:8px;flex-wrap:wrap;justify-content:flex-end}
+  .w-selall .w-total b{font-weight:600;color:var(--text)}
+  .w-selall .w-total .w-fiat{font-variant-numeric:tabular-nums}
   .wgrid{display:grid;grid-template-columns:20px 56px minmax(150px,max-content) max-content max-content;
          align-items:center;column-gap:12px;font-size:13px}
   .wgrid .wc{padding:8px 0;border-bottom:1px solid var(--line);min-height:20px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
@@ -3864,8 +3868,13 @@ function renderWalletList(){
   // select-all sits above the grid so it doesn't perturb column tracks
   const sarow = el('div','w-selall');
   const sa = el('input'); sa.type = 'checkbox'; sa.id = 'w-selall';
-  sa.onchange = () => { document.querySelectorAll('#w-list input.wsel').forEach(c => c.checked = sa.checked); };
+  sa.onchange = () => {
+    document.querySelectorAll('#w-list input.wsel').forEach(c => c.checked = sa.checked);
+    wUpdateTotal();
+  };
   sarow.append(sa, document.createTextNode(' select all'));
+  const total = el('span','w-total'); total.id = 'w-total';
+  sarow.append(total);
   box.append(sarow);
 
   // one grid for every row: checkbox · name · address · balance · rewards.
@@ -3876,6 +3885,7 @@ function renderWalletList(){
     const c1 = el('div','wc');
     const cb = el('input'); cb.type = 'checkbox'; cb.className = 'wsel'; cb.value = name;
     cb.checked = true; cb.id = cbId;
+    cb.onchange = wUpdateTotal;
     c1.append(cb);
     const c2 = el('div','wc');
     const nm = el('label','wname', name); nm.setAttribute('for', cbId); c2.append(nm);
@@ -3900,12 +3910,49 @@ function renderWalletList(){
     grid.append(c1, c2, c3, c4, c5);
   });
   box.append(grid);
+  wUpdateTotal();
+}
+
+// Combined balance of the currently selected wallets, shown next to "select all".
+// Summed from the NYM figures and converted once with the rate the query carried
+// (price_usd/price_eur, spot at query time) — adding up the per-row fiat amounts
+// would accumulate their rounding. Wallets that weren't queried, or whose balance
+// lookup failed, are left out of the sum and reported as a count instead.
+function wUpdateTotal(){
+  const box = document.getElementById('w-total');
+  if(!box) return;
+  box.innerHTML = '';
+  const sel = wSelectedNames();
+  let nym = 0, counted = 0, usd = null, eur = null;
+  sel.forEach(name => {
+    const q = walletQueried[name];
+    if(!q || q.error || typeof q.balance_nym !== 'number') return;
+    nym += q.balance_nym; counted++;
+    if(q.price_usd != null) usd = q.price_usd;
+    if(q.price_eur != null) eur = q.price_eur;
+  });
+  if(counted === 0) return;   // nothing queried yet — keep the row uncluttered
+  box.append(document.createTextNode('total balance'));
+  box.append(el('b', '', fmtNym(nym) + ' NYM'));
+  if(usd != null) box.append(el('span','w-fiat', '· ' + fmtFiat(nym * usd, 'USD')));
+  if(eur != null) box.append(el('span','w-fiat', '· ' + fmtFiat(nym * eur, 'EUR')));
+  if(usd == null && eur == null) box.append(el('span','w-fiat','· no rate'));
+  box.append(document.createTextNode(
+    counted === sel.length ? '· ' + counted + ' wallet' + (counted === 1 ? '' : 's')
+                           : '· ' + counted + ' of ' + sel.length + ' queried'));
 }
 
 function fmtNym(v){
   const n = Number(v);
   if(!isFinite(n)) return String(v);
   return n.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 6});
+}
+
+function fmtFiat(v, cur){
+  try{
+    return v.toLocaleString(undefined, {style:'currency', currency:cur,
+      minimumFractionDigits:2, maximumFractionDigits:2});
+  }catch(e){ return (cur === 'EUR' ? '€' : '$') + v.toFixed(2); }
 }
 
 function openWallets(mode){

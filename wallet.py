@@ -341,16 +341,7 @@ def send(receiver: str, amount_unym: int, mnemonic: str) -> dict:
     return {"ok": ok, "output": _tail(out if ok else (err or out))}
 
 
-def nym_price_usd() -> float | None:
-    """Best-effort spot price for USD display. None on failure — never fatal."""
-    sources = [
-        ("https://api.coingecko.com/api/v3/simple/price?ids=nym&vs_currencies=usd",
-         lambda d: float(d["nym"]["usd"])),
-        ("https://api.coinpaprika.com/v1/tickers/nym-nym",
-         lambda d: float(d["quotes"]["USD"]["price"])),
-        ("https://api.binance.com/api/v3/ticker/price?symbol=NYMUSDT",
-         lambda d: float(d["price"])),
-    ]
+def _fetch_price(sources) -> float | None:
     for url, pick in sources:
         try:
             with urllib.request.urlopen(url, timeout=8) as r:
@@ -360,6 +351,52 @@ def nym_price_usd() -> float | None:
         except Exception:
             continue
     return None
+
+
+def nym_price_usd() -> float | None:
+    """Best-effort spot price for USD display. None on failure — never fatal."""
+    return _fetch_price([
+        ("https://api.coingecko.com/api/v3/simple/price?ids=nym&vs_currencies=usd",
+         lambda d: float(d["nym"]["usd"])),
+        ("https://api.coinpaprika.com/v1/tickers/nym-nym",
+         lambda d: float(d["quotes"]["USD"]["price"])),
+        ("https://api.binance.com/api/v3/ticker/price?symbol=NYMUSDT",
+         lambda d: float(d["price"])),
+    ])
+
+
+def _usd_eur_rate() -> float | None:
+    """EUR per 1 USD. Only needed when no source quotes NYM in EUR directly."""
+    return _fetch_price([
+        ("https://api.frankfurter.app/latest?from=USD&to=EUR",
+         lambda d: float(d["rates"]["EUR"])),
+        ("https://open.er-api.com/v6/latest/USD",
+         lambda d: float(d["rates"]["EUR"])),
+    ])
+
+
+def nym_prices() -> dict:
+    """{"usd": float|None, "eur": float|None} — spot price at call time, best
+    effort. EUR comes from a direct quote where available, otherwise from the
+    USD price times an FX rate; a missing rate leaves eur None rather than
+    guessing. Never raises: display-only data must not fail a wallet query."""
+    usd = eur = None
+    # one call covers both currencies when coingecko is reachable
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=nym&vs_currencies=usd,eur"
+        with urllib.request.urlopen(url, timeout=8) as r:
+            d = json.loads(r.read().decode())["nym"]
+        usd = float(d["usd"]) if float(d.get("usd") or 0) > 0 else None
+        eur = float(d["eur"]) if float(d.get("eur") or 0) > 0 else None
+    except Exception:
+        pass
+    if usd is None:
+        usd = nym_price_usd()
+    if eur is None and usd is not None:
+        fx = _usd_eur_rate()
+        if fx:
+            eur = usd * fx
+    return {"usd": usd, "eur": eur}
 
 
 def _tail(text: str, n: int = 1200) -> str:
@@ -500,7 +537,8 @@ def rewards_summary() -> dict:
 def query_wallets(names: list[str], password: str, with_usd: bool = True) -> list[dict]:
     """For each wallet: address, balance, pending rewards. Read-only. Per-wallet
     errors are captured so one bad password doesn't abort the batch."""
-    price = nym_price_usd() if with_usd else None
+    prices = nym_prices() if with_usd else {"usd": None, "eur": None}
+    price, price_eur = prices["usd"], prices["eur"]
     rows = []
     for name in names:
         row = {"name": name}
@@ -518,19 +556,28 @@ def query_wallets(names: list[str], password: str, with_usd: bool = True) -> lis
                 row["rewards_nym"] = pr["nym"]
             except WalletError as e:
                 row["rewards_error"] = str(e)
+            b = row.get("balance_nym")
+            r = row.get("rewards_nym")
             if price is not None:
-                b = row.get("balance_nym")
-                r = row.get("rewards_nym")
                 if isinstance(b, (int, float)):
                     row["balance_usd"] = round(b * price, 2)
                 if isinstance(r, (int, float)):
                     row["rewards_usd"] = round(r * price, 2)
+            if price_eur is not None:
+                if isinstance(b, (int, float)):
+                    row["balance_eur"] = round(b * price_eur, 2)
+                if isinstance(r, (int, float)):
+                    row["rewards_eur"] = round(r * price_eur, 2)
         except WalletError as e:
             row["error"] = str(e)
         rows.append(row)
-    if price is not None:
-        for row in rows:
+    # the rates the UI needs to total a selection itself (summing the rounded
+    # per-row figures would drift), stamped on every row so any one will do
+    for row in rows:
+        if price is not None:
             row["price_usd"] = price
+        if price_eur is not None:
+            row["price_eur"] = price_eur
     return rows
 
 
