@@ -3083,6 +3083,9 @@ def finish(force_reboot=False):
 
 def main_packages():
     phase("update", 2)
+    # no-op when dpkg is clean; finishes half-configured packages left by an
+    # interrupted earlier run, which apt would otherwise refuse to touch
+    run_quiet(["dpkg", "--configure", "-a"])
     rc, _ = run_quiet(["apt-get", "-q", "update"])
     if rc != 0:
         fail("apt-get update failed (exit %d) — see log" % rc)
