@@ -4165,10 +4165,17 @@ function duRenderCheck(){
       row.append(el('span','pill', (pend.upgraded + (pend.new || 0)) + ' pkg updates'
         + (pend.security ? ' (' + pend.security + ' security)' : '')));
     if(pend.error) row.append(el('span','pill bad','apt: ' + pend.error.slice(0, 60)));
-    if(s.reboot_required) row.append(el('span','pill warn','reboot pending'));
+    if(s.reboot_required){
+      const p = el('span','pill warn','reboot pending');
+      p.title = 'node wants a reboot from earlier updates — the upgrade reboot clears it';
+      row.append(p);
+    }
 
     const bad = (r.checks || []).filter(c => !c.ok && c.level === 'block');
-    const warns = (r.checks || []).filter(c => !c.ok && c.level === 'warn');
+    // the reboot warn-check duplicates the "reboot pending" pill above — keep
+    // it in the compatible-pill tooltip but don't render it as a second pill
+    const warns = (r.checks || []).filter(c => !c.ok && c.level === 'warn'
+      && !/^reboot/.test(c.check));
     if(bad.length){
       const p = el('span','pill bad','blocked: ' + bad.map(c => c.check).join(', '));
       p.title = bad.map(c => c.check + ' — ' + c.detail).join('\n');

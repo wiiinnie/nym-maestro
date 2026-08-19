@@ -201,7 +201,9 @@ def compat_checks(osinfo, plan):
             if release.get("further") else " → ".join(release["path"]))
 
     if osinfo.get("reboot_required"):
-        add("no reboot already pending", False, "warn",
+        # named after the finding, not the pass-condition: this entry only
+        # exists when it fails, and the UI shows failed checks by name
+        add("reboot already pending", False, "warn",
             "node wants a reboot from earlier updates — the upgrade reboot clears it")
     virt = osinfo.get("virt")
     if virt in ("lxc", "openvz", "systemd-nspawn"):
