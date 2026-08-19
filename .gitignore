@@ -16,6 +16,9 @@ dist/
 # Sensitive node data
 recovery_nodes.csv
 
+# Node backup archives (contain the nodes' private keys) — never commit
+backups/
+
 # Old scratch files
 _old/
 seed_nodes.py
