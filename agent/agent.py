@@ -1320,8 +1320,9 @@ def act_fail2ban_unban(params):
 
 # --- SSH key auth + password-login hardening -------------------------------
 #
-# Login model: you log in as an unprivileged user (default "hermes") and sudo
-# to root. Direct root SSH login is never enabled. Keys are installed into that
+# Login model: you log in as an unprivileged admin user (its name comes from
+# MAESTRO_SSH_USER in the unit env — never hard-coded here) and sudo to root.
+# Direct root SSH login is never enabled. Keys are installed into that
 # user's ~/.ssh/authorized_keys (owned by the user), NOT root's. Hardening sets
 # PasswordAuthentication no + PermitRootLogin no for the whole daemon.
 

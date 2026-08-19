@@ -348,7 +348,7 @@ check("setup rejects shell-injection in ignoreip",
 check("setup rejects bad time", agent.act_fail2ban_setup({"bantime": "1y"})["ok"] is False)
 check("unban validates the IP", agent.act_fail2ban_unban({"ip": "nope"})["ok"] is False)
 
-# --- SSH key auth + harden gating (login user = hermes, never root) --------
+# --- SSH key auth + harden gating (login user = opsadmin, never root) --------
 import types as _types3
 _ED = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIabc123+/def maestro@mac"
 check("pubkey accepts real keys, rejects junk",
@@ -356,26 +356,26 @@ check("pubkey accepts real keys, rejects junk",
       and not agent._PUBKEY_RE.match("not a key") and not agent._PUBKEY_RE.match("ssh-ed25519"))
 
 _sd = _tf3.mkdtemp()
-_home = _os3.path.join(_sd, "home", "hermes")
+_home = _os3.path.join(_sd, "home", "opsadmin")
 _os3.makedirs(_home, exist_ok=True)
 _fakepw = _types3.SimpleNamespace(pw_uid=_os3.getuid(), pw_gid=_os3.getgid(), pw_dir=_home)
 
 
 def _fake_user_paths(user):
-    if user != "hermes":
+    if user != "opsadmin":
         raise KeyError(user)
     sshd = _os3.path.join(_home, ".ssh")
     return _fakepw, sshd, _os3.path.join(sshd, "authorized_keys")
 
 
 agent._user_paths = _fake_user_paths
-agent.SSH_USER_DEFAULT = "hermes"  # in production this comes from MAESTRO_SSH_USER
+agent.SSH_USER_DEFAULT = "opsadmin"  # in production this comes from MAESTRO_SSH_USER
 _authk = _os3.path.join(_home, ".ssh", "authorized_keys")
 
 _a1 = agent.act_ssh_add_key({"public_keys": [_ED]})
 _a2 = agent.act_ssh_add_key({"public_keys": [_ED]})
 check("add_key installs once then dedupes into the login user's account",
-      _a1["added"] == 1 and _a1["user"] == "hermes" and _a1["authorized_keys"] == _authk
+      _a1["added"] == 1 and _a1["user"] == "opsadmin" and _a1["authorized_keys"] == _authk
       and _a2["already_present"] == 1)
 check("authorized_keys perms are 600 file / 700 dir",
       oct(_os3.stat(_authk).st_mode)[-3:] == "600" and
@@ -449,7 +449,7 @@ check("harden self-heals a missing sshd_config Include and then disables passwor
 
 _st = agent.act_ssh_status({})
 check("ssh_status reports user, key count, and effective config",
-      _st["password_auth"] == "no" and _st["user"] == "hermes"
+      _st["password_auth"] == "no" and _st["user"] == "opsadmin"
       and _st["user_exists"] is True and _st["authorized_keys_count"] == 1)
 
 print(f"\n{ok} passed, {fail} failed")
