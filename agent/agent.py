@@ -41,7 +41,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-AGENT_VERSION = "0.12.1"
+AGENT_VERSION = "0.12.2"
 
 try:
     with open(os.path.abspath(__file__), "rb") as _sf:
@@ -3281,11 +3281,13 @@ def _verify_green(checks):
 
 
 def _distro_state_summary():
-    st = _distro_read_state()
+    st, phase, _ = _distro_reconcile()
     if not st:
         return None
-    return {k: st.get(k) for k in ("mode", "phase", "pct", "started_at",
-                                   "finished_at", "error", "needs_reboot")}
+    out = {k: st.get(k) for k in ("mode", "pct", "started_at",
+                                  "finished_at", "error", "needs_reboot", "note")}
+    out["phase"] = phase
+    return out
 
 
 def act_distro_upgrade(params):
@@ -3397,14 +3399,16 @@ def _post_upgrade_checks():
     return checks
 
 
-def act_distro_status(params):
-    """Progress of the current/last upgrade. After the post-upgrade reboot this
-    is also where verification happens: the state file still says "rebooting",
-    so once /proc/stat shows a newer boot we run the service checks and flip
-    the state to done (or keep reporting "verifying" until they pass)."""
+def _distro_reconcile():
+    """Read the upgrade state and resolve it against reality — boot time,
+    unit, state-file freshness, apt lock, os-release. Returns (st, phase,
+    verify); st is None when no upgrade ever ran. May persist a terminal
+    phase as a side effect. Shared by distro_upgrade_status AND the os_info
+    summary, so a stale mid-flight state self-heals on the next scan instead
+    of blocking future upgrades forever."""
     st = _distro_read_state()
     if not st:
-        return {"ok": True, "kind": "distro", "phase": "idle"}
+        return None, "idle", None
     phase = st.get("phase")
     btime = _proc_btime()
     rebooted = bool(btime and st.get("started_at") and btime > st["started_at"])
@@ -3464,6 +3468,18 @@ def act_distro_status(params):
                     _distro_write_state(st)
                 phase = "failed"
 
+    return st, phase, verify
+
+
+def act_distro_status(params):
+    """Progress of the current/last upgrade. After the post-upgrade reboot this
+    is also where verification happens: the state file still says "rebooting",
+    so once /proc/stat shows a newer boot we run the service checks and flip
+    the state to done (or keep reporting "verifying" until they pass)."""
+    st, phase, verify = _distro_reconcile()
+    if st is None:
+        return {"ok": True, "kind": "distro", "phase": "idle"}
+    osr = parse_os_release(_read_text("/etc/os-release") or "")
     out = {k: st.get(k) for k in ("mode", "reboot", "started_at", "pct",
                                   "pkg_total", "pkg_done", "eta_epoch", "error",
                                   "needs_reboot", "finished_at", "target",

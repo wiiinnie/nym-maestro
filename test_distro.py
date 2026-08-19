@@ -220,6 +220,13 @@ r = agent.act_distro_status({})
 agent.shutil.which = _which2
 check("status: missing sudo reported, done anyway", r["phase"] == "done"
       and any(c["check"] == "sudo installed" and not c["ok"] for c in (r["verify"] or [])))
+
+# a scan (os_info) resolves a stuck mid-flight state the same way, so it
+# cannot block future upgrades forever
+_mid_release_state()
+r = agent.act_os_info({"check_updates": False})
+check("os_info: stuck state self-heals to done via reconcile",
+      (r["upgrade_state"] or {}).get("phase") == "done")
 agent._apt_locked = _orig_lock
 
 agent._proc_btime, agent.service_state, agent.unit_exists = _orig_btime, _orig_svcstate, _orig_unit
