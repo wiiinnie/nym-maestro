@@ -75,14 +75,17 @@ blob = src.split('b64decode("')[1].split('")')[0]
 check("runner params survive base64 round-trip (quotes included)",
       json.loads(base64.b64decode(blob)) == params)
 check("runner is stdlib-only imports",
-      all(m in ("base64", "json", "os", "re", "subprocess", "sys", "time", "traceback")
+      all(m in ("base64", "json", "os", "re", "shutil", "subprocess", "sys",
+                "time", "traceback")
           for line in src.splitlines() if line.startswith("import ")
           for m in line[7:].split(", ")))
+check("runner reinstalls lockout-critical packages", "ensure_essentials" in src)
 
 # --- agent: action guards (no systemd here — everything monkeypatched) -------
 print("agent action guards")
 
 tmp = tempfile.mkdtemp(prefix="maestro-distro-test-")
+agent.CERTDIR = tmp
 agent.DISTRO_STATE = os.path.join(tmp, "state.json")
 agent.DISTRO_LOG = os.path.join(tmp, "log")
 agent.DISTRO_RUNNER = os.path.join(tmp, "runner.py")
@@ -125,6 +128,14 @@ r = agent.act_distro_upgrade({"mode": "release"})
 check("ubuntu release needs do-release-upgrade", not r["ok"] and "do-release-upgrade" in r["error"])
 agent.shutil.which = _which
 
+FAKE_FILES["/etc/os-release"] = "ID=ubuntu\nVERSION_ID=\"22.04\"\nVERSION_CODENAME=jammy\n"
+r = agent.act_distro_upgrade({"mode": "packages"})
+check("start: launches via systemd-run", r["ok"] and r.get("started"))
+seed = json.load(open(agent.DISTRO_STATE))
+check("start: seeds state with from_version + starting phase",
+      seed["from_version"] == "22.04" and seed["phase"] == "starting")
+os.remove(agent.DISTRO_STATE)
+
 r = agent.act_distro_status({})
 check("status: idle without state file", r["ok"] and r["phase"] == "idle")
 
@@ -165,6 +176,41 @@ agent._proc_btime = lambda: now - 3000        # no reboot since start
 r = agent.act_distro_status({})
 check("status: dead runner -> failed", r["phase"] == "failed" and "not running" in r["error"])
 
+# runner killed but its apt/do-release-upgrade child still holds the lock
+def _mid_release_state():
+    with open(agent.DISTRO_STATE, "w") as f:
+        json.dump({"version": 1, "mode": "release", "reboot": "auto",
+                   "started_at": now - 600, "phase": "release_upgrade", "pct": 40,
+                   "from_version": "25.04", "phases": []}, f)
+
+
+_mid_release_state()
+FAKE_FILES["/etc/os-release"] = "ID=ubuntu\nVERSION_ID=\"25.04\"\nVERSION_CODENAME=plucky\n"
+_orig_lock = agent._apt_locked
+agent._apt_locked = lambda: True
+r = agent.act_distro_status({})
+check("status: apt locked -> detached, not failed", r["phase"] == "detached")
+check("status: detached carries a note", "still running" in (r["note"] or ""))
+
+# runner killed, lock free, but the release LANDED without us -> verify -> done
+agent._apt_locked = lambda: False
+agent.service_state = lambda: (True, "nym-node.service")
+FAKE_FILES["/etc/os-release"] = "ID=ubuntu\nVERSION_ID=\"26.04\"\nVERSION_CODENAME=resolute\n"
+r = agent.act_distro_status({})
+check("status: orphaned-but-completed release -> done", r["phase"] == "done")
+check("status: note names the version jump", "25.04 -> 26.04" in (r["note"] or ""))
+check("status: unrebooted orphan flags needs_reboot", r["needs_reboot"] is True)
+
+# missing sudo is reported but never gates "done"
+_mid_release_state()
+_which2 = agent.shutil.which
+agent.shutil.which = lambda *_: None
+r = agent.act_distro_status({})
+agent.shutil.which = _which2
+check("status: missing sudo reported, done anyway", r["phase"] == "done"
+      and any(c["check"] == "sudo installed" and not c["ok"] for c in (r["verify"] or [])))
+agent._apt_locked = _orig_lock
+
 agent._proc_btime, agent.service_state, agent.unit_exists = _orig_btime, _orig_svcstate, _orig_unit
 
 # os_info with canned files
@@ -190,7 +236,7 @@ check("os_info: hardware fields", r["mem_total"] == 2000000 * 1024
       and r["cpu"]["model"] == "test cpu" and r["kernel"])
 check("os_info: pending counts parsed", r["pending"] == {"upgraded": 3, "new": 0,
                                                          "security": 1, "error": None})
-check("os_info: reports last upgrade state", (r["upgrade_state"] or {}).get("phase") == "failed")
+check("os_info: reports last upgrade state", (r["upgrade_state"] or {}).get("phase") == "done")
 r = agent.act_os_info({"check_updates": False})
 check("os_info: check_updates=False skips apt", r["pending"]["upgraded"] is None)
 
@@ -319,6 +365,26 @@ check("release_packages dict shape parsed", top and top[0]["usn"] == "USN-9")
 check("string cve ids parsed", top[0]["cves"] == ["CVE-2026-0009"])
 check("empty/garbage feed -> empty list", distro.rank_usns(None) == []
       and distro.rank_usns(["x", 5]) == [])
+
+# the LIVE feed shape: empty cves, ids in cves_ids, no severity anywhere —
+# scores come from the per-CVE endpoint via rescore_with_cves
+live = [{"id": "USN-A", "title": "x", "published": "2026-08-01", "cves": [],
+         "cves_ids": ["CVE-2026-1"],
+         "release_packages": {"noble": [{"name": "openssl", "is_source": True}]}},
+        {"id": "USN-B", "title": "y", "published": "2026-08-02", "cves": [],
+         "cves_ids": ["CVE-2026-3"],
+         "release_packages": {"noble": [{"name": "linux-hwe", "is_source": True}]}}]
+pre = distro.rank_usns(live, limit=5)
+check("live shape: cves_ids fallback fills cve list",
+      sorted(c for t in pre for c in t["cves"]) == ["CVE-2026-1", "CVE-2026-3"])
+check("live shape: zero scores rank newest first", pre[0]["usn"] == "USN-B")
+top = distro.rescore_with_cves(pre, {"CVE-2026-1": {"cvss3": 9.1, "priority": None},
+                                     "CVE-2026-3": {"cvss3": None, "priority": "medium"}})
+check("rescore: per-CVE cvss3 applied",
+      next(t for t in top if t["usn"] == "USN-A")["score"] == 9.1)
+check("rescore: priority word fallback",
+      next(t for t in top if t["usn"] == "USN-B")["score"] == 5.0)
+check("rescore: order follows real severity", top[0]["usn"] == "USN-A")
 
 # --- distro: recommendations ----------------------------------------------------
 print("distro recommendations")

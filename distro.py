@@ -17,10 +17,14 @@ ENDOFLIFE_URLS = {
     "debian": "https://endoflife.date/api/debian.json",
 }
 
-# Ubuntu Security Notices, filtered server-side by release codename. Debian
+# Ubuntu Security Notices, filtered server-side by release codename. The API
+# hard-caps limit at 20, so coverage comes from offset pagination (app.py
+# fetches a few pages). Severity is NOT in the list feed — cvss3/priority live
+# on the per-CVE endpoint, fetched for the preselected notices only. Debian
 # has no comparably small feed (the security-tracker dump is tens of MB), so
 # Debian nodes get a link instead of an inline top-5 — stated, not silent.
-USN_URL = "https://ubuntu.com/security/notices.json?release={codename}&limit=100&order=newest"
+USN_URL = "https://ubuntu.com/security/notices.json?release={codename}&limit=20&order=newest&offset={offset}"
+CVE_URL = "https://ubuntu.com/security/cves/{cve}.json"
 DEBIAN_SECURITY_URL = "https://www.debian.org/security/"
 
 # Fallback when endoflife.date is unreachable. Deliberately conservative: it
@@ -244,7 +248,8 @@ def _vuln_reason(top):
         return None
     worst = top[0]
     area = (worst.get("why") or worst.get("ops_area") or "").split(" — ")[0]
-    s = (f"closes {worst['usn']} (CVSS {worst['score']}"
+    sev = f"CVSS {worst['score']}" if worst.get("score") else "unrated"
+    s = (f"closes {worst['usn']} ({sev}"
          + (f", {area}" if area else "") + ")")
     if len(top) > 1:
         s += f" and {len(top) - 1} more ops-relevant security fixes — hover the CVEs pill"
@@ -393,6 +398,9 @@ def _cve_ids(notice, limit=6):
         cid = cve.get("id") if isinstance(cve, dict) else cve
         if isinstance(cid, str) and cid.startswith("CVE-"):
             ids.append(cid)
+    if not ids:  # the live feed often ships empty `cves` but filled `cves_ids`
+        ids = [c for c in (notice.get("cves_ids") or [])
+               if isinstance(c, str) and c.startswith("CVE-")]
     return ids[:limit]
 
 
@@ -408,12 +416,15 @@ def rank_usns(notices, limit=5):
         if not isinstance(n, dict):
             continue
         pkgs = n.get("release_packages")
-        if isinstance(pkgs, dict):  # some payloads nest per-release package lists
-            names = [p.get("name") if isinstance(p, dict) else p
-                     for plist in pkgs.values() for p in (plist or [])]
+        if isinstance(pkgs, dict):  # the live feed nests per-release package lists
+            plists = [p for plist in pkgs.values() for p in (plist or [])]
         else:
-            names = [p.get("name") if isinstance(p, dict) else p
-                     for p in (n.get("packages") or [])]
+            plists = list(n.get("packages") or [])
+        # match on SOURCE packages only where the shape tells us — otherwise a
+        # binding like python3-samba drags a samba notice into the python bucket
+        names = [p.get("name") if isinstance(p, dict) else p
+                 for p in plists
+                 if not isinstance(p, dict) or p.get("is_source", True)]
         names = [x for x in names if x]
         m = _ops_match(names)
         if not m:
@@ -430,8 +441,13 @@ def rank_usns(notices, limit=5):
             "cves": _cve_ids(n),
             "published": (n.get("published") or "")[:10],
         })
-    scored.sort(key=lambda x: (-x["score"], x["published"]), reverse=False)
+    return _pick_diverse(scored, limit)
 
+
+def _pick_diverse(scored, limit):
+    """Best per ops area first (so the top-N covers kernel AND ssh AND ssl),
+    then fill by raw severity; newest first among equals."""
+    scored = sorted(scored, key=lambda x: (x["score"], x["published"]), reverse=True)
     picked, seen_area = [], set()
     for item in scored:               # pass 1: best per ops area
         if item["ops_area"] not in seen_area:
@@ -445,5 +461,25 @@ def rank_usns(notices, limit=5):
                 picked.append(item)
                 if len(picked) >= limit:
                     break
-    picked.sort(key=lambda x: -x["score"])
+    picked.sort(key=lambda x: (x["score"], x["published"]), reverse=True)
     return picked[:limit]
+
+
+def rescore_with_cves(items, cve_scores, limit=5):
+    """Fold per-CVE severity (from the CVE detail endpoint) into ranked items.
+
+    cve_scores: {cve_id: {"cvss3": float|None, "priority": str|None}}. Each
+    item's score becomes the max of what it had and its CVEs' scores, then the
+    diversity pick runs again. Items are not mutated."""
+    out = []
+    for item in items or []:
+        best = item.get("score") or 0.0
+        for cid in item.get("cves") or []:
+            s = cve_scores.get(cid) or {}
+            try:
+                best = max(best, float(s.get("cvss3") or 0))
+            except (TypeError, ValueError):
+                pass
+            best = max(best, _PRIORITY_SCORE.get((s.get("priority") or "").lower(), 0.0))
+        out.append({**item, "score": round(best, 1)})
+    return _pick_diverse(out, limit)

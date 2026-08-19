@@ -2499,6 +2499,9 @@ function updateBulk(){
   // the landing modal's target picker counts the selection, so keep it in sync
   const lp = document.getElementById('lp-overlay');
   if(lp && lp.classList.contains('open')) lpFillPickers();
+  // same for the OS-upgrade modal: re-evaluate its selection note + staleness
+  const du = document.getElementById('du-overlay');
+  if(du && du.classList.contains('open')) openDistro();
   if(typeof renderCards === 'function') renderCards();
 }
 
@@ -4024,9 +4027,22 @@ let duTimer = null;
 
 function openDistro(){
   document.getElementById('du-overlay').classList.add('open');
-  const sel = selectedNodes().filter(n => n.status && n.status.reachable);
-  document.getElementById('du-check-note').textContent =
-    sel.length ? sel.length + ' reachable node(s) selected' : 'select nodes in the table first';
+  const sel = duTargets();
+  const note = document.getElementById('du-check-note');
+  note.textContent = sel.length ? sel.length + ' reachable node(s) selected'
+                                : 'select nodes in the table first';
+  // Dry-run results are selection-scoped: a different selection starts fresh.
+  // The progress panel below is global job state and always stays — a running
+  // upgrade must never be hidden by a selection change.
+  if(duCheckData){
+    const had = new Set((duCheckData.results || []).map(r => r.uid));
+    const same = sel.length === had.size && sel.every(n => had.has(n.uid));
+    if(!same){
+      duCheckData = null;
+      ['du-recs','du-check','du-cves'].forEach(id => document.getElementById(id).innerHTML = '');
+      if(sel.length) note.textContent = sel.length + ' node(s) selected — run a new dry run';
+    }
+  }
   duPollProgress(true);   // pick up a job that is already running
 }
 function closeDistro(){
@@ -4058,6 +4074,7 @@ const DU_PHASES = {
   release_upgrade: 'release upgrade running', sources: 'rewriting apt sources',
   upgrade_minimal: 'upgrading (minimal set)', full_upgrade: 'upgrading (full set)',
   rebooting: 'rebooting…', verifying: 'back up — verifying services',
+  detached: 'runner lost — upgrade still running on the node',
   done: 'done', failed: 'failed', cancelled: 'cancelled',
 };
 function duPhaseLabel(p){ return DU_PHASES[p] || p || '—'; }
@@ -4078,7 +4095,8 @@ function duCveTip(key){
     const row = el('div','du-cve');
     const head = el('div');
     head.append(el('b', null, u.usn || ''), document.createTextNode(' · '));
-    const sev = el('span','pill ' + (u.score >= 7 ? 'bad' : u.score >= 4 ? 'warn' : ''), 'CVSS ' + u.score);
+    const sev = el('span','pill ' + (u.score >= 7 ? 'bad' : u.score >= 4 ? 'warn' : ''),
+      u.score > 0 ? 'CVSS ' + u.score : 'unrated');
     head.append(sev, document.createTextNode(' · ' + (u.packages || []).join(', ')));
     row.append(head);
     if(u.title) row.append(el('div','du-sub', u.title));
@@ -4316,12 +4334,14 @@ function duRenderProgress(p){
       row.append(b);
     }
     if(ns.os_version && st === 'done') row.append(el('span','pill ok','now on ' + ns.os_version));
-    if(ns.verify && st !== 'done'){
+    if(ns.verify){
       const badv = ns.verify.filter(v => !v.ok);
-      if(badv.length) row.append(el('span','pill warn', 'waiting: ' + badv.map(v => v.check).join(', ')));
+      if(badv.length) row.append(el('span','pill warn',
+        (st === 'done' ? 'check failed: ' : 'waiting: ') + badv.map(v => v.check).join(', ')));
     }
     if(ns.error){ const e = el('div','du-log', ns.error); e.style.color = 'var(--danger)'; row.append(e); }
     else if(ns.log_line && st === 'running') row.append(el('div','du-log', ns.log_line));
+    if(ns.note){ const nt = el('div','du-log', ns.note); nt.style.color = 'var(--warn)'; row.append(nt); }
     box.append(row);
   });
 }

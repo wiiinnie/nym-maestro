@@ -2096,19 +2096,56 @@ async def _distro_catalog(app_):
     return st.distro_catalog
 
 
+_USN_PAGES = 3          # 3 × the API's hard limit of 20 = 60 newest notices
+_CVE_FETCH_CAP = 16     # per-CVE severity lookups per release check (2 × 8 picks)
+
+
 async def _distro_usn_top(app_, codename):
-    """Top ops-relevant USNs for one Ubuntu release, cached."""
+    """Top ops-relevant USNs for one Ubuntu release, cached.
+
+    The list feed carries no severity at all (empty cvss/priority), so this
+    runs in two stages: page the newest notices, preselect the ops-relevant
+    ones, then fetch per-CVE detail for a bounded number of their CVEs and
+    re-rank on real CVSS/priority."""
     st = _distro_state(app_)
     c = st.distro_usns.get(codename)
     if c and time.time() - c["ts"] < _DISTRO_CACHE_TTL:
         return c
-    url = distro.USN_URL.format(codename=codename)
-    entry = {"ts": time.time(), "top": [], "source": url, "error": None}
+    source = distro.USN_URL.format(codename=codename, offset=0)
+    entry = {"ts": time.time(), "top": [], "source": source, "error": None}
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(url, headers={"Accept": "application/json"})
-            r.raise_for_status()
-            entry["top"] = distro.rank_usns((r.json() or {}).get("notices"), limit=5)
+        async with httpx.AsyncClient(timeout=15.0,
+                                     headers={"Accept": "application/json"}) as client:
+            notices = []
+            for page in range(_USN_PAGES):
+                r = await client.get(distro.USN_URL.format(codename=codename,
+                                                           offset=page * 20))
+                r.raise_for_status()
+                batch = (r.json() or {}).get("notices") or []
+                notices.extend(batch)
+                if len(batch) < 20:
+                    break
+            picked = distro.rank_usns(notices, limit=8)
+            wanted = []
+            for item in picked:
+                wanted.extend(item.get("cves", [])[:2])
+            wanted = list(dict.fromkeys(wanted))[:_CVE_FETCH_CAP]
+
+            async def one_cve(cid):
+                try:
+                    rr = await client.get(distro.CVE_URL.format(cve=cid))
+                    rr.raise_for_status()
+                    d = rr.json() or {}
+                    return cid, {"cvss3": d.get("cvss3"), "priority": d.get("priority")}
+                except Exception:
+                    return cid, None
+            pairs = await asyncio.gather(*[one_cve(c_) for c_ in wanted])
+            scores = {cid: s for cid, s in pairs if s}
+            entry["top"] = distro.rescore_with_cves(picked, scores, limit=5)
+    except httpx.HTTPStatusError as e:
+        code = e.response.status_code
+        entry["error"] = (f"the USN feed has no data for release {codename!r} "
+                          f"(HTTP {code}" + (" — EOL release?" if code in (404, 422) else "") + ")")
     except Exception as e:
         entry["error"] = f"USN feed unavailable: {e}"
     st.distro_usns[codename] = entry
@@ -2223,7 +2260,8 @@ async def distro_upgrade(payload: DistroUpgradeRequest, request: Request):
                                 "eta_epoch": None, "error": None, "log_line": None,
                                 "pkg_total": None, "pkg_done": None,
                                 "started_at": None, "finished_at": None,
-                                "os_version": None, "verify": None, "backup": None}
+                                "os_version": None, "verify": None, "backup": None,
+                                "note": None}
                      for n in nodes},
            "order": [n["uid"] for n in nodes]}
     st.distro_job = job
@@ -2313,10 +2351,10 @@ async def _distro_upgrade_one(app_, store, job, node, ns):
             ns.update(phase=phase, pct=st.get("pct"), eta_epoch=st.get("eta_epoch"),
                       pkg_total=st.get("pkg_total"), pkg_done=st.get("pkg_done"),
                       os_version=st.get("os_version"), verify=st.get("verify"),
-                      log_line=tail[-1] if tail else None)
+                      note=st.get("note"), log_line=tail[-1] if tail else None)
             if phase == "done":
                 result = {"ok": True, **{k: st.get(k) for k in
-                          ("mode", "os_version", "verify", "needs_reboot")}}
+                          ("mode", "os_version", "verify", "needs_reboot", "note")}}
                 ns.update(status="done", pct=100, finished_at=time.time())
                 break
             if phase == "failed":
