@@ -43,8 +43,16 @@ Python mTLS orchestrator für ein 22-Node Nym Exit-Gateway Fleet. Zwei Komponent
 - Ein `index.html`, das ein Symlink ist, wird abgelehnt (`reason: "symlink"`): der Backup-Schritt würde sonst den Symlink-Zielinhalt ins web-servierte Verzeichnis kopieren.
 - **Bekannte Einschränkung von `FQDN_RE`** (aus der Referenzimplementierung übernommen, in `landing.py` UND agent-seitig): Labels mit doppeltem Bindestrich werden abgelehnt — also auch Punycode/IDN (`xn--…`). Für die aktuellen `nym-exit-XX01.hermes-stakepool.de`-Hostnames irrelevant. Der Fehler ist fail-closed: Rebuild stoppt hart und nennt den betroffenen Node, statt ihn stillschweigend auszulassen. Wenn je ein IDN-Hostname dazukommt, muss das Pattern in beiden Dateien angepasst werden.
 
+## Distro / OS upgrade
+- Feature-Split: `distro.py` (orchestrator, pure Planung/Ranking — testbar ohne Netz), `/api/distro/*` in `app.py` (Fetch + Fanout + Rolling-Job), Agent-Actions `os_info` / `distro_upgrade` / `distro_upgrade_status` (ab Agent 0.12.0), UI-Modal `du-*`.
+- **Der Upgrade läuft nie im Agent-Prozess.** Der Agent generiert einen self-contained stdlib-Runner (`render_distro_runner`, base64-JSON-Params gegen Escaping-Probleme) und startet ihn als transiente systemd-Unit `maestro-distro-upgrade` (`KillMode=process`). Treffpunkt ist ein JSON-State-File + Log unter CERTDIR — der Agent darf von apt neu gestartet oder die Box rebootet werden.
+- Reboot-Verifikation ist pull-basiert: State-File bleibt auf `rebooting`; sieht `distro_upgrade_status` via `/proc/stat` btime einen Boot NACH `started_at`, prüft es Services (nym-node, Exit-Ifaces, fail2ban) und flippt erst bei grün auf `done`, sonst meldet es `verifying` und der Orchestrator pollt weiter.
+- Orchestrator-Job: rolling (Semaphore, Default 1 Node gleichzeitig — das sind live Exit-Gateways, die rebooten). Unreachable ist mid-job **erwartet** (Reboot); erst >25 min Funkstille failt den Node. Cancel überspringt nur queued Nodes; laufendes apt wird nie abgebrochen.
+- Dry run (`/api/distro/check`) ändert auf den Nodes nichts außer optionalem `apt-get update`. Release-Katalog live von endoflife.date mit bewusst konservativem Static-Fallback (darf hinterherhinken, darf nie ein Release erfinden). CVE-Top-5 aus den Ubuntu Security Notices, gefiltert auf ops-relevante Pakete (`OPS_PACKAGES` in distro.py); Debian bekommt nur den DSA-Link, das ist gewollt und wird angezeigt, nicht verschluckt.
+- Ubuntu-LTS-Nodes bleiben auf dem LTS-Zug (nächstes LTS, nie non-LTS, nie Multi-Hop); Debian N→N+1 via sources-Rewrite. `up_to_date` heißt: kein Release-Sprung UND keine pending Packages.
+
 ## Versioning
-- Agent-Version steht auf **0.11.0** (`AGENT_VERSION` in `agent/agent.py`). Vor Annahmen über Feature-Verfügbarkeit fleet-weit den Agent-Versionsstring prüfen — nicht alle 23 Nodes laufen zwangsläufig auf derselben Agent-Version.
+- Agent-Version steht auf **0.12.0** (`AGENT_VERSION` in `agent/agent.py`; 0.12.0 = Distro-Upgrade-Actions). Vor Annahmen über Feature-Verfügbarkeit fleet-weit den Agent-Versionsstring prüfen — nicht alle 23 Nodes laufen zwangsläufig auf derselben Agent-Version.
 - Es gibt keine Capability-Negotiation: ein alter Agent antwortet auf eine unbekannte Action mit HTTP 400 `unknown action: ...`. Das ist das Feature-Detection-Signal. Achtung: `agent_exec` macht `raise_for_status()`, und httpx' Exception-Message enthält den Response-Body NICHT — für eine brauchbare Fehlermeldung `e.response.json()["error"]` auslesen (siehe `_landing_fanout`).
 
 ## Working conventions

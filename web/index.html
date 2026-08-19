@@ -223,6 +223,24 @@
   /* overlays that must float ABOVE an already-open modal (command results,
      throughput preview) — otherwise they render behind the triggering modal */
   .overlay.overlay-top{z-index:40}
+  /* distro-upgrade modal: dry-run rows, hover CVE tooltip, progress bars */
+  .du-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;border:1px solid var(--line);
+    border-radius:var(--r);padding:8px 10px;margin-bottom:6px;font-size:12px}
+  .du-row .name{font-weight:600}
+  .du-sub{font-size:11px;color:var(--muted)}
+  .du-cvewrap{position:relative;display:inline-block}
+  .du-cvewrap .du-cvetip{display:none;position:absolute;right:0;top:calc(100% + 6px);z-index:60;
+    width:460px;max-width:72vw;background:var(--surface);border:1px solid var(--line);
+    border-radius:var(--r);padding:10px 12px;box-shadow:0 10px 28px rgba(0,0,0,.28);
+    text-align:left;cursor:default}
+  .du-cvewrap:hover .du-cvetip{display:block}
+  .du-cve{padding:6px 0;border-bottom:1px solid var(--line);font-size:12px}
+  .du-cve:last-child{border-bottom:0}
+  .du-bar{flex:1 1 140px;min-width:120px;height:8px;border-radius:4px;background:var(--surface-2);
+    border:1px solid var(--line);overflow:hidden}
+  .du-bar>i{display:block;height:100%;background:var(--accent);transition:width .6s}
+  .du-log{flex-basis:100%;font-family:var(--mono);font-size:10.5px;color:var(--muted);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .overlay.open{display:flex}
   body:has(.overlay.open){overflow:hidden}
   .flag{font-size:15px;line-height:1}
@@ -512,6 +530,7 @@
     <button id="btn-ssh" onclick="openSsh()" disabled>SSH keys</button>
     <button id="btn-extra-blocks" onclick="openExtraBlocks()" disabled title="Install/verify NYM-EXIT abuse blocklist">Extra blocks</button>
     <button id="btn-update-agent" onclick="openAgentUpdate()" disabled title="Push the local agent to selected nodes">Update agent</button>
+    <button id="btn-distro" onclick="openDistro()" disabled title="Dry-run check of distro versions, compatibility & CVEs; rolling headless OS upgrades">OS upgrade</button>
     <button id="btn-landing" onclick="openLanding()" title="Rebuild and deploy the public node-overview page">Landing page</button>
     <button id="btn-tg" onclick="openTgPost()" title="Draft the Telegram delegation post from live stake saturation">TG post</button>
     <span class="spacer"></span>
@@ -893,6 +912,72 @@
     <div class="modal-actions">
       <span class="spacer" style="flex:1"></span>
       <button onclick="closeLanding()">Close</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="du-overlay">
+  <div class="modal wide">
+    <h2>OS upgrade · linux distro per node</h2>
+    <p class="sub">Checks what each node runs, what the latest stable release of its distro is, whether the jump is safe, and which known vulnerabilities the update closes — then upgrades headless over the mTLS agent channel, rolling through the fleet with live progress. The dry run changes nothing on the nodes.</p>
+
+    <div style="display:flex;flex-direction:column;gap:12px;margin-bottom:14px">
+
+      <div style="border:1px solid var(--line);border-radius:8px;padding:12px 14px">
+        <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">1 · Dry run — scan &amp; check</div>
+        <p style="font-size:12px;color:var(--muted);margin:0 0 8px">Reads distro, kernel and hardware from every selected node, compares against the latest stable release, and runs the compatibility checks. Hover the <b>CVEs</b> pill on a node to see the top 5 vulnerabilities its pending update fixes — ranked by severity across the packages this operation actually depends on (kernel, OpenSSH, OpenSSL, WireGuard, systemd, netfilter, fail2ban).</p>
+        <label class="f2b-check" style="font-size:12px;color:var(--muted);display:block;margin-bottom:8px"><input id="du-refresh" type="checkbox" checked>
+          Refresh package lists first (<span class="mono" style="font-size:11px">apt-get update</span> — the only thing the dry run touches)</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <button class="primary" id="du-dryrun" onclick="duDryRun()">Dry run</button>
+          <span class="du-sub" id="du-check-note"></span>
+        </div>
+        <div id="du-check" style="margin-top:10px"></div>
+        <div id="du-cves" style="margin-top:4px"></div>
+      </div>
+
+      <div style="border:1px solid var(--line);border-radius:8px;padding:12px 14px">
+        <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">2 · Upgrade</div>
+        <p style="font-size:12px;color:var(--muted);margin:0 0 8px">Runs detached on each node (survives agent restarts and the reboot), rolling through the selection so the fleet never loses more gateways at once than the window allows. A node that reboots is expected to go dark for a few minutes; it counts as done only after its services report back healthy.</p>
+        <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;margin-bottom:8px">
+          <label style="font-size:12px;color:var(--muted)">What to upgrade
+            <select id="du-mode" style="display:block;margin-top:3px;font-size:12px">
+              <option value="packages">Packages — all pending security &amp; point updates</option>
+              <option value="release">Release — move to the suggested distro release</option>
+            </select>
+          </label>
+          <label style="font-size:12px;color:var(--muted)">Reboot
+            <select id="du-reboot" style="display:block;margin-top:3px;font-size:12px">
+              <option value="auto">auto — only if the upgrade requires it</option>
+              <option value="always">always</option>
+              <option value="never">never (reboot manually later)</option>
+            </select>
+          </label>
+          <label style="font-size:12px;color:var(--muted)">Nodes at a time
+            <select id="du-conc" style="display:block;margin-top:3px;font-size:12px">
+              <option value="1">1 — safest</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+            </select>
+          </label>
+        </div>
+        <label class="f2b-check" style="font-size:12px;color:var(--muted);display:block;margin-bottom:8px"><input id="du-confirm" type="checkbox">
+          I understand these exit gateways will go offline (and likely reboot) during the upgrade</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="primary" id="du-start" onclick="duStart()">Start upgrade</button>
+          <button class="ghost" id="du-cancel" onclick="duCancel()" style="display:none">Cancel queued nodes</button>
+        </div>
+        <div id="du-overall" class="du-sub" style="margin-top:10px"></div>
+        <div id="du-progress" style="margin-top:6px"></div>
+      </div>
+
+    </div>
+
+    <p class="f2b-warn" style="margin-bottom:0">Needs agent <span class="mono">0.12.0</span> — older agents answer <span class="mono">unknown action</span>; push the agent first with <b>Update agent</b>. Cancel only skips nodes that haven't started; a running apt/do-release-upgrade is never aborted mid-flight.</p>
+
+    <div class="modal-actions">
+      <span class="spacer" style="flex:1"></span>
+      <button onclick="closeDistro()">Close</button>
     </div>
   </div>
 </div>
@@ -2405,6 +2490,7 @@ function updateBulk(){
   document.getElementById('btn-extra-blocks').disabled = reachable.length === 0;
   document.getElementById('btn-upgrade').disabled = reachable.length === 0;
   document.getElementById('btn-update-agent').disabled = reachable.length === 0;
+  document.getElementById('btn-distro').disabled = reachable.length === 0;
   if(sel.length === 0) note.textContent = 'Select one or more nodes to act on them.';
   else note.textContent = sel.length + ' selected · ' + reachable.length + ' reachable';
   // the landing modal's target picker counts the selection, so keep it in sync
@@ -3926,6 +4012,238 @@ function showResults(title, results){
 }
 function closeRes(){ document.getElementById('res-overlay').classList.remove('open'); }
 
+// ===== distro / OS upgrade ================================================
+// Dry run: /api/distro/check (scan + latest-release + compat + top-5 CVEs,
+// nothing changed on the nodes). Upgrade: rolling background job on the
+// orchestrator, polled here every 3s for live per-node progress + ETA.
+let duCheckData = null;
+let duTimer = null;
+
+function openDistro(){
+  document.getElementById('du-overlay').classList.add('open');
+  const sel = selectedNodes().filter(n => n.status && n.status.reachable);
+  document.getElementById('du-check-note').textContent =
+    sel.length ? sel.length + ' reachable node(s) selected' : 'select nodes in the table first';
+  duPollProgress(true);   // pick up a job that is already running
+}
+function closeDistro(){
+  document.getElementById('du-overlay').classList.remove('open');
+  if(duTimer){ clearInterval(duTimer); duTimer = null; }   // job keeps running server-side
+}
+
+function duTargets(){ return selectedNodes().filter(n => n.status && n.status.reachable); }
+
+function fmtEta(epoch){
+  if(!epoch) return '';
+  const s = Math.round(epoch - Date.now() / 1000);
+  if(s <= 30) return 'any moment';
+  if(s < 3600) return '≈ ' + Math.round(s / 60) + ' min left';
+  return '≈ ' + (s / 3600).toFixed(1) + ' h left';
+}
+
+const DU_PHASES = {
+  queued: 'queued', starting: 'starting', update: 'refreshing package lists',
+  simulate: 'calculating changes', install: 'downloading & installing',
+  autoremove: 'removing obsolete packages', prepare: 'installing pending updates first',
+  release_upgrade: 'release upgrade running', sources: 'rewriting apt sources',
+  upgrade_minimal: 'upgrading (minimal set)', full_upgrade: 'upgrading (full set)',
+  rebooting: 'rebooting…', verifying: 'back up — verifying services',
+  done: 'done', failed: 'failed', cancelled: 'cancelled',
+};
+function duPhaseLabel(p){ return DU_PHASES[p] || p || '—'; }
+
+function duCveTip(key){
+  const g = (duCheckData && duCheckData.cves && duCheckData.cves[key]) || null;
+  const tip = el('div','du-cvetip');
+  if(!g){ tip.append(el('div','du-sub','no CVE data — run the dry run')); return tip; }
+  if(g.error){
+    tip.append(el('div','du-sub', g.error));
+    if(g.source){ const a = el('div','du-sub'); a.innerHTML =
+      '<a href="' + g.source + '" target="_blank" rel="noopener">security tracker ↗</a>'; tip.append(a); }
+    return tip;
+  }
+  if(!(g.top || []).length){ tip.append(el('div','du-sub','no ops-relevant security notices in the feed right now')); return tip; }
+  tip.append(el('div','du-sub','Top fixes you pick up with this update — ranked by severity over the packages this fleet depends on:'));
+  g.top.forEach(u => {
+    const row = el('div','du-cve');
+    const head = el('div');
+    head.append(el('b', null, u.usn || ''), document.createTextNode(' · '));
+    const sev = el('span','pill ' + (u.score >= 7 ? 'bad' : u.score >= 4 ? 'warn' : ''), 'CVSS ' + u.score);
+    head.append(sev, document.createTextNode(' · ' + (u.packages || []).join(', ')));
+    row.append(head);
+    if(u.title) row.append(el('div','du-sub', u.title));
+    row.append(el('div','du-sub', '→ ' + u.why));
+    if((u.cves || []).length) row.append(el('div','du-sub', u.cves.join(' · ')
+      + (u.published ? ' · ' + u.published : '')));
+    tip.append(row);
+  });
+  return tip;
+}
+
+async function duDryRun(){
+  const sel = duTargets();
+  if(sel.length === 0){ toast('select reachable nodes first', true); return; }
+  const btn = document.getElementById('du-dryrun');
+  btn.disabled = true; btn.textContent = 'Scanning… (apt on ' + sel.length + ' nodes)';
+  try{
+    duCheckData = await api('/api/distro/check', {method:'POST', body: JSON.stringify(
+      {node_ids: sel.map(n => n.uid), refresh_lists: document.getElementById('du-refresh').checked})});
+    duRenderCheck();
+  }catch(e){ toast(e.message, true); }
+  btn.disabled = false; btn.textContent = 'Dry run';
+}
+
+function duRenderCheck(){
+  const box = document.getElementById('du-check'); box.innerHTML = '';
+  const note = document.getElementById('du-check-note');
+  if(!duCheckData) return;
+  note.textContent = 'release catalog: ' + (duCheckData.catalog_source || '?');
+  duCheckData.results.forEach(r => {
+    const row = el('div','du-row');
+    row.append(el('span','name', r.name || r.node_id));
+    if(!r.ok && !r.scan){
+      const e = el('span','du-sub', r.error || 'scan failed'); e.style.color = 'var(--danger)';
+      row.append(e); box.append(row); return;
+    }
+    const s = r.scan, os = s.os || {}, plan = r.plan || {};
+    row.append(el('span','pill info', (os.pretty || (os.id + ' ' + os.version_id))));
+    const rel = plan.release;
+    if(rel){
+      const p = el('span','pill warn', '→ ' + (plan.distro === 'debian' ? 'Debian ' : 'Ubuntu ')
+        + rel.target_cycle + (rel.lts ? ' LTS' : '') + (rel.target_codename ? ' (' + rel.target_codename + ')' : ''));
+      p.title = 'suggested release upgrade' + (rel.further ? ' — ' + rel.further + ' more step(s) after this one: ' + rel.path.join(' → ') : '');
+      row.append(p);
+    } else if(plan.up_to_date){
+      row.append(el('span','pill ok','up to date'));
+    }
+    const pend = plan.packages || {};
+    if(pend.upgraded != null && (pend.upgraded || pend.new))
+      row.append(el('span','pill', (pend.upgraded + (pend.new || 0)) + ' pkg updates'
+        + (pend.security ? ' (' + pend.security + ' security)' : '')));
+    if(pend.error) row.append(el('span','pill bad','apt: ' + pend.error.slice(0, 60)));
+    if(s.reboot_required) row.append(el('span','pill warn','reboot pending'));
+
+    const bad = (r.checks || []).filter(c => !c.ok && c.level === 'block');
+    const warns = (r.checks || []).filter(c => !c.ok && c.level === 'warn');
+    if(bad.length){
+      const p = el('span','pill bad','blocked: ' + bad.map(c => c.check).join(', '));
+      p.title = bad.map(c => c.check + ' — ' + c.detail).join('\n');
+      row.append(p);
+    } else {
+      const p = el('span','pill ok','compatible');
+      p.title = (r.checks || []).map(c => (c.ok ? '✓ ' : '⚠ ') + c.check + (c.detail ? ' — ' + c.detail : '')).join('\n');
+      row.append(p);
+      if(warns.length){ const w = el('span','pill warn', warns.map(c => c.check).join(', '));
+        w.title = warns.map(c => c.detail).join('\n'); row.append(w); }
+    }
+
+    const spacer = el('span'); spacer.style.flex = '1'; row.append(spacer);
+    const wrap = el('span','du-cvewrap');
+    const cnt = ((duCheckData.cves || {})[r.cve_key] || {}).top || [];
+    wrap.append(el('span','pill ' + (cnt.some(u => u.score >= 7) ? 'bad' : 'info'),
+      'CVEs' + (cnt.length ? ' · ' + cnt.length : '')));
+    wrap.append(duCveTip(r.cve_key));
+    row.append(wrap);
+
+    const hw = el('div','du-log');
+    hw.textContent = 'kernel ' + s.kernel + ' · ' + s.arch + ' · '
+      + ((s.cpu || {}).cores || '?') + '× ' + (((s.cpu || {}).model) || 'cpu').replace(/\s+/g,' ')
+      + ' · ' + (s.mem_total ? fmtBytes(s.mem_total) + ' RAM' : 'RAM ?')
+      + ' · ' + (s.disk ? fmtBytes(s.disk.free) + ' disk free' : 'disk ?')
+      + (s.virt ? ' · ' + s.virt : '');
+    row.append(hw);
+    box.append(row);
+  });
+  const anyRelease = duCheckData.results.some(r => r.plan && r.plan.release);
+  document.getElementById('du-mode').value = anyRelease ? 'release' : 'packages';
+}
+
+async function duStart(){
+  const sel = duTargets();
+  if(sel.length === 0){ toast('select reachable nodes first', true); return; }
+  if(!duCheckData){ toast('run the dry run first', true); return; }
+  if(!document.getElementById('du-confirm').checked){ toast('tick the confirmation first', true); return; }
+  const mode = document.getElementById('du-mode').value;
+  const reboot = document.getElementById('du-reboot').value;
+  const conc = parseInt(document.getElementById('du-conc').value, 10) || 1;
+  if(!confirm('Upgrade ' + sel.length + ' node(s) — ' +
+      (mode === 'release' ? 'RELEASE upgrade to the suggested distro release' : 'all pending package updates') +
+      ', reboot: ' + reboot + ', ' + conc + ' node(s) at a time.\n\n' +
+      'Each node goes offline during install/reboot. Continue?')) return;
+  const btn = document.getElementById('du-start');
+  btn.disabled = true;
+  try{
+    await api('/api/distro/upgrade', {method:'POST', body: JSON.stringify(
+      {node_ids: sel.map(n => n.uid), mode, reboot, concurrency: conc, confirm: true})});
+    toast('Upgrade started — rolling through ' + sel.length + ' node(s)');
+    duPollProgress(true);
+  }catch(e){ toast(e.message, true); btn.disabled = false; }
+}
+
+async function duCancel(){
+  try{
+    const r = await api('/api/distro/cancel', {method:'POST', body: '{}'});
+    toast(r.note || 'cancelled');
+  }catch(e){ toast(e.message, true); }
+}
+
+function duPollProgress(start){
+  if(start && !duTimer) duTimer = setInterval(duPollProgress, 3000);
+  api('/api/distro/progress').then(p => {
+    duRenderProgress(p);
+    if(!p.job && duTimer){ clearInterval(duTimer); duTimer = null; }  // nothing to watch
+    if(p.job && p.job.finished && duTimer){
+      clearInterval(duTimer); duTimer = null;
+      document.getElementById('du-start').disabled = false;
+      const c = p.counts || {};
+      toast('OS upgrade finished: ' + (c.done || 0) + ' ok, ' + (c.failed || 0) + ' failed'
+        + (c.cancelled ? ', ' + c.cancelled + ' cancelled' : ''), (c.failed || 0) > 0);
+      load();
+    }
+  }).catch(() => {});
+}
+
+function duRenderProgress(p){
+  const box = document.getElementById('du-progress');
+  const head = document.getElementById('du-overall');
+  const cancelBtn = document.getElementById('du-cancel');
+  if(!p || !p.job){ head.textContent = ''; box.innerHTML = ''; cancelBtn.style.display = 'none'; return; }
+  const c = p.counts || {}, total = (p.nodes || []).length;
+  const running = !p.job.finished;
+  cancelBtn.style.display = running ? '' : 'none';
+  document.getElementById('du-start').disabled = running;
+  head.textContent = (running ? 'Upgrading (' + p.job.mode + ', ' + p.job.concurrency + ' at a time) — '
+                              : 'Last run (' + p.job.mode + ') — ')
+    + (c.done || 0) + '/' + total + ' done'
+    + ((c.failed || 0) ? ' · ' + c.failed + ' failed' : '')
+    + ((c.cancelled || 0) ? ' · ' + c.cancelled + ' cancelled' : '')
+    + (running && p.overall_eta_epoch ? ' · overall ' + fmtEta(p.overall_eta_epoch) : '');
+  box.innerHTML = '';
+  (p.nodes || []).forEach(ns => {
+    const row = el('div','du-row');
+    row.append(el('span','name', ns.name));
+    const st = ns.status;
+    row.append(el('span','pill ' + (st === 'done' ? 'ok' : st === 'failed' ? 'bad'
+      : st === 'running' ? 'info' : ''), duPhaseLabel(ns.phase)));
+    const bar = el('div','du-bar'); const fill = document.createElement('i');
+    fill.style.width = Math.max(0, Math.min(100, ns.pct || 0)) + '%';
+    if(st === 'failed') fill.style.background = 'var(--danger)';
+    if(st === 'done') fill.style.background = 'var(--ok)';
+    bar.append(fill); row.append(bar);
+    row.append(el('span','du-sub', (ns.pct != null ? Math.round(ns.pct) + '%' : '')
+      + (ns.pkg_total ? ' · ' + (ns.pkg_done || 0) + '/' + (ns.pkg_total * 3) + ' steps' : '')));
+    if(st === 'running' && ns.eta_epoch) row.append(el('span','du-sub', fmtEta(ns.eta_epoch)));
+    if(ns.os_version && st === 'done') row.append(el('span','pill ok','now on ' + ns.os_version));
+    if(ns.verify && st !== 'done'){
+      const badv = ns.verify.filter(v => !v.ok);
+      if(badv.length) row.append(el('span','pill warn', 'waiting: ' + badv.map(v => v.check).join(', ')));
+    }
+    if(ns.error){ const e = el('div','du-log', ns.error); e.style.color = 'var(--danger)'; row.append(e); }
+    else if(ns.log_line && st === 'running') row.append(el('div','du-log', ns.log_line));
+    box.append(row);
+  });
+}
+
 // ===== wallets ============================================================
 // Orchestrator-side: every call hits /api/wallet/* on this localhost app; keys
 // never leave this machine. Wallet selection is independent of node selection.
@@ -4308,7 +4626,8 @@ document.getElementById('w-overlay').addEventListener('click', e => { if(e.targe
 document.getElementById('wm-overlay').addEventListener('click', e => { if(e.target.id === 'wm-overlay') closeWalletManage(); });
 document.getElementById('lp-overlay').addEventListener('click', e => { if(e.target.id === 'lp-overlay') closeLanding(); });
 document.getElementById('tg-overlay').addEventListener('click', e => { if(e.target.id === 'tg-overlay') closeTgPost(); });
-document.addEventListener('keydown', e => { if(e.key === 'Escape'){ closeModal(); closeToggle(); closeSF(); closeAU(); closeUp(); closeRes(); closeTput(); closeF2b(); closeSsh(); closeWallets(); closeWalletManage(); closeLanding(); closeTgPost(); } });
+document.getElementById('du-overlay').addEventListener('click', e => { if(e.target.id === 'du-overlay') closeDistro(); });
+document.addEventListener('keydown', e => { if(e.key === 'Escape'){ closeModal(); closeToggle(); closeSF(); closeAU(); closeUp(); closeRes(); closeTput(); closeF2b(); closeSsh(); closeWallets(); closeWalletManage(); closeLanding(); closeTgPost(); closeDistro(); } });
 
 health();
 load();

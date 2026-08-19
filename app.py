@@ -31,6 +31,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, field_validator
 
 from store import Conflict, Store
+import distro
 import landing
 import wallet
 
@@ -1100,6 +1101,19 @@ class LandingRevertRequest(BaseModel):
     version: str | None = None
 
 
+class DistroNodesRequest(BaseModel):
+    node_ids: list[str]
+    refresh_lists: bool = True   # apt-get update before counting pending updates
+
+
+class DistroUpgradeRequest(BaseModel):
+    node_ids: list[str]
+    mode: str = "packages"       # packages | release
+    reboot: str = "auto"         # auto | always | never
+    concurrency: int = 1         # rolling window; 1 = one gateway down at a time
+    confirm: bool = False
+
+
 def local_agent_source():
     data = (BASE / "agent" / "agent.py").read_bytes()
     text = data.decode("utf-8")
@@ -1994,6 +2008,345 @@ async def landing_revert(payload: LandingRevertRequest, request: Request):
     status = "done" if ok_count == len(results) else ("failed" if ok_count == 0 else "partial")
     store.finish_job(job_id, status)
     return {"job_id": job_id, "status": status, "results": results}
+
+
+# ===== distro / OS upgrade ==================================================
+# The dry run (scan + check) changes nothing on the nodes beyond an optional
+# `apt-get update`. The upgrade itself is a rolling background job — default
+# one node at a time, because every target is a live exit gateway that goes
+# through a reboot on the way.
+
+_DISTRO_CACHE_TTL = 6 * 3600       # release catalog + USN feed
+_DISTRO_SCAN_TTL = 15 * 60         # node scans reused by /check inside this window
+_DISTRO_NODE_TIMEOUT = 100 * 60    # hard cap per node
+_DISTRO_OFFLINE_GRACE = 25 * 60    # max unreachable stretch (reboot + fsck headroom)
+_DISTRO_VERIFY_GRACE = 12 * 60     # services must be back this long after boot
+
+
+def _distro_state(app_):
+    if not hasattr(app_.state, "distro_scan"):
+        app_.state.distro_scan = {}       # uid -> {"ts", "res"}
+        app_.state.distro_catalog = None  # {"ts", "catalog", "source"}
+        app_.state.distro_usns = {}       # codename -> {"ts", "top", "source", "error"}
+        app_.state.distro_plans = {}      # uid -> plan from the last /check
+        app_.state.distro_job = None
+    return app_.state
+
+
+async def _distro_fanout(app_, store, nodes, action, params, timeout, label):
+    async def one(node):
+        try:
+            res = await agent_exec(app_, node, action, params or {}, timeout=timeout)
+            ok = bool(res.get("ok", True))
+        except Exception as e:
+            # httpx's exception message drops the response body — dig the
+            # agent's own error out before reporting it (see _landing_fanout)
+            msg = str(e)
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                try:
+                    msg = ((resp.json() or {}).get("error") or "").strip() or msg
+                except Exception:
+                    pass
+            if "unknown action" in msg:
+                msg = ("this node's agent predates the distro actions — "
+                       "push agent 0.12.0 to it first with Update agent")
+            res, ok = {"ok": False, "error": msg}, False
+        if isinstance(res, dict):
+            res.setdefault("kind", "distro")
+        store.audit("ui", label, None, node["uid"], json.dumps(res))
+        return {"uid": node["uid"], "node_id": node["node_id"], "name": node["name"],
+                "ok": ok, "result": res}
+    return await asyncio.gather(*[one(n) for n in nodes])
+
+
+async def _distro_catalog(app_):
+    """Latest-release catalog, live from endoflife.date with a conservative
+    static fallback (which may lag, but never invents a release)."""
+    st = _distro_state(app_)
+    c = st.distro_catalog
+    if c and time.time() - c["ts"] < _DISTRO_CACHE_TTL:
+        return c
+    try:
+        catalog, source = {}, "live (endoflife.date)"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for did, url in distro.ENDOFLIFE_URLS.items():
+                r = await client.get(url)
+                r.raise_for_status()
+                rows = distro.parse_endoflife(did, r.json())
+                if not rows:
+                    raise ValueError(f"empty catalog for {did}")
+                catalog[did] = rows
+    except Exception as e:
+        catalog = dict(distro.STATIC_CATALOG)
+        source = f"static fallback — endoflife.date unreachable ({e.__class__.__name__})"
+    st.distro_catalog = {"ts": time.time(), "catalog": catalog, "source": source}
+    return st.distro_catalog
+
+
+async def _distro_usn_top(app_, codename):
+    """Top ops-relevant USNs for one Ubuntu release, cached."""
+    st = _distro_state(app_)
+    c = st.distro_usns.get(codename)
+    if c and time.time() - c["ts"] < _DISTRO_CACHE_TTL:
+        return c
+    url = distro.USN_URL.format(codename=codename)
+    entry = {"ts": time.time(), "top": [], "source": url, "error": None}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(url, headers={"Accept": "application/json"})
+            r.raise_for_status()
+            entry["top"] = distro.rank_usns((r.json() or {}).get("notices"), limit=5)
+    except Exception as e:
+        entry["error"] = f"USN feed unavailable: {e}"
+    st.distro_usns[codename] = entry
+    return entry
+
+
+@app.post("/api/distro/scan")
+async def distro_scan(payload: DistroNodesRequest, request: Request):
+    """Inventory only: distro, kernel, hardware, pending updates per node."""
+    store, nodes = _eb_targets(request, payload.node_ids)
+    params = {"check_updates": True, "refresh_lists": payload.refresh_lists}
+    results = await _distro_fanout(request.app, store, nodes, "os_info", params,
+                                   240, "distro_scan")
+    st = _distro_state(request.app)
+    for r in results:
+        if r["ok"]:
+            st.distro_scan[r["uid"]] = {"ts": time.time(), "res": r["result"]}
+    return {"results": results}
+
+
+@app.post("/api/distro/check")
+async def distro_check(payload: DistroNodesRequest, request: Request):
+    """The dry run: per node the current OS + hardware, the suggested upgrade,
+    compatibility checks, and per release the top ops-relevant CVEs. Nothing is
+    changed on the nodes (beyond the optional apt list refresh in the scan)."""
+    store, nodes = _eb_targets(request, payload.node_ids)
+    app_ = request.app
+    st = _distro_state(app_)
+    now = time.time()
+    fresh = {n["uid"] for n in nodes
+             if (e := st.distro_scan.get(n["uid"])) and now - e["ts"] < _DISTRO_SCAN_TTL}
+    scan_errors = {}
+    stale = [n for n in nodes if n["uid"] not in fresh]
+    if stale:
+        params = {"check_updates": True, "refresh_lists": payload.refresh_lists}
+        for r in await _distro_fanout(app_, store, stale, "os_info", params,
+                                      240, "distro_scan"):
+            if r["ok"]:
+                st.distro_scan[r["uid"]] = {"ts": now, "res": r["result"]}
+            else:
+                scan_errors[r["uid"]] = r["result"].get("error") or "scan failed"
+    cat = await _distro_catalog(app_)
+
+    results, cves = [], {}
+    for n in nodes:
+        uid = n["uid"]
+        cached = st.distro_scan.get(uid)
+        if not cached:
+            results.append({"uid": uid, "node_id": n["node_id"], "name": n["name"],
+                            "ok": False, "error": scan_errors.get(uid, "scan failed")})
+            continue
+        osinfo = cached["res"]
+        plan = distro.plan_upgrade(osinfo, cat["catalog"])
+        checks = distro.compat_checks(osinfo, plan)
+        st.distro_plans[uid] = plan
+        os_ = osinfo.get("os") or {}
+        cve_key = os_.get("codename") if os_.get("id") == "ubuntu" else os_.get("id")
+        results.append({"uid": uid, "node_id": n["node_id"], "name": n["name"],
+                        "ok": plan.get("error") is None, "error": plan.get("error"),
+                        "scan": osinfo, "plan": plan, "checks": checks,
+                        "compat_ok": distro.compat_ok(checks), "cve_key": cve_key})
+        if cve_key and cve_key not in cves:
+            if os_.get("id") == "ubuntu":
+                e = await _distro_usn_top(app_, cve_key)
+                cves[cve_key] = {k: e.get(k) for k in ("top", "source", "error")}
+            elif os_.get("id") == "debian":
+                cves[cve_key] = {"top": [], "source": distro.DEBIAN_SECURITY_URL,
+                                 "error": "no compact Debian feed — see the DSA list"}
+    return {"results": results, "cves": cves, "catalog_source": cat["source"]}
+
+
+@app.post("/api/distro/upgrade")
+async def distro_upgrade(payload: DistroUpgradeRequest, request: Request):
+    """Start the rolling headless upgrade job. Requires a prior dry run for
+    every target (that is where mode feasibility and compat were established)
+    and an explicit confirm — these nodes reboot."""
+    store, nodes = _eb_targets(request, payload.node_ids)
+    app_ = request.app
+    st = _distro_state(app_)
+    if payload.mode not in ("packages", "release"):
+        raise HTTPException(400, "mode must be packages or release")
+    if payload.reboot not in ("auto", "always", "never"):
+        raise HTTPException(400, "reboot must be auto, always or never")
+    if not payload.confirm:
+        raise HTTPException(400, "confirm required — this upgrade reboots exit gateways")
+    if st.distro_job and not st.distro_job.get("finished"):
+        raise HTTPException(409, "a distro upgrade job is already running")
+    conc = max(1, min(int(payload.concurrency or 1), 4))
+
+    missing = [n["name"] or n["node_id"] for n in nodes if n["uid"] not in st.distro_plans]
+    if missing:
+        raise HTTPException(400, "run the dry run first — no check result for: "
+                            + ", ".join(missing[:5]))
+    blocked = []
+    for n in nodes:
+        plan = st.distro_plans[n["uid"]]
+        if payload.mode == "release" and not plan.get("release"):
+            blocked.append(f'{n["name"] or n["node_id"]} (no release upgrade available)')
+        osinfo = (st.distro_scan.get(n["uid"]) or {}).get("res")
+        if osinfo and not distro.compat_ok(distro.compat_checks(osinfo, plan)):
+            blocked.append(f'{n["name"] or n["node_id"]} (compatibility check failed)')
+    if blocked:
+        raise HTTPException(400, "not starting: " + "; ".join(blocked[:5]))
+
+    job_id = uuid.uuid4().hex
+    job = {"job_id": job_id, "started_at": time.time(), "finished": False,
+           "cancelled": False, "mode": payload.mode, "reboot": payload.reboot,
+           "concurrency": conc,
+           "nodes": {n["uid"]: {"uid": n["uid"], "name": n["name"] or n["node_id"],
+                                "status": "queued", "phase": "queued", "pct": 0,
+                                "eta_epoch": None, "error": None, "log_line": None,
+                                "pkg_total": None, "pkg_done": None,
+                                "started_at": None, "finished_at": None,
+                                "os_version": None, "verify": None}
+                     for n in nodes},
+           "order": [n["uid"] for n in nodes]}
+    st.distro_job = job
+    store.record_job(job_id, "distro_upgrade",
+                     json.dumps({"mode": payload.mode, "reboot": payload.reboot,
+                                 "concurrency": conc, "nodes": len(nodes)}), len(nodes))
+    asyncio.create_task(_distro_job_run(app_, nodes, job))
+    return {"job_id": job_id, "queued": len(nodes), "concurrency": conc}
+
+
+async def _distro_job_run(app_, nodes, job):
+    store = app_.state.store
+    sem = asyncio.Semaphore(job["concurrency"])
+
+    async def one(node):
+        ns = job["nodes"][node["uid"]]
+        async with sem:
+            if job["cancelled"]:
+                ns.update(status="cancelled", phase="cancelled")
+                store.record_target(job["job_id"], node["uid"], "failed", None,
+                                    json.dumps({"ok": False, "error": "cancelled before start"}))
+                return
+            await _distro_upgrade_one(app_, store, job, node, ns)
+
+    try:
+        await asyncio.gather(*[one(n) for n in nodes])
+    finally:
+        job["finished"] = True
+        job["finished_at"] = time.time()
+        oks = sum(1 for ns in job["nodes"].values() if ns["status"] == "done")
+        status = "done" if oks == len(job["nodes"]) else ("failed" if oks == 0 else "partial")
+        store.finish_job(job["job_id"], status)
+
+
+async def _distro_upgrade_one(app_, store, job, node, ns):
+    """Drive one node through start → poll → (reboot gap) → verify → done.
+    The node being unreachable is EXPECTED mid-job (reboot, agent restarted by
+    apt) — only a long silence fails it."""
+    plan = _distro_state(app_).distro_plans.get(node["uid"]) or {}
+    params = {"mode": job["mode"], "reboot": job["reboot"]}
+    if job["mode"] == "release":
+        rel = plan.get("release") or {}
+        params["target"] = rel.get("target_cycle")
+        params["target_codename"] = rel.get("target_codename")
+    ns.update(status="running", phase="starting", started_at=time.time())
+    result = {"ok": False}
+    try:
+        res = await agent_exec(app_, node, "distro_upgrade", params, timeout=60)
+        if not res.get("ok"):
+            raise RuntimeError(res.get("error") or "agent refused to start the upgrade")
+        deadline = time.time() + _DISTRO_NODE_TIMEOUT
+        offline_since = None
+        verify_since = None
+        while time.time() < deadline:
+            await asyncio.sleep(5)
+            try:
+                st = await agent_exec(app_, node, "distro_upgrade_status", {}, timeout=15)
+                offline_since = None
+            except Exception:
+                if offline_since is None:
+                    offline_since = time.time()
+                    ns["phase"] = "offline — rebooting or agent restarting"
+                elif time.time() - offline_since > _DISTRO_OFFLINE_GRACE:
+                    raise RuntimeError(
+                        f"node stayed unreachable for {_DISTRO_OFFLINE_GRACE // 60} min "
+                        "— check it manually (console/SSH)")
+                continue
+            phase = st.get("phase")
+            tail = [ln for ln in (st.get("log_tail") or "").strip().splitlines() if ln.strip()]
+            ns.update(phase=phase, pct=st.get("pct"), eta_epoch=st.get("eta_epoch"),
+                      pkg_total=st.get("pkg_total"), pkg_done=st.get("pkg_done"),
+                      os_version=st.get("os_version"), verify=st.get("verify"),
+                      log_line=tail[-1] if tail else None)
+            if phase == "done":
+                result = {"ok": True, **{k: st.get(k) for k in
+                          ("mode", "os_version", "verify", "needs_reboot")}}
+                ns.update(status="done", pct=100, finished_at=time.time())
+                break
+            if phase == "failed":
+                raise RuntimeError(st.get("error") or "upgrade failed — see the node's log")
+            if phase == "verifying":
+                verify_since = verify_since or time.time()
+                if time.time() - verify_since > _DISTRO_VERIFY_GRACE:
+                    bad = [c["check"] for c in (st.get("verify") or []) if not c["ok"]]
+                    raise RuntimeError("upgrade finished but services did not come back: "
+                                       + (", ".join(bad) or "unknown"))
+        else:
+            raise RuntimeError(f"timed out after {_DISTRO_NODE_TIMEOUT // 60} min")
+    except Exception as e:
+        result = {"ok": False, "error": str(e)}
+        ns.update(status="failed", phase="failed", error=str(e), finished_at=time.time())
+    store.record_target(job["job_id"], node["uid"],
+                        "done" if result.get("ok") else "failed", None, json.dumps(result))
+    store.audit("ui", "distro_upgrade", job["job_id"], node["uid"], json.dumps(result))
+    with contextlib.suppress(Exception):
+        await repoll_nodes(app_, [node])
+
+
+@app.get("/api/distro/progress")
+async def distro_progress(request: Request):
+    st = _distro_state(request.app)
+    job = st.distro_job
+    if not job:
+        return {"job": None}
+    counts = {"done": 0, "failed": 0, "running": 0, "queued": 0, "cancelled": 0}
+    for ns in job["nodes"].values():
+        counts[ns["status"]] = counts.get(ns["status"], 0) + 1
+    # rough overall ETA: the latest in-flight ETA, plus queued nodes at the
+    # average duration of the ones already finished (10 min until known)
+    overall_eta = None
+    if not job["finished"]:
+        now = time.time()
+        durations = [ns["finished_at"] - ns["started_at"] for ns in job["nodes"].values()
+                     if ns["status"] == "done" and ns["started_at"] and ns["finished_at"]]
+        avg = (sum(durations) / len(durations)) if durations else 600
+        inflight = [ns["eta_epoch"] for ns in job["nodes"].values()
+                    if ns["status"] == "running" and ns.get("eta_epoch")]
+        base = max(inflight) if inflight else now
+        overall_eta = base + counts["queued"] * avg / job["concurrency"]
+    return {"job": {k: job.get(k) for k in ("job_id", "started_at", "finished",
+                                            "finished_at", "cancelled", "mode",
+                                            "reboot", "concurrency")},
+            "counts": counts, "overall_eta_epoch": overall_eta,
+            "nodes": [job["nodes"][u] for u in job["order"]]}
+
+
+@app.post("/api/distro/cancel")
+async def distro_cancel(request: Request):
+    _require_pki(request)
+    st = _distro_state(request.app)
+    job = st.distro_job
+    if not job or job.get("finished"):
+        raise HTTPException(400, "no distro upgrade job is running")
+    job["cancelled"] = True
+    return {"ok": True, "note": "queued nodes will be skipped; in-flight upgrades "
+                                "run to completion (apt cannot be safely aborted)"}
 
 
 @app.get("/api/wallet/list")

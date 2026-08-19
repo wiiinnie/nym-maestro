@@ -19,6 +19,7 @@ Config comes from the environment (set by the systemd unit / agent.env):
 The agent is additive: it discovers the already-installed node setup and never
 re-provisions it. Write actions arrive in later slices; for now it is read-only.
 """
+import base64
 import contextlib
 import hashlib
 import ipaddress
@@ -40,7 +41,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-AGENT_VERSION = "0.11.0"
+AGENT_VERSION = "0.12.0"
 
 try:
     with open(os.path.abspath(__file__), "rb") as _sf:
@@ -2821,7 +2822,541 @@ def act_landing_revert(params):
             "error": None if ok else "restored page does not carry the expected version"}
 
 
+# --- distro / OS upgrade ----------------------------------------------------
+# The upgrade itself never runs inside the agent process: apt can restart
+# services (including this agent) mid-flight, and a release upgrade ends in a
+# reboot. The agent only writes a generated stdlib runner script and launches
+# it as a detached transient systemd unit; both sides meet at a JSON state
+# file + log that `distro_upgrade_status` reports back to the orchestrator.
+
+DISTRO_STATE = os.path.join(CERTDIR, "distro-upgrade.state.json")
+DISTRO_LOG = os.path.join(CERTDIR, "distro-upgrade.log")
+DISTRO_RUNNER = os.path.join(CERTDIR, "distro-upgrade-runner.py")
+DISTRO_UNIT = "maestro-distro-upgrade"
+
+
+def parse_os_release(text):
+    """Parse /etc/os-release into a dict (values unquoted)."""
+    out = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        out[k.strip()] = v
+    return out
+
+
+def parse_meminfo_total(text):
+    """MemTotal from /proc/meminfo, in bytes (or None)."""
+    m = re.search(r"^MemTotal:\s+(\d+)\s*kB", text or "", re.M)
+    return int(m.group(1)) * 1024 if m else None
+
+
+def parse_cpu_info(text):
+    """{model, cores} from /proc/cpuinfo (x86 + arm shapes)."""
+    cores = len(re.findall(r"^processor\s*:", text or "", re.M))
+    m = re.search(r"^model name\s*:\s*(.+)$", text or "", re.M)
+    if not m:  # arm: no "model name" per core, but a "Model" line at the end
+        m = re.search(r"^Model\s*:\s*(.+)$", text or "", re.M)
+    return {"model": m.group(1).strip() if m else None, "cores": cores or None}
+
+
+def parse_apt_counts(text):
+    """(upgraded, newly_installed, security) from `apt-get -s full-upgrade`.
+
+    `security` counts the Inst lines pulling from a -security pocket — the
+    packages whose pending update is a security fix, not just a version bump.
+    """
+    m = re.search(r"(\d+) upgraded, (\d+) newly installed", text or "")
+    if not m:
+        return None, None, None
+    security = len(re.findall(r"^Inst\s.*-security", text or "", re.M))
+    return int(m.group(1)), int(m.group(2)), security
+
+
+def _read_text(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+def _tail_text(path, nbytes=1600):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - nbytes))
+            return f.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+
+
+def act_os_info(params):
+    """Inventory for the upgrade planner: distro, kernel, hardware, pending
+    updates. Read-only apart from an optional `apt-get update` to refresh the
+    package lists so the pending counts are current."""
+    osr = parse_os_release(_read_text("/etc/os-release") or "")
+    un = os.uname()
+    rc, virt, _ = _run(["systemd-detect-virt"], timeout=5)
+    pending = {"upgraded": None, "new": None, "security": None, "error": None}
+    if params.get("check_updates", True):
+        if params.get("refresh_lists"):
+            _run(["apt-get", "-q", "update"], timeout=180, merge=True)
+        rc1, out1, err1 = _run(["apt-get", "-s", "-o", "Debug::NoLocking=true",
+                                "full-upgrade"], timeout=120)
+        up, new, sec = parse_apt_counts(out1)
+        if rc1 == 0 and up is not None:
+            pending = {"upgraded": up, "new": new, "security": sec, "error": None}
+        else:
+            pending["error"] = (err1 or out1 or "apt-get simulate failed").strip()[-400:]
+    return {
+        "ok": True, "kind": "osinfo",
+        "os": {"id": (osr.get("ID") or "").lower() or None,
+               "version_id": osr.get("VERSION_ID"),
+               "codename": (osr.get("VERSION_CODENAME") or "").lower() or None,
+               "pretty": osr.get("PRETTY_NAME")},
+        "kernel": un.release, "arch": un.machine,
+        "cpu": parse_cpu_info(_read_text("/proc/cpuinfo") or ""),
+        "mem_total": parse_meminfo_total(_read_text("/proc/meminfo") or ""),
+        "disk": read_disk(),
+        "virt": (virt or "").strip() if rc == 0 else None,
+        "python": ".".join(str(v) for v in sys.version_info[:3]),
+        "pending": pending,
+        "reboot_required": os.path.exists("/var/run/reboot-required"),
+        "do_release_upgrade": bool(shutil.which("do-release-upgrade")),
+        "upgrade_state": _distro_state_summary(),
+    }
+
+
+# The runner is deliberately self-contained (stdlib, no imports from the
+# agent): once systemd-run detaches it, the agent may be restarted by apt or
+# the whole box rebooted under it. @PARAMS@ is base64-JSON so no quoting or
+# escape sequence in a param can break the generated source.
+DISTRO_RUNNER_TEMPLATE = r'''#!/usr/bin/env python3
+"""Generated by nym-maestro-agent: headless distro upgrade, one shot.
+Progress protocol: JSON state file (atomic replace) + append-only log."""
+import base64, json, os, re, subprocess, sys, time, traceback
+
+PARAMS = json.loads(base64.b64decode("@PARAMS@").decode("utf-8"))
+STATE, LOG = PARAMS["state_file"], PARAMS["log_file"]
+
+_state = {"version": 1, "mode": PARAMS["mode"], "reboot": PARAMS["reboot"],
+          "started_at": int(time.time()), "phase": "starting", "pct": 0,
+          "pkg_total": None, "pkg_done": 0, "eta_epoch": None, "error": None,
+          "needs_reboot": False, "finished_at": None,
+          "target": PARAMS.get("target"), "phases": []}
+
+
+def save(**kw):
+    _state.update(kw)
+    pct = _state.get("pct") or 0
+    # Overall ETA: linear projection over the whole job from the fraction
+    # done so far; refines as phases complete. Reboot adds a fixed buffer.
+    if 3 <= pct < 100 and _state["phase"] not in ("done", "failed"):
+        elapsed = int(time.time()) - _state["started_at"]
+        eta = _state["started_at"] + int(elapsed * 100.0 / pct)
+        if _state["reboot"] != "never":
+            eta += 120
+        _state["eta_epoch"] = eta
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(_state, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, STATE)
+
+
+def log(msg):
+    with open(LOG, "a") as f:
+        f.write(time.strftime("[%H:%M:%S] ") + msg.rstrip() + "\n")
+
+
+def phase(name, pct):
+    _state["phases"].append({"phase": name, "ts": int(time.time())})
+    save(phase=name, pct=pct)
+    log("== phase: " + name)
+
+
+def fail(msg):
+    log("FAILED: " + msg)
+    save(phase="failed", error=msg[:500], finished_at=int(time.time()))
+    sys.exit(1)
+
+
+APT_ENV = dict(os.environ, DEBIAN_FRONTEND="noninteractive",
+               NEEDRESTART_MODE="a", UCF_FORCE_CONFFOLD="1")
+APT_OPTS = ["-y", "-o", "Dpkg::Options::=--force-confdef",
+            "-o", "Dpkg::Options::=--force-confold"]
+# every package produces roughly one Get:, one Unpacking and one Setting up
+MARK = re.compile(r"^(Unpacking |Setting up |Preparing to unpack |Get:)")
+
+
+def run_stream(cmd, base_pct, span_pct, markers_total):
+    """Run cmd, tee output to LOG, advance pct as marker lines go by."""
+    log("$ " + " ".join(cmd))
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, errors="replace", env=APT_ENV, bufsize=1)
+    seen, last = 0, 0.0
+    for line in p.stdout:
+        with open(LOG, "a") as f:
+            f.write(line)
+        if MARK.match(line):
+            seen += 1
+            if time.time() - last > 2:
+                frac = min(seen / float(max(markers_total, 1)), 1.0)
+                save(pct=round(base_pct + span_pct * frac, 1), pkg_done=seen)
+                last = time.time()
+    p.wait()
+    save(pkg_done=seen)
+    return p.returncode, seen
+
+
+def run_quiet(cmd):
+    log("$ " + " ".join(cmd))
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                       text=True, errors="replace", env=APT_ENV)
+    with open(LOG, "a") as f:
+        f.write(p.stdout)
+    return p.returncode, p.stdout
+
+
+def os_release_field(key):
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith(key + "="):
+                    return line.split("=", 1)[1].strip().strip('"')
+    except Exception:
+        pass
+    return None
+
+
+def finish(force_reboot=False):
+    needs = force_reboot or os.path.exists("/var/run/reboot-required")
+    save(needs_reboot=needs)
+    pol = PARAMS["reboot"]
+    if pol == "always" or (pol == "auto" and needs):
+        phase("rebooting", 96)
+        log("rebooting now")
+        time.sleep(3)  # let a status poll in flight read the state first
+        subprocess.run(["systemctl", "reboot"])
+        time.sleep(120)  # shutdown kills this unit
+        fail("reboot was requested but the node did not go down")
+    save(phase="done", pct=100, finished_at=int(time.time()), eta_epoch=None)
+    log("done" + (" (reboot still required — policy is 'never')" if needs else ""))
+
+
+def main_packages():
+    phase("update", 2)
+    rc, _ = run_quiet(["apt-get", "-q", "update"])
+    if rc != 0:
+        fail("apt-get update failed (exit %d) — see log" % rc)
+    phase("simulate", 5)
+    rc, out = run_quiet(["apt-get", "-s"] + APT_OPTS + ["full-upgrade"])
+    if rc != 0:
+        fail("apt-get simulate failed (exit %d)" % rc)
+    m = re.search(r"(\d+) upgraded, (\d+) newly installed", out)
+    total = (int(m.group(1)) + int(m.group(2))) if m else 0
+    save(pkg_total=total)
+    if total:
+        phase("install", 8)
+        rc, _ = run_stream(["apt-get"] + APT_OPTS + ["full-upgrade"],
+                           8, 82, markers_total=total * 3)
+        if rc != 0:
+            fail("apt-get full-upgrade failed (exit %d) — see log" % rc)
+    else:
+        log("nothing to upgrade")
+    phase("autoremove", 92)
+    run_quiet(["apt-get"] + APT_OPTS + ["autoremove", "--purge"])
+    finish()
+
+
+def main_release_ubuntu():
+    phase("prepare", 2)
+    rc, _ = run_quiet(["apt-get", "-q", "update"])
+    if rc != 0:
+        fail("apt-get update failed (exit %d)" % rc)
+    rc, _ = run_stream(["apt-get"] + APT_OPTS + ["full-upgrade"], 3, 7, 300)
+    if rc != 0:
+        fail("pre-upgrade full-upgrade failed (exit %d) — see log" % rc)
+    phase("release_upgrade", 10)
+    # marker total is a heuristic (~full package set); pct is coarse here but
+    # monotonic, and the overall ETA projection still tracks reality.
+    rc, _ = run_stream(["do-release-upgrade", "-f", "DistUpgradeViewNonInteractive"],
+                       10, 80, markers_total=PARAMS.get("assume_markers") or 4500)
+    if rc != 0:
+        fail("do-release-upgrade failed (exit %d) — see log" % rc)
+    now_ver = os_release_field("VERSION_ID")
+    if now_ver == PARAMS.get("from_version"):
+        fail("release unchanged after do-release-upgrade (still %s) — "
+             "likely 'no new release found'; see log" % now_ver)
+    finish(force_reboot=True)
+
+
+def main_release_debian():
+    cur, tgt = PARAMS["from_codename"], PARAMS["target_codename"]
+    if not cur or not tgt or cur == tgt:
+        fail("bad codenames for debian release upgrade: %r -> %r" % (cur, tgt))
+    phase("prepare", 2)
+    rc, _ = run_quiet(["apt-get", "-q", "update"])
+    if rc != 0:
+        fail("apt-get update failed (exit %d)" % rc)
+    rc, _ = run_stream(["apt-get"] + APT_OPTS + ["full-upgrade"], 3, 5, 300)
+    if rc != 0:
+        fail("pre-upgrade full-upgrade failed (exit %d)" % rc)
+    phase("sources", 8)
+    pat = re.compile(r"\b" + re.escape(cur) + r"\b")
+    roots = ["/etc/apt/sources.list"]
+    for d in ("/etc/apt/sources.list.d",):
+        if os.path.isdir(d):
+            roots += [os.path.join(d, x) for x in sorted(os.listdir(d))
+                      if x.endswith((".list", ".sources"))]
+    changed = 0
+    for path in roots:
+        try:
+            with open(path) as f:
+                text = f.read()
+        except Exception:
+            continue
+        if not pat.search(text):
+            continue
+        with open(path + ".maestro-dist-bak", "w") as f:
+            f.write(text)
+        with open(path, "w") as f:
+            f.write(pat.sub(tgt, text))
+        changed += 1
+        log("rewrote %s (%s -> %s)" % (path, cur, tgt))
+    if changed == 0:
+        fail("no apt source mentions %r — refusing to guess" % cur)
+    phase("update", 10)
+    rc, _ = run_quiet(["apt-get", "-q", "update"])
+    if rc != 0:
+        fail("apt-get update failed after sources rewrite (exit %d) — "
+             "originals kept as *.maestro-dist-bak" % rc)
+    phase("upgrade_minimal", 12)
+    rc, _ = run_stream(["apt-get"] + APT_OPTS + ["upgrade", "--without-new-pkgs"],
+                       12, 33, markers_total=PARAMS.get("assume_markers") or 2500)
+    if rc != 0:
+        fail("minimal upgrade failed (exit %d) — see log" % rc)
+    phase("full_upgrade", 45)
+    rc, _ = run_stream(["apt-get"] + APT_OPTS + ["full-upgrade"],
+                       45, 45, markers_total=PARAMS.get("assume_markers") or 2500)
+    if rc != 0:
+        fail("full-upgrade failed (exit %d) — see log" % rc)
+    if os_release_field("VERSION_CODENAME") == cur:
+        fail("codename unchanged after full-upgrade — see log")
+    finish(force_reboot=True)
+
+
+def main():
+    open(LOG, "a").close()
+    save()
+    mode, distro = PARAMS["mode"], PARAMS.get("distro")
+    if mode == "packages":
+        main_packages()
+    elif distro == "ubuntu":
+        main_release_ubuntu()
+    elif distro == "debian":
+        main_release_debian()
+    else:
+        fail("unsupported: mode=%r distro=%r" % (mode, distro))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        err = traceback.format_exc()
+        try:
+            log(err)
+        except Exception:
+            pass
+        fail(err.strip().splitlines()[-1])
+'''
+
+
+def render_distro_runner(run_params):
+    """Runner source with the params baked in as base64 JSON."""
+    blob = base64.b64encode(json.dumps(run_params).encode("utf-8")).decode("ascii")
+    return DISTRO_RUNNER_TEMPLATE.replace("@PARAMS@", blob)
+
+
+def _distro_read_state():
+    try:
+        with open(DISTRO_STATE) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _distro_write_state(st):
+    tmp = DISTRO_STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, DISTRO_STATE)
+
+
+def _distro_unit_active():
+    rc, out, _ = _run(["systemctl", "is-active", DISTRO_UNIT], timeout=5)
+    return (out or "").strip() in ("active", "activating")
+
+
+def _distro_state_summary():
+    st = _distro_read_state()
+    if not st:
+        return None
+    return {k: st.get(k) for k in ("mode", "phase", "pct", "started_at",
+                                   "finished_at", "error", "needs_reboot")}
+
+
+def act_distro_upgrade(params):
+    """Kick off a headless OS upgrade as a detached transient systemd unit.
+
+    mode "packages": apt full-upgrade within the current release.
+    mode "release":  do-release-upgrade (Ubuntu) / sources rewrite (Debian).
+    reboot policy: "auto" (only if the upgrade asks for it — a release
+    upgrade always does), "always", "never".
+    Returns immediately; progress is polled via distro_upgrade_status.
+    """
+    mode = params.get("mode") or "packages"
+    if mode not in ("packages", "release"):
+        return {"ok": False, "error": f"unknown mode {mode!r} (packages|release)"}
+    reboot = params.get("reboot") or "auto"
+    if reboot not in ("auto", "always", "never"):
+        return {"ok": False, "error": f"unknown reboot policy {reboot!r} (auto|always|never)"}
+    if _distro_unit_active():
+        return {"ok": False, "error": "a distro upgrade is already running on this node"}
+    st = _distro_read_state()
+    if st and st.get("phase") not in (None, "done", "failed") and not st.get("finished_at"):
+        # unit not active but state says mid-flight: stale unless we just rebooted
+        btime = _proc_btime()
+        if not (btime and st.get("started_at") and btime > st["started_at"]):
+            if time.time() - st.get("started_at", 0) < 300:
+                return {"ok": False, "error": "an upgrade appears to be in flight "
+                                              "(state file is fresh); check status first"}
+
+    osr = parse_os_release(_read_text("/etc/os-release") or "")
+    distro = (osr.get("ID") or "").lower()
+    if distro not in ("ubuntu", "debian"):
+        return {"ok": False, "error": f"unsupported distro {distro!r} (ubuntu|debian)"}
+    if mode == "release":
+        if distro == "ubuntu" and not shutil.which("do-release-upgrade"):
+            return {"ok": False, "error": "do-release-upgrade not found — "
+                                          "install update-manager-core first"}
+        if distro == "debian" and not params.get("target_codename"):
+            return {"ok": False, "error": "target_codename is required for a debian release upgrade"}
+
+    run_params = {
+        "mode": mode, "reboot": reboot, "distro": distro,
+        "state_file": DISTRO_STATE, "log_file": DISTRO_LOG,
+        "from_version": osr.get("VERSION_ID"),
+        "from_codename": (osr.get("VERSION_CODENAME") or "").lower() or None,
+        "target": params.get("target"),
+        "target_codename": params.get("target_codename"),
+    }
+    try:
+        os.makedirs(CERTDIR, exist_ok=True)
+        with open(DISTRO_RUNNER, "w") as f:
+            f.write(render_distro_runner(run_params))
+        os.chmod(DISTRO_RUNNER, 0o700)
+        # seed state + fresh log so a status poll right after start is coherent
+        _distro_write_state({"version": 1, "mode": mode, "reboot": reboot,
+                             "started_at": int(time.time()), "phase": "starting",
+                             "pct": 0, "pkg_total": None, "pkg_done": 0,
+                             "eta_epoch": None, "error": None, "needs_reboot": False,
+                             "finished_at": None, "target": params.get("target"),
+                             "phases": []})
+        with open(DISTRO_LOG, "w") as f:
+            f.write(time.strftime("[%H:%M:%S] ") + f"upgrade queued (mode={mode}, "
+                    f"reboot={reboot}, distro={distro})\n")
+    except Exception as e:
+        return {"ok": False, "error": f"could not stage the upgrade runner: {e}"}
+
+    _run(["systemctl", "reset-failed", DISTRO_UNIT], timeout=5)  # clear a dead prior run
+    py = sys.executable or "/usr/bin/python3"
+    rc, out, err = _run(["systemd-run", "--unit", DISTRO_UNIT, "--collect",
+                         "--description", "nym-maestro distro upgrade",
+                         "--property", "KillMode=process",
+                         py, DISTRO_RUNNER], timeout=15)
+    if rc != 0:
+        return {"ok": False, "error": "systemd-run failed: "
+                                      + ((err or out or "").strip() or f"exit {rc}")}
+    return {"ok": True, "kind": "distro", "started": True, "mode": mode,
+            "reboot": reboot, "distro": distro, "unit": DISTRO_UNIT}
+
+
+def _post_upgrade_checks():
+    """Did everything come back after the upgrade/reboot? Cheap, honest checks;
+    the orchestrator keeps polling while these are still red."""
+    checks = []
+    active, svc = service_state()
+    checks.append({"check": f"{svc} active", "ok": bool(active)})
+    devtxt = _read_text("/proc/net/dev") or ""
+    for d in EXIT_DEVICES:
+        checks.append({"check": f"iface {d} up", "ok": (d + ":") in devtxt})
+    if unit_exists("fail2ban.service"):
+        rc, out, _ = _run(["systemctl", "is-active", "fail2ban"], timeout=5)
+        checks.append({"check": "fail2ban active", "ok": (out or "").strip() == "active"})
+    return checks
+
+
+def act_distro_status(params):
+    """Progress of the current/last upgrade. After the post-upgrade reboot this
+    is also where verification happens: the state file still says "rebooting",
+    so once /proc/stat shows a newer boot we run the service checks and flip
+    the state to done (or keep reporting "verifying" until they pass)."""
+    st = _distro_read_state()
+    if not st:
+        return {"ok": True, "kind": "distro", "phase": "idle"}
+    phase = st.get("phase")
+    btime = _proc_btime()
+    rebooted = bool(btime and st.get("started_at") and btime > st["started_at"])
+    verify = st.get("verify")
+    if phase == "rebooting" and rebooted:
+        checks = _post_upgrade_checks()
+        verify = checks
+        if all(c["ok"] for c in checks):
+            st.update(phase="done", pct=100, finished_at=int(time.time()),
+                      eta_epoch=None, verify=checks)
+            with contextlib.suppress(Exception):
+                _distro_write_state(st)
+            phase = "done"
+        else:
+            phase = "verifying"  # transient: caller polls until green
+    elif phase not in (None, "idle", "done", "failed", "rebooting") and not _distro_unit_active():
+        # mid-flight state but no unit: the runner died without a terminal
+        # write (OOM, kill). Grace period covers the systemd-run start lag.
+        if time.time() - st.get("started_at", 0) > 60:
+            st.update(phase="failed",
+                      error=st.get("error") or "upgrade unit is not running — see log")
+            with contextlib.suppress(Exception):
+                _distro_write_state(st)
+            phase = "failed"
+
+    osr = parse_os_release(_read_text("/etc/os-release") or "")
+    out = {k: st.get(k) for k in ("mode", "reboot", "started_at", "pct",
+                                  "pkg_total", "pkg_done", "eta_epoch", "error",
+                                  "needs_reboot", "finished_at", "target")}
+    out.update({"ok": True, "kind": "distro", "phase": phase, "verify": verify,
+                "os_version": osr.get("VERSION_ID"),
+                "log_tail": _tail_text(DISTRO_LOG)})
+    return out
+
+
 EXEC_ACTIONS = {
+    "os_info": act_os_info,
+    "distro_upgrade": act_distro_upgrade,
+    "distro_upgrade_status": act_distro_status,
     "restart": act_restart,
     "toggle": act_toggle,
     "service_file": act_service_file,
