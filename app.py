@@ -1111,6 +1111,7 @@ class DistroUpgradeRequest(BaseModel):
     mode: str = "packages"       # packages | release
     reboot: str = "auto"         # auto | always | never
     concurrency: int = 1         # rolling window; 1 = one gateway down at a time
+    backup: bool = False         # pull a complete node backup before upgrading
     confirm: bool = False
 
 
@@ -1529,6 +1530,36 @@ def _safe_backup_name(name: str) -> bool:
     return bool(name) and os.path.basename(name) == name and bool(_BACKUP_NAME_RE.match(name))
 
 
+async def _backup_node(app_, node):
+    """One node's complete backup: the agent stops the service, tars the data
+    dir and restarts; we stream the archive into BACKUPS, verify its sha256 and
+    remove the staged copy on the node. Returns the result dict with `ok` set —
+    shared by /api/backup and the distro job's pre-upgrade backup."""
+    res = await agent_exec(app_, node, "backup", timeout=900)
+    ok = bool(res.get("ok"))
+    if ok:
+        fname = res.get("filename") or ""
+        dest = BACKUPS / fname
+        if not _safe_backup_name(fname) or dest.resolve().parent != BACKUPS.resolve():
+            ok = False
+            res["error"] = "agent returned an unsafe backup filename"
+        else:
+            got = await download_backup(app_, node, fname, dest)
+            if got != res.get("sha256"):
+                ok = False
+                res["error"] = "sha256 mismatch after download"
+                with contextlib.suppress(Exception):
+                    dest.unlink()
+            else:
+                res["saved_path"] = str(dest)
+                res["local_size"] = dest.stat().st_size
+                with contextlib.suppress(Exception):
+                    await agent_exec(app_, node, "backup_cleanup",
+                                     {"name": fname}, timeout=30)
+    res["ok"] = ok
+    return res
+
+
 @app.post("/api/backup")
 async def backup(payload: BackupRequest, request: Request):
     app_ = request.app
@@ -1545,27 +1576,8 @@ async def backup(payload: BackupRequest, request: Request):
     results = []
     for node in nodes:  # sequential: only one node is stopped at a time
         try:
-            res = await agent_exec(app_, node, "backup", timeout=900)
+            res = await _backup_node(app_, node)
             ok = bool(res.get("ok"))
-            if ok:
-                fname = res.get("filename") or ""
-                dest = BACKUPS / fname
-                if not _safe_backup_name(fname) or dest.resolve().parent != BACKUPS.resolve():
-                    ok = False
-                    res["error"] = "agent returned an unsafe backup filename"
-                else:
-                    got = await download_backup(app_, node, fname, dest)
-                    if got != res.get("sha256"):
-                        ok = False
-                        res["error"] = "sha256 mismatch after download"
-                        with contextlib.suppress(Exception):
-                            dest.unlink()
-                    else:
-                        res["saved_path"] = str(dest)
-                        res["local_size"] = dest.stat().st_size
-                        with contextlib.suppress(Exception):
-                            await agent_exec(app_, node, "backup_cleanup",
-                                             {"name": fname}, timeout=30)
         except Exception as e:
             res, ok = {"ok": False, "error": str(e)}, False
         store.record_target(job_id, node["uid"], "done" if ok else "failed", None, json.dumps(res))
@@ -2165,7 +2177,8 @@ async def distro_check(payload: DistroNodesRequest, request: Request):
             elif os_.get("id") == "debian":
                 cves[cve_key] = {"top": [], "source": distro.DEBIAN_SECURITY_URL,
                                  "error": "no compact Debian feed — see the DSA list"}
-    return {"results": results, "cves": cves, "catalog_source": cat["source"]}
+    return {"results": results, "cves": cves, "catalog_source": cat["source"],
+            "recommendations": distro.recommend_actions(results, cves)}
 
 
 @app.post("/api/distro/upgrade")
@@ -2204,19 +2217,20 @@ async def distro_upgrade(payload: DistroUpgradeRequest, request: Request):
     job_id = uuid.uuid4().hex
     job = {"job_id": job_id, "started_at": time.time(), "finished": False,
            "cancelled": False, "mode": payload.mode, "reboot": payload.reboot,
-           "concurrency": conc,
+           "concurrency": conc, "backup": payload.backup,
            "nodes": {n["uid"]: {"uid": n["uid"], "name": n["name"] or n["node_id"],
                                 "status": "queued", "phase": "queued", "pct": 0,
                                 "eta_epoch": None, "error": None, "log_line": None,
                                 "pkg_total": None, "pkg_done": None,
                                 "started_at": None, "finished_at": None,
-                                "os_version": None, "verify": None}
+                                "os_version": None, "verify": None, "backup": None}
                      for n in nodes},
            "order": [n["uid"] for n in nodes]}
     st.distro_job = job
     store.record_job(job_id, "distro_upgrade",
                      json.dumps({"mode": payload.mode, "reboot": payload.reboot,
-                                 "concurrency": conc, "nodes": len(nodes)}), len(nodes))
+                                 "concurrency": conc, "backup": payload.backup,
+                                 "nodes": len(nodes)}), len(nodes))
     asyncio.create_task(_distro_job_run(app_, nodes, job))
     return {"job_id": job_id, "queued": len(nodes), "concurrency": conc}
 
@@ -2258,6 +2272,22 @@ async def _distro_upgrade_one(app_, store, job, node, ns):
     ns.update(status="running", phase="starting", started_at=time.time())
     result = {"ok": False}
     try:
+        if job.get("backup"):
+            # complete backup BEFORE anything is touched: stop-tar-restart on
+            # the node, archive pulled and sha256-verified here. If it fails,
+            # the node keeps its current OS — no backup, no upgrade.
+            ns["phase"] = "backup"
+            BACKUPS.mkdir(parents=True, exist_ok=True)
+            try:
+                bres = await _backup_node(app_, node)
+            except Exception as e:
+                bres = {"ok": False, "error": str(e)}
+            ns["backup"] = {k: bres.get(k) for k in
+                            ("ok", "filename", "saved_path", "local_size", "error")}
+            store.audit("ui", "distro_backup", job["job_id"], node["uid"], json.dumps(bres))
+            if not bres.get("ok"):
+                raise RuntimeError("pre-upgrade backup failed — upgrade not started: "
+                                   + (bres.get("error") or "unknown error"))
         res = await agent_exec(app_, node, "distro_upgrade", params, timeout=60)
         if not res.get("ok"):
             raise RuntimeError(res.get("error") or "agent refused to start the upgrade")
@@ -2302,6 +2332,8 @@ async def _distro_upgrade_one(app_, store, job, node, ns):
     except Exception as e:
         result = {"ok": False, "error": str(e)}
         ns.update(status="failed", phase="failed", error=str(e), finished_at=time.time())
+    if ns.get("backup") is not None:
+        result["backup"] = ns["backup"]
     store.record_target(job["job_id"], node["uid"],
                         "done" if result.get("ok") else "failed", None, json.dumps(result))
     store.audit("ui", "distro_upgrade", job["job_id"], node["uid"], json.dumps(result))

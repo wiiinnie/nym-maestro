@@ -320,6 +320,124 @@ check("string cve ids parsed", top[0]["cves"] == ["CVE-2026-0009"])
 check("empty/garbage feed -> empty list", distro.rank_usns(None) == []
       and distro.rank_usns(["x", 5]) == [])
 
+# --- distro: recommendations ----------------------------------------------------
+print("distro recommendations")
+
+import datetime  # noqa: E402
+
+TODAY = datetime.date(2026, 8, 19)
+
+
+def check_row(name, oi, cat, compat_ok=True, cve_key="jammy"):
+    plan = distro.plan_upgrade(oi, cat)
+    return {"uid": name, "node_id": name, "name": name, "plan": plan,
+            "checks": distro.compat_checks(oi, plan), "compat_ok": compat_ok,
+            "cve_key": cve_key}
+
+
+CVES = {"jammy": {"top": distro.rank_usns(notices, 5)}}      # worst = 9.8 kernel
+
+rows = [check_row("AT01", osinfo("ubuntu", "22.04", "jammy"), CAT),
+        check_row("AT02", osinfo("ubuntu", "22.04", "jammy"), CAT)]
+recs = distro.recommend_actions(rows, CVES, today=TODAY)
+rel = [r for r in recs if r["action"] == "release"]
+check("release rec exists for the 22.04 cohort", len(rel) == 1)
+check("headline says what to move to",
+      "Upgrade 2 node(s) from Ubuntu 22.04 to Ubuntu 24.04 LTS" in rel[0]["headline"])
+check("high urgency from the CVSS 9.8 kernel USN", rel[0]["urgency"] == "high")
+check("reason ties in the top vulnerability",
+      any("USN-2" in t and "9.8" in t for t in rel[0]["reasons"]))
+check("reason recommends the pre-upgrade backup",
+      any("backup" in t for t in rel[0]["reasons"]))
+check("settings preselect release + backup",
+      rel[0]["settings"] == {"mode": "release", "backup": True})
+
+# past-EOL release is high urgency even with no CVE feed
+rows = [check_row("AT03", osinfo("ubuntu", "20.04", "focal"),
+                  {"ubuntu": distro.STATIC_CATALOG["ubuntu"]}, cve_key="focal")]
+recs = distro.recommend_actions(rows, {}, today=TODAY)
+check("past-EOL cohort is high urgency", recs[0]["urgency"] == "high")
+check("past-EOL named in the reasons",
+      any("past end of standard support" in t for t in recs[0]["reasons"]))
+
+# packages-only cohort
+rows = [check_row("AT04", osinfo("ubuntu", "24.04", "noble",
+                                 pending={"upgraded": 9, "new": 1, "security": 3}),
+                  CAT, cve_key="noble")]
+recs = distro.recommend_actions(rows, {"noble": {"top": distro.rank_usns(notices, 5)}},
+                                today=TODAY)
+check("packages rec for the up-to-date release",
+      recs[0]["action"] == "packages" and "Install pending updates" in recs[0]["headline"])
+check("security count in the reasons",
+      any("3 of them security" in t for t in recs[0]["reasons"]))
+check("packages settings keep backup off",
+      recs[0]["settings"] == {"mode": "packages", "backup": False})
+
+# fully up to date
+rows = [check_row("AT05", osinfo("ubuntu", "24.04", "noble"), CAT, cve_key="noble")]
+recs = distro.recommend_actions(rows, {}, today=TODAY)
+check("up-to-date cohort -> action none / info",
+      recs[0]["action"] == "none" and recs[0]["urgency"] == "info")
+
+# a blocked node gets its own fix-first recommendation, sorted to the top
+blocked_oi = osinfo("ubuntu", "22.04", "jammy", disk={"free": 3 * 2**30})
+brow = check_row("AT06", blocked_oi, CAT)
+brow["compat_ok"] = distro.compat_ok(brow["checks"])
+recs = distro.recommend_actions([brow], CVES, today=TODAY)
+fix = [r for r in recs if r["action"] == "fix"]
+check("blocked node -> fix recommendation", len(fix) == 1 and fix[0]["urgency"] == "high")
+check("blocker named with detail", any("8 GiB" in t for t in fix[0]["reasons"]))
+check("release rec then counts 0 ready nodes",
+      any(r["action"] == "release" and "Upgrade 0 node(s)" in r["headline"] for r in recs))
+check("scan-failed rows are skipped, not crashed",
+      distro.recommend_actions([{"uid": "x", "plan": None}], {}, today=TODAY) == [])
+
+# --- app: _backup_node helper -----------------------------------------------------
+print("app _backup_node")
+
+import asyncio  # noqa: E402
+import app as maestro_app  # noqa: E402
+
+bdir = Path(tmp) / "backups"
+bdir.mkdir()
+maestro_app.BACKUPS = bdir
+NODE = {"uid": "u1", "node_id": "n1", "name": "AT01", "ip": "192.0.2.1", "agent_port": 8443}
+FNAME = "nym-backup_at01_20260819_120000.tar.gz"
+calls = []
+
+
+def fake_backup_env(agent_result, download_sha):
+    async def fake_exec(app_, node, action, params=None, timeout=40):
+        calls.append(action)
+        if action == "backup":
+            return dict(agent_result)
+        return {"ok": True}
+
+    async def fake_download(app_, node, name, dest, timeout=900):
+        Path(dest).write_bytes(b"data")
+        return download_sha
+
+    maestro_app.agent_exec = fake_exec
+    maestro_app.download_backup = fake_download
+
+
+fake_backup_env({"ok": True, "filename": FNAME, "sha256": "abc"}, "abc")
+r = asyncio.run(maestro_app._backup_node(None, NODE))
+check("backup ok: sha verified, saved locally",
+      r["ok"] and r["saved_path"] == str(bdir / FNAME) and r["local_size"] == 4)
+check("backup ok: staged copy cleaned up on the node", calls[-1] == "backup_cleanup")
+
+fake_backup_env({"ok": True, "filename": FNAME, "sha256": "abc"}, "WRONG")
+r = asyncio.run(maestro_app._backup_node(None, NODE))
+check("sha mismatch -> not ok, archive discarded",
+      not r["ok"] and "mismatch" in r["error"] and not (bdir / FNAME).exists())
+
+calls.clear()
+fake_backup_env({"ok": True, "filename": "../../etc/shadow", "sha256": "abc"}, "abc")
+r = asyncio.run(maestro_app._backup_node(None, NODE))
+check("unsafe filename -> refused before any download",
+      not r["ok"] and "unsafe" in r["error"] and calls == ["backup"])
+
 print()
 print(f"{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)

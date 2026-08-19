@@ -7,6 +7,7 @@ catalog from endoflife.date, USNs from ubuntu.com) and the agent fanout.
 """
 from __future__ import annotations
 
+import datetime
 import re
 
 # Where app.py fetches the live release catalog. endoflife.date is a plain
@@ -216,6 +217,139 @@ def compat_checks(osinfo, plan):
 
 def compat_ok(checks):
     return all(c["ok"] for c in checks if c["level"] == "block")
+
+
+_DISTRO_NAMES = {"ubuntu": "Ubuntu", "debian": "Debian"}
+_EOL_SOON_DAYS = 180
+
+
+def _eol_state(eol_str, today):
+    """('past'|'soon'|'ok'|None, iso-date) for an EOL string."""
+    try:
+        eol = datetime.date.fromisoformat((eol_str or "")[:10])
+    except ValueError:
+        return None, None
+    if eol <= today:
+        return "past", eol.isoformat()
+    if (eol - today).days <= _EOL_SOON_DAYS:
+        return "soon", eol.isoformat()
+    return "ok", eol.isoformat()
+
+
+def _vuln_reason(top):
+    """One sentence tying the recommendation to the ranked CVEs."""
+    if not top:
+        return None
+    worst = top[0]
+    area = (worst.get("why") or worst.get("ops_area") or "").split(" — ")[0]
+    s = (f"closes {worst['usn']} (CVSS {worst['score']}"
+         + (f", {area}" if area else "") + ")")
+    if len(top) > 1:
+        s += f" and {len(top) - 1} more ops-relevant security fixes — hover the CVEs pill"
+    return s
+
+
+def recommend_actions(results, cves, today=None):
+    """Turn a finished dry run into explicit fleet advice: "upgrade these N
+    nodes to X because …". Pure synthesis over /api/distro/check's per-node
+    results + the ranked CVE groups; grouped by (distro, current version) so
+    a mixed fleet gets one recommendation per cohort.
+
+    Returns a list of {action, urgency, headline, reasons, nodes, settings},
+    highest urgency first. `settings` is what the UI should preselect
+    (mode, and backup=True for release jumps — the riskiest operation here).
+    """
+    today = today or datetime.date.today()
+    groups = {}
+    for r in results or []:
+        if not r.get("plan"):
+            continue  # scan failed; surfaced on the node row itself
+        plan = r["plan"]
+        groups.setdefault((plan.get("distro"), plan.get("current")), []).append(r)
+
+    order = {"high": 0, "medium": 1, "low": 2, "info": 3}
+    recs = []
+    for (distro_id, current), rows in sorted(groups.items(), key=lambda kv: str(kv[0])):
+        names = sorted(r.get("name") or r.get("node_id") or r["uid"] for r in rows)
+        plan = rows[0]["plan"]
+        rel = plan.get("release")
+        top = ((cves or {}).get(rows[0].get("cve_key")) or {}).get("top") or []
+        dname = _DISTRO_NAMES.get(distro_id, distro_id or "?")
+        sec = sum((r["plan"].get("packages") or {}).get("security") or 0 for r in rows)
+        pkgs = sum(((r["plan"].get("packages") or {}).get("upgraded") or 0)
+                   + ((r["plan"].get("packages") or {}).get("new") or 0) for r in rows)
+        blocked = [r for r in rows if not r.get("compat_ok")]
+        ready = [r for r in rows if r.get("compat_ok")]
+        vuln = _vuln_reason(top)
+        worst_score = top[0]["score"] if top else 0
+
+        if rel:
+            eol_state, eol_date = _eol_state(plan.get("current_eol"), today)
+            urgency = ("high" if eol_state == "past" or worst_score >= 7
+                       else "medium" if eol_state == "soon" or sec else "low")
+            reasons = []
+            if eol_state == "past":
+                reasons.append(f"{dname} {current} is past end of standard support "
+                               f"(since {eol_date}) — no more security updates")
+            elif eol_state == "soon":
+                reasons.append(f"{dname} {current} support ends {eol_date}")
+            elif eol_date:
+                reasons.append(f"{dname} {current} is supported until {eol_date}, "
+                               "but the newer release is available now")
+            if vuln:
+                reasons.append(vuln)
+            if sec:
+                reasons.append(f"{sec} pending security updates across these nodes "
+                               "come along with the jump")
+            tgt = (f"{dname} {rel['target_cycle']}"
+                   + (" LTS" if rel.get("lts") else "")
+                   + (f" ({rel['target_codename']})" if rel.get("target_codename") else ""))
+            if rel.get("eol"):
+                reasons.append(f"{tgt} is the current stable release, supported until {rel['eol']}")
+            if rel.get("further"):
+                reasons.append("this is step 1 of " + " → ".join(rel["path"])
+                               + " — rerun the dry run after it lands")
+            reasons.append("enable the pre-upgrade backup: a release jump is the "
+                           "riskiest operation maestro runs")
+            recs.append({"action": "release", "urgency": urgency,
+                         "headline": f"Upgrade {len(ready)} node(s) from {dname} {current} to {tgt}",
+                         "reasons": reasons,
+                         "nodes": sorted(r.get("name") or r.get("node_id") or r["uid"]
+                                         for r in ready),
+                         "settings": {"mode": "release", "backup": True}})
+        elif pkgs:
+            urgency = ("high" if sec and worst_score >= 7
+                       else "medium" if sec else "low")
+            reasons = [f"{pkgs} pending package updates"
+                       + (f", {sec} of them security fixes" if sec else " (no security fixes pending)")]
+            if vuln and sec:
+                reasons.append(vuln)
+            reasons.append(f"{dname} {current} is already the latest release — "
+                           "this is a package update, no reboot unless the kernel asks for it")
+            recs.append({"action": "packages", "urgency": urgency,
+                         "headline": f"Install pending updates on {len(ready)} {dname} {current} node(s)",
+                         "reasons": reasons,
+                         "nodes": sorted(r.get("name") or r.get("node_id") or r["uid"]
+                                         for r in ready),
+                         "settings": {"mode": "packages", "backup": False}})
+        else:
+            recs.append({"action": "none", "urgency": "info",
+                         "headline": f"{len(rows)} {dname} {current} node(s) are up to date",
+                         "reasons": ["no release upgrade available, no pending packages"],
+                         "nodes": names, "settings": None})
+
+        if blocked:
+            why = sorted({f'{c["check"]} ({c["detail"]})'
+                          for r in blocked for c in (r.get("checks") or [])
+                          if not c["ok"] and c["level"] == "block"})
+            recs.append({"action": "fix", "urgency": "high",
+                         "headline": f"Fix {len(blocked)} node(s) before upgrading",
+                         "reasons": why or ["compatibility check failed"],
+                         "nodes": sorted(r.get("name") or r.get("node_id") or r["uid"]
+                                         for r in blocked),
+                         "settings": None})
+    recs.sort(key=lambda r: order.get(r["urgency"], 9))
+    return recs
 
 
 def _ops_match(packages):

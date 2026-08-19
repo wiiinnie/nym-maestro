@@ -932,7 +932,8 @@
           <button class="primary" id="du-dryrun" onclick="duDryRun()">Dry run</button>
           <span class="du-sub" id="du-check-note"></span>
         </div>
-        <div id="du-check" style="margin-top:10px"></div>
+        <div id="du-recs" style="margin-top:10px"></div>
+        <div id="du-check" style="margin-top:4px"></div>
         <div id="du-cves" style="margin-top:4px"></div>
       </div>
 
@@ -961,6 +962,8 @@
             </select>
           </label>
         </div>
+        <label class="f2b-check" style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px"><input id="du-backup" type="checkbox">
+          Pull a complete node backup first — stop, tar, restart, then download &amp; sha256-verify the archive onto this machine. A node whose backup fails is <b>not</b> upgraded. Adds a short extra service stop per node.</label>
         <label class="f2b-check" style="font-size:12px;color:var(--muted);display:block;margin-bottom:8px"><input id="du-confirm" type="checkbox">
           I understand these exit gateways will go offline (and likely reboot) during the upgrade</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -4042,7 +4045,8 @@ function fmtEta(epoch){
 }
 
 const DU_PHASES = {
-  queued: 'queued', starting: 'starting', update: 'refreshing package lists',
+  queued: 'queued', backup: 'backing up (stop · tar · download)',
+  starting: 'starting', update: 'refreshing package lists',
   simulate: 'calculating changes', install: 'downloading & installing',
   autoremove: 'removing obsolete packages', prepare: 'installing pending updates first',
   release_upgrade: 'release upgrade running', sources: 'rewriting apt sources',
@@ -4093,11 +4097,51 @@ async function duDryRun(){
   btn.disabled = false; btn.textContent = 'Dry run';
 }
 
+function duRenderRecs(){
+  // maestro's verdict: "upgrade these nodes to X because …", tied to the CVE
+  // ranking, EOL dates and pending security counts. Highest urgency first.
+  const box = document.getElementById('du-recs'); box.innerHTML = '';
+  const recs = (duCheckData && duCheckData.recommendations) || [];
+  recs.forEach(rec => {
+    const edge = rec.urgency === 'high' ? 'var(--danger)'
+               : rec.urgency === 'medium' ? 'var(--warn)'
+               : rec.urgency === 'low' ? 'var(--accent)' : 'var(--line)';
+    const card = el('div');
+    card.style.cssText = 'border:1px solid var(--line);border-left:4px solid ' + edge +
+      ';border-radius:var(--r);padding:10px 12px;margin-bottom:8px';
+    const head = el('div');
+    head.style.cssText = 'display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:4px';
+    head.append(el('b', null, rec.headline));
+    if(rec.urgency !== 'info')
+      head.append(el('span','pill ' + (rec.urgency === 'high' ? 'bad' : rec.urgency === 'medium' ? 'warn' : 'info'),
+        rec.urgency + ' priority'));
+    if(rec.settings){
+      const b = el('button','ghost','Use these settings');
+      b.style.marginLeft = 'auto';
+      b.onclick = () => {
+        document.getElementById('du-mode').value = rec.settings.mode;
+        document.getElementById('du-backup').checked = !!rec.settings.backup;
+        toast('Upgrade form set to ' + rec.settings.mode + (rec.settings.backup ? ' with backup' : ''));
+      };
+      head.append(b);
+    }
+    card.append(head);
+    (rec.reasons || []).forEach(t => card.append(el('div','du-sub','· ' + t)));
+    if((rec.nodes || []).length){
+      const n = el('div','du-sub', rec.nodes.join(', '));
+      n.style.marginTop = '4px';
+      card.append(n);
+    }
+    box.append(card);
+  });
+}
+
 function duRenderCheck(){
   const box = document.getElementById('du-check'); box.innerHTML = '';
   const note = document.getElementById('du-check-note');
   if(!duCheckData) return;
   note.textContent = 'release catalog: ' + (duCheckData.catalog_source || '?');
+  duRenderRecs();
   duCheckData.results.forEach(r => {
     const row = el('div','du-row');
     row.append(el('span','name', r.name || r.node_id));
@@ -4166,15 +4210,18 @@ async function duStart(){
   const mode = document.getElementById('du-mode').value;
   const reboot = document.getElementById('du-reboot').value;
   const conc = parseInt(document.getElementById('du-conc').value, 10) || 1;
+  const backup = document.getElementById('du-backup').checked;
   if(!confirm('Upgrade ' + sel.length + ' node(s) — ' +
       (mode === 'release' ? 'RELEASE upgrade to the suggested distro release' : 'all pending package updates') +
-      ', reboot: ' + reboot + ', ' + conc + ' node(s) at a time.\n\n' +
-      'Each node goes offline during install/reboot. Continue?')) return;
+      ', reboot: ' + reboot + ', ' + conc + ' node(s) at a time.\n' +
+      (backup ? 'A complete backup is pulled and verified per node BEFORE its upgrade (extra service stop); a node whose backup fails is not upgraded.\n'
+              : 'No pre-upgrade backup was selected.\n') +
+      '\nEach node goes offline during install/reboot. Continue?')) return;
   const btn = document.getElementById('du-start');
   btn.disabled = true;
   try{
     await api('/api/distro/upgrade', {method:'POST', body: JSON.stringify(
-      {node_ids: sel.map(n => n.uid), mode, reboot, concurrency: conc, confirm: true})});
+      {node_ids: sel.map(n => n.uid), mode, reboot, concurrency: conc, backup, confirm: true})});
     toast('Upgrade started — rolling through ' + sel.length + ' node(s)');
     duPollProgress(true);
   }catch(e){ toast(e.message, true); btn.disabled = false; }
@@ -4233,6 +4280,15 @@ function duRenderProgress(p){
     row.append(el('span','du-sub', (ns.pct != null ? Math.round(ns.pct) + '%' : '')
       + (ns.pkg_total ? ' · ' + (ns.pkg_done || 0) + '/' + (ns.pkg_total * 3) + ' steps' : '')));
     if(st === 'running' && ns.eta_epoch) row.append(el('span','du-sub', fmtEta(ns.eta_epoch)));
+    if(ns.backup){
+      const b = el('span','pill ' + (ns.backup.ok ? 'ok' : 'bad'),
+        ns.backup.ok ? 'backup ✓' : 'backup failed');
+      b.title = ns.backup.ok
+        ? (ns.backup.filename || '') + (ns.backup.local_size ? ' · ' + fmtBytes(ns.backup.local_size) : '')
+          + (ns.backup.saved_path ? '\n' + ns.backup.saved_path : '')
+        : (ns.backup.error || '');
+      row.append(b);
+    }
     if(ns.os_version && st === 'done') row.append(el('span','pill ok','now on ' + ns.os_version));
     if(ns.verify && st !== 'done'){
       const badv = ns.verify.filter(v => !v.ok);
