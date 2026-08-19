@@ -513,6 +513,7 @@
     <button id="btn-extra-blocks" onclick="openExtraBlocks()" disabled title="Install/verify NYM-EXIT abuse blocklist">Extra blocks</button>
     <button id="btn-update-agent" onclick="openAgentUpdate()" disabled title="Push the local agent to selected nodes">Update agent</button>
     <button id="btn-landing" onclick="openLanding()" title="Rebuild and deploy the public node-overview page">Landing page</button>
+    <button id="btn-tg" onclick="openTgPost()" title="Draft the Telegram delegation post from live stake saturation">TG post</button>
     <span class="spacer"></span>
     <div class="filter"><input id="filter" type="text" placeholder="filter nodes" autocomplete="off"></div>
     <button class="primary" onclick="openModal('add')">Add node</button>
@@ -892,6 +893,27 @@
     <div class="modal-actions">
       <span class="spacer" style="flex:1"></span>
       <button onclick="closeLanding()">Close</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="tg-overlay">
+  <div class="modal wide">
+    <h2>Telegram post · delegation shift</h2>
+    <p class="sub">Drafts the community post from live on-chain saturation (bonded stake vs the network saturation point). Gateway names link to the SpectreDAO explorer. Nothing is sent anywhere — edit below, then <b>Copy</b> puts the post on the clipboard as rich text, so pasting into Telegram keeps the links clickable. Telegram clients that only paste plain text get the explorer URL on its own line under each gateway instead (still clickable — Telegram auto-links it).</p>
+    <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+      <label style="font-size:12px;color:var(--muted)">Room below
+        <input id="tg-threshold" type="number" value="100" min="1" max="100" step="1" onchange="tgBuild()" style="width:70px;margin:0 2px 0 6px"> %
+      </label>
+      <label class="f2b-check" style="font-size:12px;color:var(--muted)"><input id="tg-sat" type="checkbox" checked onchange="tgBuild()"> Show saturation %</label>
+      <button id="tg-build" onclick="tgBuild()">Rebuild draft</button>
+    </div>
+    <div id="tg-summary" style="font-size:12px;color:var(--muted);margin-bottom:8px"></div>
+    <div id="tg-text" contenteditable="true" spellcheck="false" style="width:100%;box-sizing:border-box;min-height:280px;max-height:52vh;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:13px;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere"></div>
+    <div class="modal-actions">
+      <button class="primary" onclick="tgCopy()">Copy to clipboard</button>
+      <span class="spacer" style="flex:1"></span>
+      <button onclick="closeTgPost()">Close</button>
     </div>
   </div>
 </div>
@@ -3400,6 +3422,69 @@ function openLanding(){
 }
 function closeLanding(){ document.getElementById('lp-overlay').classList.remove('open'); }
 
+// ===== Telegram delegation post ===========================================
+function openTgPost(){
+  document.getElementById('tg-overlay').classList.add('open');
+  tgBuild();
+}
+function closeTgPost(){ document.getElementById('tg-overlay').classList.remove('open'); }
+
+async function tgBuild(){
+  const btn = document.getElementById('tg-build');
+  const th = parseFloat(document.getElementById('tg-threshold').value) || 100;
+  const sat = document.getElementById('tg-sat').checked;
+  btn.disabled = true;
+  try{
+    const r = await api('/api/delegation/draft?threshold=' + encodeURIComponent(th)
+                        + '&sat=' + sat);
+    document.getElementById('tg-text').innerHTML = r.message_html;
+    const parts = [
+      r.under.length + ' with room (< ' + r.threshold + '%)',
+      r.over.length + ' over saturated (≥ 100%)'
+    ];
+    if(r.no_data.length) parts.push('no on-chain data: ' + r.no_data.join(', '));
+    document.getElementById('tg-summary').textContent = parts.join(' · ');
+  }catch(e){ toast(e.message, true); }
+  btn.disabled = false;
+}
+
+async function tgCopy(){
+  // copy the (possibly hand-edited) draft as rich text + plain fallback, so
+  // pasting into Telegram keeps the explorer links clickable
+  const el = document.getElementById('tg-text');
+  const htmlBody = el.innerHTML;
+  // plain fallback: bare explorer URL on a line under the whole entry line
+  // (after the trailing "(NN% saturated)" text, not right behind the link)
+  const clone = el.cloneNode(true);
+  clone.querySelectorAll('a').forEach(a => {
+    if(a.textContent.trim() === a.href) return;
+    let ref = a;
+    while(ref.nextSibling && ref.nextSibling.nodeType === Node.TEXT_NODE) ref = ref.nextSibling;
+    ref.after(document.createElement('br'), a.href);
+  });
+  // must be rendered (not display:none) or innerText drops the line breaks
+  clone.style.position = 'fixed'; clone.style.left = '-9999px';
+  document.body.appendChild(clone);
+  const plain = clone.innerText;
+  clone.remove();
+  try{
+    await navigator.clipboard.write([new ClipboardItem({
+      'text/html': new Blob([htmlBody], {type: 'text/html'}),
+      'text/plain': new Blob([plain], {type: 'text/plain'})
+    })]);
+    toast('Post copied — links stay clickable when pasted');
+  }catch(e){
+    // fallback: select the rich content and use the legacy copy command
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const sel = getSelection();
+    sel.removeAllRanges(); sel.addRange(range);
+    document.execCommand('copy');
+    sel.removeAllRanges();
+    toast('Post copied to clipboard');
+  }
+}
+
 function lpReachable(){ return nodes.filter(n => n.status && n.status.reachable); }
 
 function lpFillPickers(){
@@ -4222,7 +4307,8 @@ document.getElementById('ssh-overlay').addEventListener('click', e => { if(e.tar
 document.getElementById('w-overlay').addEventListener('click', e => { if(e.target.id === 'w-overlay') closeWallets(); });
 document.getElementById('wm-overlay').addEventListener('click', e => { if(e.target.id === 'wm-overlay') closeWalletManage(); });
 document.getElementById('lp-overlay').addEventListener('click', e => { if(e.target.id === 'lp-overlay') closeLanding(); });
-document.addEventListener('keydown', e => { if(e.key === 'Escape'){ closeModal(); closeToggle(); closeSF(); closeAU(); closeUp(); closeRes(); closeTput(); closeF2b(); closeSsh(); closeWallets(); closeWalletManage(); closeLanding(); } });
+document.getElementById('tg-overlay').addEventListener('click', e => { if(e.target.id === 'tg-overlay') closeTgPost(); });
+document.addEventListener('keydown', e => { if(e.key === 'Escape'){ closeModal(); closeToggle(); closeSF(); closeAU(); closeUp(); closeRes(); closeTput(); closeF2b(); closeSsh(); closeWallets(); closeWalletManage(); closeLanding(); closeTgPost(); } });
 
 health();
 load();

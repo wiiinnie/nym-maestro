@@ -56,7 +56,7 @@ Python mTLS orchestrator für ein 22-Node Nym Exit-Gateway Fleet. Zwei Komponent
 ## Testing
 - Vor "fertig" die Test-Suites für Agent und Orchestrator laufen lassen. Existiert für ein geändertes Modul noch keine Test-Suite, das explizit benennen statt die Verifikation stillschweigend zu überspringen.
 - Für Agent-Änderungen: da stdlib-only, Tests nicht mit Third-Party-Test-Deps überladen, die nicht schon etabliert sind (pytest als Dev-only-Dependency ist unkritisch, wird ja nicht auf die Nodes ausgeliefert).
-- **Die Suites sind Skripte, nicht pytest-Tests** — direkt laufen: `.venv/bin/python test_<name>.py`. Jede printet `N passed, M failed` und exitet mit 1 bei Fehlern. Vorhanden: `test_actions`, `test_agent_mtls`, `test_extra_blocks`, `test_landing`, `test_migration`, `test_peers`, `test_wallet`, plus `smoke_test.py`.
+- **Die Suites sind Skripte, nicht pytest-Tests** — direkt laufen: `.venv/bin/python test_<name>.py`. Jede printet `N passed, M failed` und exitet mit 1 bei Fehlern. Vorhanden: `test_actions`, `test_agent_mtls`, `test_delegation`, `test_extra_blocks`, `test_landing`, `test_migration`, `test_peers`, `test_wallet`, plus `smoke_test.py`.
 - `test_wallet.py` hat einen bekannten, vorbestehenden Failure (`redeem passes --mnemonic`) — nicht durch neue Änderungen verursacht, vor dem Debuggen gegen HEAD verifizieren.
 - `test_agent_mtls.py` enthält das Harness, um einen echten Agent lokal mit frischer CA + Enrollment über echtes mTLS zu starten (`pki.init_ca` / `pki.enroll` + Subprocess). Für Wire-Level-Tests neuer Agent-Actions von dort kopieren, statt nur `act_*` in-process aufzurufen.
 

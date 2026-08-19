@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import contextlib
 import hashlib
+import html as html_mod
 import hmac
 import json
 import os
@@ -78,6 +79,12 @@ _COUNTRY_NAME_TO_ISO2 = {
     "estonia": "EE", "iceland": "IS", "cyprus": "CY", "croatia": "HR",
     "chile": "CL", "colombia": "CO", "kazakhstan": "KZ", "georgia": "GE",
 }
+
+# Reverse map for display ("FI" -> "Finland"); the first name listed for a
+# code wins, so keep the preferred spelling first above (e.g. "czechia").
+_ISO2_TO_COUNTRY = {}
+for _n, _c in _COUNTRY_NAME_TO_ISO2.items():
+    _ISO2_TO_COUNTRY.setdefault(_c, _n.title())
 
 # --- Nym network topology (IP -> country), for placing 1789 peers on the map -
 # Topology source: the unified /described endpoint returns every node type
@@ -232,6 +239,7 @@ def _harvest_stake(data, sat_point, into):
             continue
         rec = {
             "nym_node_id": bi.get("node_id"),
+            "identity_key": (bi.get("node") or {}).get("identity_key"),
             "total_stake": total / 1e6,                      # NYM
             "saturation": (total / sat_point) if sat_point else None,
         }
@@ -1194,6 +1202,140 @@ async def list_nodes(request: Request):
         if srec:
             n["stake"] = srec
     return nodes
+
+
+# --- Telegram delegation post -------------------------------------------------
+# Drafts the copy/paste community post: gateways below the saturation threshold
+# are advertised as having room for new delegators, gateways at/over 100% are
+# flagged so people move their stake away. Data comes from the same bonded /
+# reward-params cache as the fleet table. Nothing is published anywhere — the
+# draft only goes back to the dashboard for manual copy & paste.
+
+_NUM_WORDS = ["Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven",
+              "Eight", "Nine", "Ten", "Eleven", "Twelve"]
+
+
+def _flag_emoji(cc):
+    if not (cc and len(cc) == 2 and cc.isalpha()):
+        return ""
+    return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in cc.upper())
+
+
+def _delegation_split(nodes, stake, threshold):
+    """Partition enabled nodes into (under, over, no_data) by saturation %.
+
+    under: below `threshold` % (room for delegators); over: at/over 100 %;
+    no_data: enabled nodes with no bonded/stake record (never in the post).
+    The country comes from the operator naming convention (name = CC + number),
+    which is what the post text uses ("EXIT Gateway Finland - FI01").
+    """
+    under, over, no_data = [], [], []
+    for n in nodes:
+        if not n.get("enabled", True):
+            continue
+        name = (n.get("name") or "").strip()
+        nip = _norm_ip(n.get("ip", "")) or n.get("ip", "")
+        srec = stake.get(nip) or stake.get((n.get("hostname") or "").strip().lower()) or {}
+        sat = srec.get("saturation")
+        if sat is None:
+            no_data.append(name)
+            continue
+        cc = name[:2].upper() if len(name) >= 2 and name[:2].isalpha() else ""
+        country = _ISO2_TO_COUNTRY.get(cc, cc)
+        # partition on the same rounded percent the post displays, so a node
+        # shown as "(100% saturated)" can never appear in the has-room list
+        pct = int(round(sat * 100))
+        entry = {
+            "name": name,
+            "cc": cc,
+            "flag": _flag_emoji(cc),
+            "country": country,
+            "description": f"EXIT Gateway {country} - {name}",
+            "saturation_pct": pct,
+            "identity_key": srec.get("identity_key"),
+            "nym_node_id": srec.get("nym_node_id"),
+        }
+        if pct < threshold:
+            under.append(entry)
+        elif pct >= 100:
+            over.append(entry)
+    under.sort(key=lambda e: e["saturation_pct"])
+    over.sort(key=lambda e: -e["saturation_pct"])
+    return under, over, no_data
+
+
+NYM_EXPLORER_NODE_URL = os.environ.get(
+    "MAESTRO_NYM_EXPLORER_NODE_URL",
+    "https://explorer.nym.spectredao.net/nodes/")
+
+_TG_SUPPORT_URL = "https://t.me/hermespool"
+
+
+def _explorer_url(e):
+    key = e.get("identity_key")
+    return (NYM_EXPLORER_NODE_URL + key) if key else None
+
+
+def _delegation_message(under, sat=True, html=False):
+    """Compose the post. Plain text carries the explorer URL as a bare line
+    under each gateway (Telegram auto-links pasted URLs); the html variant
+    links the gateway name itself and is what the dashboard's Copy button
+    puts on the clipboard as text/html, so pasting into Telegram keeps the
+    clickable link."""
+    n = len(under)
+    count = _NUM_WORDS[n] if n < len(_NUM_WORDS) else str(n)
+    plural = "Gateway has" if n == 1 else "Gateways have"
+    esc = html_mod.escape if html else (lambda s: s)
+    paras = [
+        esc("💫 Hermes Stakepool - EXIT Gateways 💫"),
+        esc("Dear NYM-Community,"),
+        esc("it's time to shift your delegations from over saturated nodes to "
+            f"maximize your staking rewards! {count} of my well established "
+            f"and reliable EXIT {plural} room for new delegators:"),
+    ]
+    for e in under:
+        label = f"{e['flag']} {e['description']}".strip()
+        tail = f" ({e['saturation_pct']}% saturated)" if sat else ""
+        url = _explorer_url(e)
+        if html and url:
+            paras.append(f"{esc(e['flag'])} <a href=\"{esc(url)}\">"
+                         f"{esc(e['description'])}</a>{esc(tail)}")
+        elif html:
+            paras.append(esc(label + tail))
+        else:
+            paras.append(label + tail + (f"\n{url}" if url else ""))
+    paras.append(esc("Please consider moving your stake anytime soon!"))
+    if html:
+        paras.append(f'💬 Support-Chat: <a href="{_TG_SUPPORT_URL}">'
+                     f"{_TG_SUPPORT_URL}</a>")
+    else:
+        paras.append(f"💬 Support-Chat: {_TG_SUPPORT_URL}")
+    paras.append(esc("Your support is highly appreciated, don't hesitate to "
+                     "reach out with any questions!"))
+    paras.append(esc("Cheers Wunderbaer"))
+    if html:
+        return "<br><br>".join(p.replace("\n", "<br>") for p in paras)
+    return "\n\n".join(paras)
+
+
+@app.get("/api/delegation/draft")
+async def delegation_draft(request: Request, threshold: float = 100.0,
+                           sat: bool = True):
+    # clamp to <= 100 so a node can never land in both lists
+    threshold = max(1.0, min(threshold, 100.0))
+    nodes = request.app.state.store.list_nodes()
+    stake = await fetch_nym_stake()
+    under, over, no_data = _delegation_split(nodes, stake, threshold)
+    for e in under:
+        e["explorer_url"] = _explorer_url(e)
+    return {
+        "threshold": threshold,
+        "under": under,
+        "over": over,
+        "no_data": no_data,
+        "message": _delegation_message(under, sat=sat),
+        "message_html": _delegation_message(under, sat=sat, html=True),
+    }
 
 
 @app.get("/api/throughput")
