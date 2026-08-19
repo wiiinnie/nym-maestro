@@ -3242,6 +3242,18 @@ def _distro_unit_active():
     return (out or "").strip() in ("active", "activating")
 
 
+def _distro_state_fresh(max_age=120):
+    """Is the runner still writing the state file? run_stream saves at least
+    every ~2s, so a recent mtime is proof of life that does not depend on
+    systemd — `systemctl is-active` can transiently FAIL mid-release-upgrade
+    while dbus/systemd themselves are being upgraded (false 'unit dead',
+    seen in the field on BE01)."""
+    try:
+        return time.time() - os.path.getmtime(DISTRO_STATE) < max_age
+    except Exception:
+        return False
+
+
 def _apt_locked():
     """True if dpkg/apt is locked — some package operation is running right
     now. Non-destructive probe: flock in non-blocking mode, never truncating
@@ -3417,7 +3429,11 @@ def act_distro_status(params):
         # the unit alone. Grace period covers the systemd-run start lag.
         if time.time() - st.get("started_at", 0) > 60:
             cur_ver, from_ver = osr.get("VERSION_ID"), st.get("from_version")
-            if _apt_locked():
+            if _distro_state_fresh():
+                # the runner is still writing — the unit query lied (systemd/
+                # dbus mid-upgrade). Report the state as-is, change nothing.
+                pass
+            elif _apt_locked():
                 # the package system is still locked: the upgrade child is
                 # alive and working — report progress, do NOT fail
                 phase = "detached"

@@ -167,12 +167,22 @@ r = agent.act_distro_status({})
 check("status: services red -> verifying, not done", r["phase"] == "verifying")
 check("status: red check named", any(not c["ok"] for c in r["verify"]))
 
+def _age_state(sec=600):
+    """Push the state file's mtime into the past — a fresh mtime means 'the
+    runner is alive and writing', which most dead-unit tests must not trip."""
+    os.utime(agent.DISTRO_STATE, (now - sec, now - sec))
+
+
 # runner died mid-flight (no unit, stale state) -> failed
 with open(agent.DISTRO_STATE, "w") as f:
     json.dump({"version": 1, "mode": "packages", "reboot": "auto",
                "started_at": now - 600, "phase": "install", "pct": 40,
                "phases": []}, f)
 agent._proc_btime = lambda: now - 3000        # no reboot since start
+r = agent.act_distro_status({})
+check("status: fresh state file -> runner alive, phase untouched",
+      r["phase"] == "install" and not r["error"])
+_age_state()
 r = agent.act_distro_status({})
 check("status: dead runner -> failed", r["phase"] == "failed" and "not running" in r["error"])
 
@@ -182,6 +192,7 @@ def _mid_release_state():
         json.dump({"version": 1, "mode": "release", "reboot": "auto",
                    "started_at": now - 600, "phase": "release_upgrade", "pct": 40,
                    "from_version": "25.04", "phases": []}, f)
+    _age_state()
 
 
 _mid_release_state()

@@ -4189,6 +4189,13 @@ function duRenderCheck(){
       row.append(el('span','pill', (pend.upgraded + (pend.new || 0)) + ' pkg updates'
         + (pend.security ? ' (' + pend.security + ' security)' : '')));
     if(pend.error) row.append(el('span','pill bad','apt: ' + pend.error.slice(0, 60)));
+    const ust = s.upgrade_state;
+    if(ust && ust.phase && !['done','failed'].includes(ust.phase)){
+      const p = el('span','pill warn','upgrade in progress: ' + duPhaseLabel(ust.phase)
+        + (ust.pct ? ' · ' + Math.round(ust.pct) + '%' : ''));
+      p.title = 'this node is mid-upgrade right now — leave it alone until the state file reports done';
+      row.append(p);
+    }
     if(s.reboot_required){
       const p = el('span','pill warn','reboot pending');
       p.title = 'node wants a reboot from earlier updates — the upgrade reboot clears it';
@@ -4265,16 +4272,22 @@ async function duCancel(){
   }catch(e){ toast(e.message, true); }
 }
 
+let duSawRunning = false;   // toast only on a live running->finished transition
+
 function duPollProgress(start){
   // 1s cadence so the elapsed timers tick smoothly; the endpoint is a plain
   // in-memory snapshot on localhost, no fanout happens per poll
   if(start && !duTimer) duTimer = setInterval(duPollProgress, 1000);
   api('/api/distro/progress').then(p => {
     duRenderProgress(p);
-    if(!p.job && duTimer){ clearInterval(duTimer); duTimer = null; }  // nothing to watch
-    if(p.job && p.job.finished && duTimer){
-      clearInterval(duTimer); duTimer = null;
-      document.getElementById('du-start').disabled = false;
+    const running = p.job && !p.job.finished;
+    if(running){ duSawRunning = true; return; }
+    // idle or finished: stop polling; a finished job we WATCHED finish gets
+    // exactly one toast — reopening the modal later must not re-fire it
+    if(duTimer){ clearInterval(duTimer); duTimer = null; }
+    document.getElementById('du-start').disabled = false;
+    if(p.job && duSawRunning){
+      duSawRunning = false;
       const c = p.counts || {};
       toast('OS upgrade finished: ' + (c.done || 0) + ' ok, ' + (c.failed || 0) + ' failed'
         + (c.cancelled ? ', ' + c.cancelled + ' cancelled' : ''), (c.failed || 0) > 0);
