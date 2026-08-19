@@ -2360,8 +2360,11 @@ async def distro_progress(request: Request):
         avg = (sum(durations) / len(durations)) if durations else 600
         inflight = [ns["eta_epoch"] for ns in job["nodes"].values()
                     if ns["status"] == "running" and ns.get("eta_epoch")]
-        base = max(inflight) if inflight else now
-        overall_eta = base + counts["queued"] * avg / job["concurrency"]
+        # no in-flight ETA and nothing queued -> we know nothing yet (e.g. all
+        # runners still in backup/starting); better no ETA than "any moment"
+        if inflight or counts["queued"]:
+            base = max(inflight) if inflight else now
+            overall_eta = base + counts["queued"] * avg / job["concurrency"]
     return {"job": {k: job.get(k) for k in ("job_id", "started_at", "finished",
                                             "finished_at", "cancelled", "mode",
                                             "reboot", "concurrency")},

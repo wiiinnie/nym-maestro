@@ -4044,6 +4044,12 @@ function fmtEta(epoch){
   return '≈ ' + (s / 3600).toFixed(1) + ' h left';
 }
 
+function fmtTimer(sec){
+  sec = Math.max(0, Math.round(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(s).padStart(2, '0');
+}
+
 const DU_PHASES = {
   queued: 'queued', backup: 'backing up (stop · tar · download)',
   starting: 'starting', update: 'refreshing package lists',
@@ -4242,7 +4248,9 @@ async function duCancel(){
 }
 
 function duPollProgress(start){
-  if(start && !duTimer) duTimer = setInterval(duPollProgress, 3000);
+  // 1s cadence so the elapsed timers tick smoothly; the endpoint is a plain
+  // in-memory snapshot on localhost, no fanout happens per poll
+  if(start && !duTimer) duTimer = setInterval(duPollProgress, 1000);
   api('/api/distro/progress').then(p => {
     duRenderProgress(p);
     if(!p.job && duTimer){ clearInterval(duTimer); duTimer = null; }  // nothing to watch
@@ -4271,6 +4279,8 @@ function duRenderProgress(p){
     + (c.done || 0) + '/' + total + ' done'
     + ((c.failed || 0) ? ' · ' + c.failed + ' failed' : '')
     + ((c.cancelled || 0) ? ' · ' + c.cancelled + ' cancelled' : '')
+    + (running ? ' · ⏱ ' + fmtTimer(Date.now() / 1000 - p.job.started_at)
+               : (p.job.finished_at ? ' · took ' + fmtTimer(p.job.finished_at - p.job.started_at) : ''))
     + (running && p.overall_eta_epoch ? ' · overall ' + fmtEta(p.overall_eta_epoch) : '');
   box.innerHTML = '';
   (p.nodes || []).forEach(ns => {
@@ -4286,6 +4296,15 @@ function duRenderProgress(p){
     bar.append(fill); row.append(bar);
     row.append(el('span','du-sub', (ns.pct != null ? Math.round(ns.pct) + '%' : '')
       + (ns.pkg_total ? ' · ' + (ns.pkg_done || 0) + '/' + (ns.pkg_total * 3) + ' steps' : '')));
+    if(ns.started_at){
+      const secs = st === 'running' ? Date.now() / 1000 - ns.started_at
+                 : (ns.finished_at ? ns.finished_at - ns.started_at : null);
+      if(secs != null){
+        const t = el('span','du-sub mono', (st === 'running' ? '⏱ ' : 'took ') + fmtTimer(secs));
+        t.style.minWidth = '58px';   // keep the row from wobbling as digits tick
+        row.append(t);
+      }
+    }
     if(st === 'running' && ns.eta_epoch) row.append(el('span','du-sub', fmtEta(ns.eta_epoch)));
     if(ns.backup){
       const b = el('span','pill ' + (ns.backup.ok ? 'ok' : 'bad'),
