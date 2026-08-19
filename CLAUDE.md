@@ -60,6 +60,7 @@ Python mTLS orchestrator für ein 22-Node Nym Exit-Gateway Fleet. Zwei Komponent
 - Es gibt keine Capability-Negotiation: ein alter Agent antwortet auf eine unbekannte Action mit HTTP 400 `unknown action: ...`. Das ist das Feature-Detection-Signal. Achtung: `agent_exec` macht `raise_for_status()`, und httpx' Exception-Message enthält den Response-Body NICHT — für eine brauchbare Fehlermeldung `e.response.json()["error"]` auslesen (siehe `_landing_fanout`).
 
 ## Working conventions
+- **Der echte SSH-Login-User steht NIRGENDS im Repo** (Code, Kommentare, Tests, Docs) — er kommt ausschließlich aus `MAESTRO_SSH_USER` (Orchestrator-Env beim Start via `run.sh`, Agent-Env in der Unit). Ohne gesetzte Variable sind die SSH-Aktionen funktionslos (verify baut dann `ssh @host` → Usage-Dump). Bei neuen Features/Tests neutrale Namen verwenden.
 - Bei allem, was mTLS/Cert-Logik betrifft oder Agents fleet-weit offline nehmen könnte, vorher nachfragen — ein Bug hier heißt nicht "Commit reverten", sondern "22 Nodes melden sich nicht mehr."
 - Defensiver, expliziter Code auf Agent-Seite (keine externen Error-Handling-Libs — stdlib only, siehe oben).
 - Beim Hinzufügen von Orchestrator-API-Feldern/Endpoints auf das Muster achten, das im Schwesterprojekt SOZU bereits aufgetreten ist: still fallengelassene Felder in Config-APIs. Verifizieren, dass neue Felder tatsächlich durchverdrahtet sind, nicht nur deklariert.
