@@ -221,6 +221,10 @@ def _restart_service(svc, wait=150):
     Returns (restarted, active, error, elapsed_s).
     """
     old_pid = _show_props(svc, "MainPID").get("MainPID", "0")
+    # a unit that exhausted its StartLimitBurst (e.g. nym-node crash-looping
+    # while the nym-api was down) refuses plain restart until reset — clearing
+    # first is a no-op for healthy units
+    _run(["systemctl", "reset-failed", svc], timeout=10)
     rc, out, err = _run(["systemctl", "restart", "--no-block", svc], timeout=15)
     if rc != 0:
         return False, service_state()[0], (err or out or "systemctl restart failed").strip(), 0
