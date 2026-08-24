@@ -130,6 +130,18 @@ class Store:
             " id INTEGER PRIMARY KEY AUTOINCREMENT, uid TEXT NOT NULL,"
             " ts REAL NOT NULL, json TEXT NOT NULL);"
             "CREATE INDEX IF NOT EXISTS idx_onwire_uid_ts ON onwire_history(uid, ts);"
+            "CREATE TABLE IF NOT EXISTS abuse_cases ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+            " case_id TEXT NOT NULL DEFAULT '',"
+            " complainant TEXT NOT NULL DEFAULT '',"
+            " provider TEXT NOT NULL DEFAULT '',"
+            " node_name TEXT NOT NULL DEFAULT '',"
+            " ip TEXT NOT NULL DEFAULT '',"
+            " report_text TEXT NOT NULL DEFAULT '',"
+            " reply_text TEXT NOT NULL DEFAULT '',"
+            " notes TEXT NOT NULL DEFAULT '');"
+            "CREATE INDEX IF NOT EXISTS idx_abuse_complainant ON abuse_cases(complainant);"
         )
         self.db.commit()
         self._ensure_history_unique_indexes()
@@ -685,6 +697,97 @@ class Store:
                 "total_bytes": total_bytes, "dev_bytes": dev_bytes,
                 "window_hours": hours, "observed_hours": round(span, 2),
                 "buckets_observed": n}
+
+    # -- abuse-reply cases ---------------------------------------------------
+
+    ABUSE_FIELDS = ("case_id", "complainant", "provider", "node_name", "ip",
+                    "report_text", "reply_text", "notes")
+
+    def abuse_list(self, q=None, limit=500):
+        """Newest first. q filters case id / complainant / provider / node / ip."""
+        sql = ("SELECT id, created_at, case_id, complainant, provider, node_name,"
+               " ip, report_text, reply_text, notes FROM abuse_cases")
+        args = []
+        if q:
+            like = f"%{q}%"
+            sql += (" WHERE case_id LIKE ? OR complainant LIKE ? OR provider LIKE ?"
+                    " OR node_name LIKE ? OR ip LIKE ?")
+            args += [like] * 5
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(int(limit))
+        with self.lock:
+            rows = self.db.execute(sql, args).fetchall()
+        return [dict(r) for r in rows]
+
+    def abuse_get(self, case_pk):
+        with self.lock:
+            row = self.db.execute(
+                "SELECT id, created_at, case_id, complainant, provider, node_name,"
+                " ip, report_text, reply_text, notes FROM abuse_cases WHERE id=?",
+                (case_pk,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def abuse_latest_for(self, complainant):
+        """Most recent case from this complainant (case-insensitive) — the reply
+        drafting reuses so answers to e.g. Paramount stay identical."""
+        with self.lock:
+            row = self.db.execute(
+                "SELECT id, created_at, case_id, complainant, provider, node_name,"
+                " ip, report_text, reply_text, notes FROM abuse_cases"
+                " WHERE complainant = ? COLLATE NOCASE ORDER BY id DESC LIMIT 1",
+                (complainant,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def abuse_create(self, d: dict) -> int:
+        vals = [(d.get(k) or "").strip() for k in self.ABUSE_FIELDS]
+        with self.lock:
+            cur = self.db.execute(
+                "INSERT INTO abuse_cases (case_id, complainant, provider,"
+                " node_name, ip, report_text, reply_text, notes)"
+                " VALUES (?,?,?,?,?,?,?,?)", vals,
+            )
+            self.db.commit()
+        return cur.lastrowid
+
+    def abuse_delete(self, case_pk) -> bool:
+        with self.lock:
+            cur = self.db.execute("DELETE FROM abuse_cases WHERE id=?", (case_pk,))
+            self.db.commit()
+        return cur.rowcount > 0
+
+    def abuse_distinct(self, column):
+        """Distinct non-empty values for the UI datalists (complainant/provider)."""
+        if column not in ("complainant", "provider"):
+            raise ValueError("bad column")
+        with self.lock:
+            rows = self.db.execute(
+                f"SELECT DISTINCT {column} FROM abuse_cases WHERE {column} != ''"
+                f" ORDER BY {column} COLLATE NOCASE"
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    # -- app_config key/value ------------------------------------------------
+
+    def get_config(self, key, default=None):
+        with self.lock:
+            row = self.db.execute(
+                "SELECT value FROM app_config WHERE key=?", (key,)
+            ).fetchone()
+        return row[0] if row else default
+
+    def set_config(self, key, value):
+        with self.lock:
+            if value is None:
+                self.db.execute("DELETE FROM app_config WHERE key=?", (key,))
+            else:
+                self.db.execute(
+                    "INSERT INTO app_config (key, value) VALUES (?,?)"
+                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, value),
+                )
+            self.db.commit()
 
     def record_job(self, job_id, action, params_json, node_count, created_by="ui"):
         with self.lock:

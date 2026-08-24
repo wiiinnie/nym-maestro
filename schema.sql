@@ -121,6 +121,28 @@ CREATE TABLE IF NOT EXISTS app_config (
 );
 
 -- ---------------------------------------------------------------------------
+-- Abuse-report replies. One row per handled report: who complained
+-- (complainant, e.g. "Paramount"), which hoster forwarded it (provider, e.g.
+-- "OVH"), the pasted report and the reply as sent. Drafting reuses the latest
+-- reply of the same complainant with a fresh case id, so answers stay
+-- consistent over time.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS abuse_cases (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    case_id     TEXT NOT NULL DEFAULT '',
+    complainant TEXT NOT NULL DEFAULT '',
+    provider    TEXT NOT NULL DEFAULT '',
+    node_name   TEXT NOT NULL DEFAULT '',
+    ip          TEXT NOT NULL DEFAULT '',
+    report_text TEXT NOT NULL DEFAULT '',
+    reply_text  TEXT NOT NULL DEFAULT '',
+    notes       TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_abuse_complainant ON abuse_cases(complainant);
+
+-- ---------------------------------------------------------------------------
 -- Rolling per-node throughput history (one row per poll), for the sparkline
 -- and the 24h graph. json = {device: bytes/sec}. Pruned to a ~26h window.
 -- ---------------------------------------------------------------------------

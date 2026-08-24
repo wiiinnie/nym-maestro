@@ -31,6 +31,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, field_validator
 
 from store import Conflict, Store
+import abuse
 import distro
 import landing
 import wallet
@@ -1386,6 +1387,130 @@ def onwire_average(request: Request, hours: float = 24.0):
     # fleet average ON-WIRE throughput (bits/s), split wg / mix
     hours = max(0.5, min(hours, 168.0))
     return request.app.state.store.onwire_avg(hours=hours)
+
+
+# --- Abuse replies ------------------------------------------------------------
+# Consistent answers to abuse reports. Drafting extracts the case id + reported
+# IP from the pasted report, then reuses the most recent stored reply of the
+# same complainant (case id swapped) so e.g. Paramount always gets the identical
+# reasoning; only with no prior case does the (editable) template render fresh.
+# Nothing is sent anywhere — replies are copy/paste, cases are stored locally.
+
+_ABUSE_TEMPLATE_KEY = "abuse_reply_template"
+
+
+class AbuseDraftRequest(BaseModel):
+    report_text: str = ""
+    case_id: str = ""       # optional override of the extracted id
+    complainant: str = ""   # optional override of the detected complainant
+    provider: str = ""      # optional override of the detected provider/addressee
+
+
+class AbuseCaseCreate(BaseModel):
+    case_id: str = ""
+    complainant: str = ""
+    provider: str = ""
+    node_name: str = ""
+    ip: str = ""
+    report_text: str = ""
+    reply_text: str = ""
+    notes: str = ""
+
+
+class AbuseTemplatePut(BaseModel):
+    template: str = ""      # empty = reset to the built-in default
+
+
+@app.get("/api/abuse/template")
+def abuse_get_template(request: Request):
+    stored = request.app.state.store.get_config(_ABUSE_TEMPLATE_KEY)
+    return {"template": stored or abuse.DEFAULT_TEMPLATE,
+            "is_default": not stored}
+
+
+@app.put("/api/abuse/template")
+def abuse_put_template(body: AbuseTemplatePut, request: Request):
+    t = body.template.strip()
+    request.app.state.store.set_config(_ABUSE_TEMPLATE_KEY, t or None)
+    return {"template": t or abuse.DEFAULT_TEMPLATE, "is_default": not t}
+
+
+@app.post("/api/abuse/draft")
+def abuse_draft(body: AbuseDraftRequest, request: Request):
+    store = request.app.state.store
+    text = body.report_text
+    case_id = body.case_id.strip() or abuse.extract_case_id(text)
+    ips = abuse.extract_ips(text)
+    # match a reported IP against the fleet registry -> node name + our own ip
+    node_name, matched_ip = "", ""
+    fleet = {n["ip"]: n for n in store.list_nodes()}
+    for ip in ips:
+        if ip in fleet:
+            node_name, matched_ip = fleet[ip]["name"], ip
+            break
+    complainant = body.complainant.strip() or abuse.guess_complainant(
+        text, store.abuse_distinct("complainant"))
+    prior = store.abuse_latest_for(complainant) if complainant else None
+    # addressee = the hoster that forwarded the report ("Dear ATW,"):
+    # explicit override > name found in the report > the complainant's last case
+    provider = (body.provider.strip()
+                or abuse.guess_provider(text, store.abuse_distinct("provider"))
+                or (prior or {}).get("provider", ""))
+    if prior and prior.get("reply_text"):
+        reply = abuse.swap_case_id(prior["reply_text"], prior.get("case_id", ""), case_id)
+        reply = abuse.swap_salutation(reply, provider)
+        source = f"reused reply of case {prior.get('case_id') or '#' + str(prior['id'])} ({complainant})"
+    else:
+        template = store.get_config(_ABUSE_TEMPLATE_KEY) or abuse.DEFAULT_TEMPLATE
+        reply = abuse.render_reply(template, case_id,
+                                   matched_ip or (ips[0] if ips else ""),
+                                   addressee=provider)
+        source = "generated from template (no prior case for this complainant)" \
+            if complainant else "generated from template"
+    return {"case_id": case_id, "ips": ips, "node_name": node_name,
+            "ip": matched_ip or (ips[0] if ips else ""),
+            "complainant": complainant, "provider": provider,
+            "reply": reply, "source": source,
+            "prior_id": prior["id"] if prior else None}
+
+
+@app.get("/api/abuse/cases")
+def abuse_list_cases(request: Request, q: str = ""):
+    store = request.app.state.store
+    return {"cases": store.abuse_list(q=q.strip() or None),
+            "complainants": store.abuse_distinct("complainant"),
+            "providers": store.abuse_distinct("provider")}
+
+
+@app.post("/api/abuse/cases", status_code=201)
+def abuse_create_case(body: AbuseCaseCreate, request: Request):
+    if not body.reply_text.strip():
+        raise HTTPException(400, "reply_text is required")
+    if not body.complainant.strip():
+        raise HTTPException(400, "complainant is required")
+    store = request.app.state.store
+    pk = store.abuse_create(body.model_dump())
+    store.audit("ui", "abuse_case_create", None, None,
+                json.dumps({"id": pk, "case_id": body.case_id,
+                            "complainant": body.complainant}))
+    return store.abuse_get(pk)
+
+
+@app.get("/api/abuse/cases/{case_pk}")
+def abuse_get_case(case_pk: int, request: Request):
+    c = request.app.state.store.abuse_get(case_pk)
+    if c is None:
+        raise HTTPException(404, "no case with that id")
+    return c
+
+
+@app.delete("/api/abuse/cases/{case_pk}", status_code=204)
+def abuse_delete_case(case_pk: int, request: Request):
+    store = request.app.state.store
+    if not store.abuse_delete(case_pk):
+        raise HTTPException(404, "no case with that id")
+    store.audit("ui", "abuse_case_delete", None, None, json.dumps({"id": case_pk}))
+    return Response(status_code=204)
 
 
 @app.get("/api/nodes/{uid}")

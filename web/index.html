@@ -331,6 +331,21 @@
   .codebox{font-family:var(--mono);font-size:12px;white-space:pre-wrap;word-break:break-word;
     background:var(--surface-2);border:1px solid var(--line);border-radius:var(--r);
     padding:12px;max-height:340px;overflow:auto;color:var(--text)}
+  /* header tab nav (Nodes / Abuse replies) */
+  .tabs{display:flex;gap:4px;background:var(--surface-2);border-radius:var(--r);padding:3px;align-self:center}
+  .tabs button{border:none;background:transparent;color:var(--muted);padding:6px 14px;border-radius:6px;font-size:13px}
+  .tabs button:hover{color:var(--text);background:transparent}
+  .tabs button.on{background:var(--surface);color:var(--text);font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,.14)}
+  /* abuse-reply view */
+  .ab-card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:16px 18px;margin-bottom:18px}
+  .ab-card h2{margin:0 0 14px;font-size:15px;font-weight:600}
+  #ab-report,#ab-reply,#at-text{font-family:var(--mono);font-size:12.5px;line-height:1.55;resize:vertical}
+  .ab-src{font-size:12px;color:var(--muted)}
+  .ab-src.reuse{color:var(--accent)}
+  .ab-grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:13px}
+  @media(max-width:720px){.ab-grid4{grid-template-columns:1fr 1fr}}
+  .ab-hist-head{display:flex;align-items:center;gap:8px;margin:4px 0 10px}
+  .ab-hist-head h2{margin:0;font-size:15px;font-weight:600;flex:1}
 </style>
 </head>
 <body>
@@ -358,9 +373,14 @@
       </svg>
       <span class="brand-name">nym maestro</span>
     </div>
+    <nav class="tabs" aria-label="Views">
+      <button id="tab-nodes" class="on" onclick="showTab('nodes')">Nodes</button>
+      <button id="tab-abuse" onclick="showTab('abuse')">Abuse replies</button>
+    </nav>
     <div class="health"><span id="hdot" class="dot"></span><span id="htext">connecting…</span></div>
   </header>
 
+<div id="view-nodes">
   <div class="metrics">
     <div class="metric"><div class="k">Nodes</div><div class="v" id="m-total">—</div></div>
     <div class="metric"><div class="k">Online</div><div class="v" id="m-online">—</div></div>
@@ -558,6 +578,49 @@
   <div class="fleet-summary" id="fleet-summary"></div>
 
   <div id="tablewrap"></div>
+</div><!-- /view-nodes -->
+
+<div id="view-abuse" style="display:none">
+  <div class="ab-card">
+    <h2>Draft a reply</h2>
+    <div class="field">
+      <label for="ab-report">Abuse report — paste as received</label>
+      <textarea id="ab-report" rows="9" placeholder="Paste the full abuse report here. Case ID, reported IP, complainant and a reply draft are filled in automatically."></textarea>
+    </div>
+    <div class="ab-grid4">
+      <div class="field"><label for="ab-case">Case ID</label>
+        <input id="ab-case" placeholder="e.g. 7c188c8c3e9732e89c23" autocomplete="off"></div>
+      <div class="field"><label for="ab-complainant">Complainant</label>
+        <input id="ab-complainant" list="ab-complainants" placeholder="company that reported, e.g. Paramount" autocomplete="off">
+        <datalist id="ab-complainants"></datalist></div>
+      <div class="field"><label for="ab-provider">Provider (VPS)</label>
+        <input id="ab-provider" list="ab-providers" placeholder="e.g. OVH, ATW" autocomplete="off">
+        <datalist id="ab-providers"></datalist></div>
+      <div class="field"><label for="ab-node">Node</label>
+        <input id="ab-node" placeholder="auto from reported IP" autocomplete="off"></div>
+    </div>
+    <div class="bar" style="margin-bottom:14px">
+      <button class="primary" onclick="abDraft()" title="Extract case id & IP, then reuse the complainant's last reply — or render the template if they're new">Draft reply</button>
+      <span class="ab-src" id="ab-src"></span>
+    </div>
+    <div class="field" style="margin-bottom:8px">
+      <label for="ab-reply">Reply — review, then copy &amp; send</label>
+      <textarea id="ab-reply" rows="16" placeholder="Draft appears here. Same reasoning every time: mere conduit · content never modified · no client data · no logs · tight exit policy · rate limiting · we take this seriously."></textarea>
+    </div>
+    <div class="bar" style="margin-bottom:0">
+      <button onclick="abCopy()">Copy reply</button>
+      <button onclick="openAbTemplate()" title="The standard reply used for complainants without a prior case">Edit template</button>
+      <span class="spacer"></span>
+      <button class="primary" onclick="abSave()" title="Store report + reply under this complainant/provider for future reuse">Save case</button>
+    </div>
+  </div>
+
+  <div class="ab-hist-head">
+    <h2>Past cases</h2>
+    <div class="filter"><input id="ab-filter" type="text" placeholder="filter cases" autocomplete="off"></div>
+  </div>
+  <div id="ab-tablewrap"></div>
+</div><!-- /view-abuse -->
 </div>
 
 <div class="overlay" id="overlay">
@@ -1055,6 +1118,38 @@
     <div class="modal-actions">
       <button onclick="closeWalletManage()">Close</button>
       <button class="primary" onclick="wmAdd()">Add wallet</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="ac-overlay">
+  <div class="modal wide">
+    <h2 id="ac-title">Case</h2>
+    <div class="sub" id="ac-meta" style="margin:-10px 0 14px"></div>
+    <div class="field"><label>Report as received</label><div class="codebox" id="ac-report"></div></div>
+    <div class="field"><label>Reply as sent</label><div class="codebox" id="ac-reply"></div></div>
+    <div class="modal-actions">
+      <button class="ghost" style="color:var(--danger)" onclick="abDelete(acId)">Delete case</button>
+      <span class="spacer" style="flex:1"></span>
+      <button onclick="abCopyCase()">Copy reply</button>
+      <button onclick="abReuse(acId)" title="Load this reply into the draft form — the case id gets swapped for the new one">Reuse</button>
+      <button class="ghost" onclick="closeAbCase()">Close</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="at-overlay">
+  <div class="modal wide">
+    <h2>Reply template</h2>
+    <p class="hint" style="margin-top:-8px">Used when a complainant has no prior case. Placeholders
+      <span class="mono">{addressee}</span> (the provider, e.g. "ATW" — falls back to "Sir or Madam"),
+      <span class="mono">{case_id}</span> and <span class="mono">{ip}</span> are filled at draft time.
+      Save an empty template to reset to the built-in default.</p>
+    <div class="field"><textarea id="at-text" rows="18"></textarea></div>
+    <div class="modal-actions">
+      <span class="spacer" style="flex:1"></span>
+      <button class="ghost" onclick="closeAbTemplate()">Cancel</button>
+      <button class="primary" onclick="saveAbTemplate()">Save template</button>
     </div>
   </div>
 </div>
@@ -4727,6 +4822,209 @@ async function wmDelete(name){
 }
 
 
+// ===== abuse replies ======================================================
+// Consistency machine: paste a report, get the same reasoning the complainant
+// got last time (only the case id changes), or the standard template if new.
+let abCases = [], abLoaded = false, abIp = '', acId = null;
+
+function showTab(t){
+  document.getElementById('view-nodes').style.display = (t === 'nodes') ? '' : 'none';
+  document.getElementById('view-abuse').style.display = (t === 'abuse') ? '' : 'none';
+  document.getElementById('tab-nodes').classList.toggle('on', t === 'nodes');
+  document.getElementById('tab-abuse').classList.toggle('on', t === 'abuse');
+  history.replaceState(null, '', t === 'abuse' ? '#abuse' : location.pathname + location.search);
+  if(t === 'abuse' && !abLoaded) abLoadCases();
+}
+
+async function abLoadCases(){
+  try{
+    const r = await api('/api/abuse/cases');
+    abCases = r.cases; abLoaded = true;
+    const fill = (id, vals) => {
+      const d = document.getElementById(id); d.innerHTML = '';
+      vals.forEach(v => { const o = document.createElement('option'); o.value = v; d.append(o); });
+    };
+    fill('ab-complainants', r.complainants);
+    fill('ab-providers', r.providers);
+    abRenderTable();
+  }catch(e){ toast(e.message, true); }
+}
+
+function abRenderTable(){
+  const q = (document.getElementById('ab-filter').value || '').toLowerCase();
+  const rows = abCases.filter(c => !q ||
+    [c.case_id, c.complainant, c.provider, c.node_name, c.ip].join(' ').toLowerCase().includes(q));
+  const wrap = document.getElementById('ab-tablewrap');
+  wrap.innerHTML = '';
+  if(!rows.length){
+    const d = el('div', 'empty');
+    d.append(el('h3', null, abCases.length ? 'No matching cases' : 'No cases yet'),
+             document.createTextNode(abCases.length ? 'Adjust the filter.' :
+               'Draft a reply above and save it — future reports from the same complainant then reuse it automatically.'));
+    wrap.append(d);
+    return;
+  }
+  const table = document.createElement('table');
+  const thead = document.createElement('thead');
+  const hr = document.createElement('tr');
+  ['Date', 'Case ID', 'Complainant', 'Provider', 'Node', ''].forEach(h => {
+    const th = document.createElement('th'); th.textContent = h; hr.append(th);
+  });
+  thead.append(hr); table.append(thead);
+  const tbody = document.createElement('tbody');
+  rows.forEach(c => {
+    const tr = document.createElement('tr');
+    const tdDate = document.createElement('td');
+    tdDate.append(el('span', 'sub', (c.created_at || '').slice(0, 16)));
+    const tdCase = document.createElement('td');
+    tdCase.append(el('span', 'mono', c.case_id || '—'));
+    const tdComp = document.createElement('td');
+    tdComp.append(el('span', 'name', c.complainant || '—'));
+    const tdProv = document.createElement('td');
+    tdProv.textContent = c.provider || '—';
+    const tdNode = document.createElement('td');
+    tdNode.append(el('span', 'mono', c.node_name || c.ip || '—'));
+    const tdAct = document.createElement('td');
+    tdAct.className = 'row-actions';
+    const bView = el('button', 'ghost', 'View'); bView.onclick = () => abView(c.id);
+    const bReuse = el('button', 'ghost', 'Reuse'); bReuse.onclick = () => abReuse(c.id);
+    bReuse.title = 'Load this reply into the draft form — the case id gets swapped for the new one';
+    tdAct.append(bView, bReuse);
+    tr.append(tdDate, tdCase, tdComp, tdProv, tdNode, tdAct);
+    tbody.append(tr);
+  });
+  table.append(tbody);
+  wrap.append(table);
+}
+
+function abSetSource(text, reused){
+  const s = document.getElementById('ab-src');
+  s.textContent = text || '';
+  s.className = 'ab-src' + (reused ? ' reuse' : '');
+}
+
+async function abDraft(){
+  const report = document.getElementById('ab-report').value;
+  if(!report.trim()){ toast('Paste an abuse report first', true); return; }
+  try{
+    const r = await api('/api/abuse/draft', {method: 'POST', body: JSON.stringify({
+      report_text: report,
+      case_id: document.getElementById('ab-case').value.trim(),
+      complainant: document.getElementById('ab-complainant').value.trim(),
+      provider: document.getElementById('ab-provider').value.trim(),
+    })});
+    if(r.case_id) document.getElementById('ab-case').value = r.case_id;
+    if(r.complainant) document.getElementById('ab-complainant').value = r.complainant;
+    const prov = document.getElementById('ab-provider');
+    if(r.provider && !prov.value.trim()) prov.value = r.provider;
+    abIp = r.ip || '';
+    document.getElementById('ab-node').value =
+      r.node_name ? (r.node_name + (abIp ? ' · ' + abIp : '')) : abIp;
+    document.getElementById('ab-reply').value = r.reply;
+    abSetSource(r.source, !!r.prior_id);
+    if(!r.case_id) toast('No case id found in the report — set it manually', true);
+  }catch(e){ toast(e.message, true); }
+}
+
+async function abSave(){
+  const reply = document.getElementById('ab-reply').value;
+  const complainant = document.getElementById('ab-complainant').value.trim();
+  if(!reply.trim()){ toast('Nothing to save — draft a reply first', true); return; }
+  if(!complainant){ toast('Set the complainant (the company that reported)', true); return; }
+  try{
+    const c = await api('/api/abuse/cases', {method: 'POST', body: JSON.stringify({
+      case_id: document.getElementById('ab-case').value.trim(),
+      complainant,
+      provider: document.getElementById('ab-provider').value.trim(),
+      node_name: document.getElementById('ab-node').value.split('·')[0].trim(),
+      ip: abIp,
+      report_text: document.getElementById('ab-report').value,
+      reply_text: reply,
+      notes: '',
+    })});
+    toast('Saved case ' + (c.case_id || ('#' + c.id)));
+    abLoaded = false;
+    await abLoadCases();
+  }catch(e){ toast(e.message, true); }
+}
+
+function abCopyText(t){
+  if(!(t || '').trim()){ toast('Nothing to copy', true); return; }
+  navigator.clipboard && navigator.clipboard.writeText(t)
+    .then(() => toast('Reply copied')).catch(() => toast('Copy failed', true));
+}
+function abCopy(){ abCopyText(document.getElementById('ab-reply').value); }
+function abCopyCase(){ abCopyText(document.getElementById('ac-reply').textContent); }
+
+function abView(id){
+  const c = abCases.find(x => x.id === id);
+  if(!c) return;
+  acId = id;
+  document.getElementById('ac-title').textContent = 'Case ' + (c.case_id || ('#' + c.id));
+  document.getElementById('ac-meta').textContent =
+    [(c.created_at || '').slice(0, 16), c.complainant, c.provider, c.node_name || c.ip]
+      .filter(Boolean).join(' · ');
+  document.getElementById('ac-report').textContent = c.report_text || '(no report stored)';
+  document.getElementById('ac-reply').textContent = c.reply_text || '';
+  document.getElementById('ac-overlay').classList.add('open');
+}
+function closeAbCase(){ document.getElementById('ac-overlay').classList.remove('open'); acId = null; }
+
+function abReuse(id){
+  const c = abCases.find(x => x.id === id);
+  if(!c) return;
+  closeAbCase();
+  const newId = document.getElementById('ab-case').value.trim();
+  document.getElementById('ab-complainant').value = c.complainant || '';
+  const prov = document.getElementById('ab-provider');
+  if(!prov.value.trim()) prov.value = c.provider || '';
+  let reply = c.reply_text || '';
+  if(c.case_id && newId) reply = reply.split(c.case_id).join(newId);
+  // re-address the greeting at the current provider (mirrors abuse.swap_salutation)
+  const addr = prov.value.trim();
+  if(addr) reply = reply.replace(/^(?:dear\b[^\n]{0,80}|hello[^\n]{0,40}|hi[^\n]{0,40}|to whom it may concern[^\n]{0,10})$/im, 'Dear ' + addr + ',');
+  document.getElementById('ab-reply').value = reply;
+  abSetSource('reused reply of case ' + (c.case_id || ('#' + c.id)) + ' (' + c.complainant + ')' +
+    (newId ? '' : ' — set the new case id, then draft again to swap it in'), true);
+  document.getElementById('ab-reply').scrollIntoView({behavior: 'smooth', block: 'center'});
+}
+
+async function abDelete(id){
+  if(id == null) return;
+  const c = abCases.find(x => x.id === id);
+  if(!confirm('Delete case ' + ((c && c.case_id) || ('#' + id)) + '?\n\nThe stored report and reply are removed. ' +
+    'Drafting for this complainant then falls back to their next-newest case (or the template).')) return;
+  try{
+    await api('/api/abuse/cases/' + id, {method: 'DELETE'});
+    toast('Case deleted');
+    closeAbCase();
+    abLoaded = false;
+    await abLoadCases();
+  }catch(e){ toast(e.message, true); }
+}
+
+async function openAbTemplate(){
+  try{
+    const r = await api('/api/abuse/template');
+    document.getElementById('at-text').value = r.template;
+    document.getElementById('at-overlay').classList.add('open');
+  }catch(e){ toast(e.message, true); }
+}
+function closeAbTemplate(){ document.getElementById('at-overlay').classList.remove('open'); }
+
+async function saveAbTemplate(){
+  try{
+    const r = await api('/api/abuse/template', {method: 'PUT',
+      body: JSON.stringify({template: document.getElementById('at-text').value})});
+    toast(r.is_default ? 'Template reset to default' : 'Template saved');
+    closeAbTemplate();
+  }catch(e){ toast(e.message, true); }
+}
+
+document.getElementById('ab-filter').addEventListener('input', abRenderTable);
+// pasting a report drafts immediately — the common path is paste → copy → send
+document.getElementById('ab-report').addEventListener('paste', () => setTimeout(abDraft, 60));
+
 document.getElementById('filter').addEventListener('input', () => { renderTable(); });
 document.getElementById('overlay').addEventListener('click', e => { if(e.target.id === 'overlay') closeModal(); });
 document.getElementById('toggle-overlay').addEventListener('click', e => { if(e.target.id === 'toggle-overlay') closeToggle(); });
@@ -4742,10 +5040,13 @@ document.getElementById('wm-overlay').addEventListener('click', e => { if(e.targ
 document.getElementById('lp-overlay').addEventListener('click', e => { if(e.target.id === 'lp-overlay') closeLanding(); });
 document.getElementById('tg-overlay').addEventListener('click', e => { if(e.target.id === 'tg-overlay') closeTgPost(); });
 document.getElementById('du-overlay').addEventListener('click', e => { if(e.target.id === 'du-overlay') closeDistro(); });
-document.addEventListener('keydown', e => { if(e.key === 'Escape'){ closeModal(); closeToggle(); closeSF(); closeAU(); closeUp(); closeRes(); closeTput(); closeF2b(); closeSsh(); closeWallets(); closeWalletManage(); closeLanding(); closeTgPost(); closeDistro(); } });
+document.getElementById('ac-overlay').addEventListener('click', e => { if(e.target.id === 'ac-overlay') closeAbCase(); });
+document.getElementById('at-overlay').addEventListener('click', e => { if(e.target.id === 'at-overlay') closeAbTemplate(); });
+document.addEventListener('keydown', e => { if(e.key === 'Escape'){ closeModal(); closeToggle(); closeSF(); closeAU(); closeUp(); closeRes(); closeTput(); closeF2b(); closeSsh(); closeWallets(); closeWalletManage(); closeLanding(); closeTgPost(); closeDistro(); closeAbCase(); closeAbTemplate(); } });
 
 health();
 load();
+if(location.hash === '#abuse') showTab('abuse');   // deep-link / reload into the abuse tab
 loadWalletList().catch(()=>{});   // populate the wallet-bar nym-cli note
 fetchTraffic24();                 // real 24h fleet traffic (counter-delta) for the cards
 fetchTrafficDaily();              // per-day exit-traffic trend line on the total card
