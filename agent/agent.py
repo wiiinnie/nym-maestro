@@ -41,7 +41,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-AGENT_VERSION = "0.12.2"
+AGENT_VERSION = "0.12.3"
 
 try:
     with open(os.path.abspath(__file__), "rb") as _sf:
@@ -1954,15 +1954,25 @@ else
     echo "$CHAIN6 (v6) not present / ip6tables unavailable; skipping IPv6 blocks" >&2
 fi
 
-# Per-source rate-limit: allow established flows + up to 50 new conn/sec per source IP;
-# drop excess. Remove any prior copies first so re-runs don't stack duplicates.
+# Per-source rate-limit: DROP new TCP connections ABOVE 200/sec per source IP and
+# let everything else FALL THROUGH to nym-node's exit-policy rules below.
+# Never ACCEPT NEW here: an ACCEPT above the policy would bypass its port filter
+# (every TCP port reachable, only throttled) — that was the pre-0.12.3 behaviour.
+# Remove any prior copies first (incl. the legacy upto/ACCEPT + NEW/DROP pair) so
+# re-runs don't stack duplicates.
 if [ "$have4" = 1 ]; then
     iptables -D "$CHAIN" -p tcp -m conntrack --ctstate NEW -j DROP 2>/dev/null || true
-    iptables -D "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit         --hashlimit-mode srcip --hashlimit-upto 200/sec --hashlimit-burst 1000         --hashlimit-name nym_scan -j ACCEPT 2>/dev/null || true
-    iptables -D "$CHAIN" -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    while iptables -D "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit \
+        --hashlimit-mode srcip --hashlimit-upto 200/sec --hashlimit-burst 1000 \
+        --hashlimit-name nym_scan -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit \
+        --hashlimit-mode srcip --hashlimit-above 200/sec --hashlimit-burst 1000 \
+        --hashlimit-name nym_scan_v2 -j DROP 2>/dev/null; do :; done
+    while iptables -D "$CHAIN" -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
 
-    iptables -I "$CHAIN" -p tcp -m conntrack --ctstate NEW -j DROP
-    iptables -I "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit         --hashlimit-mode srcip --hashlimit-upto 200/sec --hashlimit-burst 1000         --hashlimit-name nym_scan -j ACCEPT
+    iptables -I "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit \
+        --hashlimit-mode srcip --hashlimit-above 200/sec --hashlimit-burst 1000 \
+        --hashlimit-name nym_scan_v2 -j DROP
     iptables -I "$CHAIN" -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
     echo "applied rate-limit rules to $CHAIN"
 fi
@@ -1973,17 +1983,17 @@ while IFS= read -r line; do
     [ -z "$ip" ] && continue
     if [[ "$ip" =~ $IP_RE ]]; then
         [ "$have4" = 1 ] || continue
-        if ! iptables -C "$CHAIN" -d "$ip" -j REJECT --reject-with icmp-port-unreachable 2>/dev/null; then
-            iptables -I "$CHAIN" -d "$ip" -j REJECT --reject-with icmp-port-unreachable \
-                || { echo "v4 add failed: $ip" >&2; continue; }
-        fi
+        # delete + re-insert so every block always sits at the TOP of the chain,
+        # above the ESTABLISHED accept (a -C skip would leave older entries buried)
+        while iptables -D "$CHAIN" -d "$ip" -j REJECT --reject-with icmp-port-unreachable 2>/dev/null; do :; done
+        iptables -I "$CHAIN" -d "$ip" -j REJECT --reject-with icmp-port-unreachable \
+            || { echo "v4 add failed: $ip" >&2; continue; }
         c4=$((c4+1))
     elif [[ "$ip" == *:* && "$ip" =~ $IP6_RE ]]; then
         [ "$have6" = 1 ] || continue
-        if ! ip6tables -C "$CHAIN6" -d "$ip" -j REJECT --reject-with icmp6-port-unreachable 2>/dev/null; then
-            ip6tables -I "$CHAIN6" -d "$ip" -j REJECT --reject-with icmp6-port-unreachable \
-                || { echo "v6 add failed: $ip" >&2; continue; }
-        fi
+        while ip6tables -D "$CHAIN6" -d "$ip" -j REJECT --reject-with icmp6-port-unreachable 2>/dev/null; do :; done
+        ip6tables -I "$CHAIN6" -d "$ip" -j REJECT --reject-with icmp6-port-unreachable \
+            || { echo "v6 add failed: $ip" >&2; continue; }
         c6=$((c6+1))
     else
         echo "skipping invalid entry: $ip" >&2
@@ -2080,7 +2090,7 @@ def _eb_chain_summary():
     try:
         rc, out, _ = _run(["iptables", "-L", EB_CHAIN, "-n", "-v"], timeout=10)
         if rc == 0:
-            m = re.search(r"limit:\s*up to\s+(\d+/\w+)\s+burst\s+(\d+)\s+mode\s+srcip", out)
+            m = re.search(r"limit:\s*(?:up to|above)\s+(\d+/\w+)\s+burst\s+(\d+)\s+mode\s+srcip", out)
             if m:
                 rate = m.group(1)
                 burst = int(m.group(2))
@@ -2229,10 +2239,11 @@ def act_extra_blocks_status(params):
     rate_limit_burst = None
     try:
         rc, out, _ = _run(["iptables", "-L", EB_CHAIN, "-n", "-v"], timeout=10)
-        # iptables prints hashlimit as "limit: up to 50/sec burst 200 mode srcip"
+        # iptables prints hashlimit as "limit: above 200/sec burst 1000 mode srcip"
+        # (legacy rules: "limit: up to ...")
         # (no literal "hashlimit"), so detect the per-source limit line directly.
         if rc == 0:
-            m_rate = re.search(r"limit:\s*up to\s+(\d+/\w+)\s+burst\s+(\d+)\s+mode\s+srcip", out)
+            m_rate = re.search(r"limit:\s*(?:up to|above)\s+(\d+/\w+)\s+burst\s+(\d+)\s+mode\s+srcip", out)
             if m_rate:
                 rate_limit_active = True
                 rate_limit_rate = m_rate.group(1)

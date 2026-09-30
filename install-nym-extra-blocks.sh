@@ -63,7 +63,7 @@ purge_exact() {
     done
 }
 
-# Drain ALL nym_scan ACCEPT rules regardless of rate value; never touch dport 465.
+# Drain ALL nym_scan* rules (legacy ACCEPT and v2 DROP) regardless of rate; never touch dport 465.
 drain_nym_scan() {
     local spec
     while :; do
@@ -75,17 +75,17 @@ drain_nym_scan() {
 }
 
 if [ "$have4" = 1 ]; then
-    drain_nym_scan
-    purge_exact -p tcp -m conntrack --ctstate NEW -j DROP
+    drain_nym_scan                     # removes legacy nym_scan ACCEPT and nym_scan_v2 DROP
+    purge_exact -p tcp -m conntrack --ctstate NEW -j DROP   # legacy catch-all DROP
     purge_exact -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
-    # insert exactly one clean triplet (final order: established, rate-accept, drop)
-    "$IPT" -I "$CHAIN" -p tcp -m conntrack --ctstate NEW -j DROP
+    # DROP only the excess and let the rest FALL THROUGH to the exit policy.
+    # Never ACCEPT NEW here: it would bypass the policy's port filter entirely.
     "$IPT" -I "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit \
-        --hashlimit-mode srcip --hashlimit-upto "$RL_RATE" --hashlimit-burst "$RL_BURST" \
-        --hashlimit-name nym_scan -j ACCEPT
+        --hashlimit-mode srcip --hashlimit-above "$RL_RATE" --hashlimit-burst "$RL_BURST" \
+        --hashlimit-name nym_scan_v2 -j DROP
     "$IPT" -I "$CHAIN" -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-    echo "applied single rate-limit ($RL_RATE burst $RL_BURST) to $CHAIN"
+    echo "applied per-source rate-limit (drop above $RL_RATE burst $RL_BURST) to $CHAIN"
 else
     echo "skipped rate-limit: $CHAIN not present" >&2
 fi
@@ -97,13 +97,14 @@ if [ -f "$CACHE" ]; then
         [ -z "$ip" ] && continue
         if [[ "$ip" =~ $IP_RE ]]; then
             [ "$have4" = 1 ] || continue
-            "$IPT" -C "$CHAIN" -d "$ip" -j REJECT --reject-with icmp-port-unreachable 2>/dev/null \
-                || "$IPT" -I "$CHAIN" -d "$ip" -j REJECT --reject-with icmp-port-unreachable || true
+            # delete + re-insert so blocks always sit at the top of the chain
+            while "$IPT" -D "$CHAIN" -d "$ip" -j REJECT --reject-with icmp-port-unreachable 2>/dev/null; do :; done
+            "$IPT" -I "$CHAIN" -d "$ip" -j REJECT --reject-with icmp-port-unreachable || true
             c4=$((c4+1))
         elif [[ "$ip" == *:* && "$ip" =~ $IP6_RE ]]; then
             [ "$have6" = 1 ] || continue
-            "$IPT6" -C "$CHAIN6" -d "$ip" -j REJECT --reject-with icmp6-port-unreachable 2>/dev/null \
-                || "$IPT6" -I "$CHAIN6" -d "$ip" -j REJECT --reject-with icmp6-port-unreachable || true
+            while "$IPT6" -D "$CHAIN6" -d "$ip" -j REJECT --reject-with icmp6-port-unreachable 2>/dev/null; do :; done
+            "$IPT6" -I "$CHAIN6" -d "$ip" -j REJECT --reject-with icmp6-port-unreachable || true
             c6=$((c6+1))
         fi
     done < "$CACHE"

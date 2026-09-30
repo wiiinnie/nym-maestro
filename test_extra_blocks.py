@@ -251,5 +251,28 @@ check("upgrade no longer skips the integrity check when no sha is given",
 check("upgrade confines the NTM script to a basename (no absolute path honoured)",
       "os.path.basename(ntm.get" in inspect.getsource(_up))
 
+# 16. rate-limit must never ACCEPT NEW connections above the exit policy
+#     (CERT-Bund 2026-09-28: port 9166 left the exit because an upto/ACCEPT rule
+#     sat above nym-node's policy REJECTs). Both the built-in and the GitHub
+#     installer script are checked.
+import re as _re
+_inst = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "install-nym-extra-blocks.sh")).read()
+for _name, _src in (("built-in", agent.EB_SCRIPT), ("installer", _inst)):
+    _ins = [l for l in _src.replace("\\\n", " ").splitlines() if " -I " in l]
+    check(f"{_name}: no inserted NEW/ACCEPT rule bypasses the exit policy",
+          not any("NEW" in l and "-j ACCEPT" in l for l in _ins))
+    check(f"{_name}: rate-limit drops only above the limit",
+          any("--hashlimit-above" in l and "-j DROP" in l for l in _ins))
+    check(f"{_name}: no catch-all NEW DROP is inserted",
+          not any(_re.search(r"--ctstate NEW -j DROP", l) for l in _ins))
+    check(f"{_name}: blocks are deleted and re-inserted (always on top)",
+          _re.search(r'-D "\$CHAIN" -d "\$ip" -j REJECT', _src) is not None
+          and _re.search(r'-C "\$CHAIN6?" -d "\$ip"', _src) is None)
+check("rate parser understands the 'above' form",
+      _re.search(r"limit:\s*(?:up to|above)\s+(\d+/\w+)\s+burst\s+(\d+)\s+mode\s+srcip",
+                 "limit: above 200/sec burst 1000 mode srcip") is not None
+      and "(?:up to|above)" in inspect.getsource(agent._eb_chain_summary))
+
 print(f"\n{ok} passed, {fail} failed")
 raise SystemExit(1 if fail else 0)
