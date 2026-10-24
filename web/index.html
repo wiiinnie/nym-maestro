@@ -3435,9 +3435,44 @@ function extraBlocksBadge(s){
       line.title = 'No per-source rate-limit rule in NYM-EXIT — run section 1 (Install / Update script) to apply it.';
       wrap.append(line);
     }
+
+    // line 4: fan-out limiter rejects (agent >= 0.12.5)
+    const fo = fanoutInfo(eb);
+    if(fo){
+      const line = el('span','sub', fo.text);
+      line.style.fontSize = '11px';
+      line.style.whiteSpace = 'nowrap';
+      if(fo.level === 'warn') line.style.color = 'var(--warn, #d9933a)';
+      else if(fo.level === 'muted') line.style.opacity = '0.6';
+      line.title = fo.title;
+      wrap.append(line);
+    }
   }
 
   return wrap;
+}
+
+// Fan-out limiter (NYM-FANOUT chains from the installer): {text, title, level}
+// or null when the agent predates the fields. The reject counter resets whenever
+// the extra-blocks oneshot re-runs (installer / nym-node restart).
+function fanoutInfo(eb){
+  if(!eb || eb.fanout_active === undefined) return null;
+  const n = eb.fanout_rejects;
+  if(!eb.fanout_active){
+    return n != null
+      ? {text: 'fan-out not hooked', level: 'warn',
+         title: 'NYM-FANOUT chains exist but NYM-EXIT has no jump to them (nym-node restart without the oneshot re-running?) — the fan-out limiter is NOT in effect. Re-run the installer.'}
+      : {text: 'no fan-out limit', level: 'muted',
+         title: 'Fan-out limiter not installed — run the installer (section 1) with an install-nym-extra-blocks.sh that includes it.'};
+  }
+  const since = eb.fanout_since ? ' since ' + fmtSince(eb.fanout_since) : '';
+  const lim = eb.fanout_rate ? eb.fanout_rate + ' new dst · burst ' + fmtBurstShort(eb.fanout_burst) : 'limit ?';
+  return {text: 'fan-out: ' + (n != null ? n.toLocaleString() : '?') + ' rejects',
+          level: 'ok',
+          title: 'Fan-out limiter (netscan protection): SYNs to new distinct destinations above ' + lim +
+                 ' per client are answered with RST.\n' +
+                 (n != null ? n.toLocaleString() : '?') + ' rejects (v4+v6)' + since +
+                 ' — the counter resets whenever the extra-blocks oneshot re-runs.'};
 }
 
 let ebTargets = [];
@@ -3516,6 +3551,12 @@ function renderEbStatus(results){
       const rl = el('span','pill warn','no rate-limit');
       rl.title = 'No per-source rate-limit rule found in NYM-EXIT — run section 1 (Install / Update script) to apply it';
       row.append(rl);
+    }
+    const fo = fanoutInfo(res);
+    if(fo){
+      const p = el('span','pill ' + fo.level, fo.text);
+      p.title = fo.title;
+      row.append(p);
     }
     if(res.list_url && !prefillUrl) prefillUrl = res.list_url;
     box.append(row);
