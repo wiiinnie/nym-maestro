@@ -269,6 +269,24 @@ for _name, _src in (("built-in", agent.EB_SCRIPT), ("installer", _inst)):
     check(f"{_name}: blocks are deleted and re-inserted (always on top)",
           _re.search(r'-D "\$CHAIN" -d "\$ip" -j REJECT', _src) is not None
           and _re.search(r'-C "\$CHAIN6?" -d "\$ip"', _src) is None)
+# 17. fan-out limiter (netscan protection, Hetzner 2026-10-24): lives in its own
+#     sub-chains, only counts NEW SYNs to unseen (client, dst) pairs, never ACCEPTs,
+#     is re-hooked idempotently and has a kill switch.
+_fo = _inst.replace("\\\n", " ")
+check("installer: fan-out stage 1 keys on (client, destination) pairs",
+      "--hashlimit-mode srcip,dstip --hashlimit-upto 1/hour --hashlimit-burst 1" in _fo)
+check("installer: fan-out stage 2 rejects per client above FO_RATE/FO_BURST",
+      _re.search(r'-p tcp -m hashlimit --hashlimit-mode srcip\s+--hashlimit-above "\$FO_RATE" '
+                 r'--hashlimit-burst "\$FO_BURST".*-j REJECT --reject-with tcp-reset', _fo) is not None)
+check("installer: fan-out never ACCEPTs (falls through to the exit policy)",
+      not any("FO_CHAIN" in l and "-j ACCEPT" in l for l in _fo.splitlines()))
+check("installer: fan-out jump is purged by exact spec before re-insert",
+      'grep -Fxc -- "-A $chain -j $FO_CHAIN"' in _fo and '-D "$chain" -j "$FO_CHAIN"' in _fo)
+check("installer: fan-out applied to v4 and v6",
+      'fanout_apply "$IPT" "$CHAIN" 4' in _fo and 'fanout_apply "$IPT6" "$CHAIN6" 6' in _fo)
+check("installer: fan-out has a kill switch", 'if [ "$FO_ENABLE" != 1 ]' in _fo)
+check("installer: fan-out writes no LOG rules (no client data stored)", "-j LOG" not in _fo)
+
 check("rate parser understands the 'above' form",
       _re.search(r"limit:\s*(?:up to|above)\s+(\d+/\w+)\s+burst\s+(\d+)\s+mode\s+srcip",
                  "limit: above 200/sec burst 1000 mode srcip") is not None

@@ -31,6 +31,18 @@ IP6_RE='^[0-9a-fA-F:]*:[0-9a-fA-F:]+(/[0-9]{1,3})?$'
 RL_RATE="200/sec"
 RL_BURST="1000"
 
+# Fan-out limiter (netscan protection, Hetzner 2610:3I8XTEPNAC40): caps how many
+# NEW DISTINCT destinations one tunnel client may open. Stage 1 lets only the
+# first SYN per (client, dst) pair within ~1h through to stage 2; stage 2 counts
+# those per client and RSTs above FO_RATE/FO_BURST. Repeat connections to known
+# destinations are never counted. No LOG target: nothing about clients is stored.
+# FO_ENABLE=0 + "Run installer" removes the limiter again (kill switch).
+FO_ENABLE=1
+FO_RATE="20/minute"
+FO_BURST="150"
+FO_CHAIN="NYM-FANOUT"
+FO_CHAIN_NEW="NYM-FANOUT-NEWDST"
+
 mkdir -p "$(dirname "$CACHE")"
 if curl -fsS --max-time 15 "$LIST_URL" -o "${CACHE}.new"; then
     mv "${CACHE}.new" "$CACHE"
@@ -74,6 +86,43 @@ drain_nym_scan() {
     done
 }
 
+# Apply (or with FO_ENABLE=0 remove) the fan-out limiter for one family.
+# Rules live in our own sub-chains, so the per-source rate parser on NYM-EXIT and
+# nym-node's exit policy are untouched; only one jump rule sits in NYM-EXIT.
+# nym-node flushes NYM-EXIT on restart (jump gone) -> this oneshot re-adds it.
+fanout_apply() {
+    local ipt="$1" chain="$2" fam="$3" n
+    # drop every existing jump (count-based, exact spec — never line numbers)
+    n=$("$ipt" -S "$chain" 2>/dev/null | grep -Fxc -- "-A $chain -j $FO_CHAIN" || true)
+    while [ "${n:-0}" -gt 0 ]; do
+        "$ipt" -D "$chain" -j "$FO_CHAIN" 2>/dev/null || break
+        n=$("$ipt" -S "$chain" 2>/dev/null | grep -Fxc -- "-A $chain -j $FO_CHAIN" || true)
+    done
+    if [ "$FO_ENABLE" != 1 ]; then
+        "$ipt" -F "$FO_CHAIN" 2>/dev/null || true; "$ipt" -X "$FO_CHAIN" 2>/dev/null || true
+        "$ipt" -F "$FO_CHAIN_NEW" 2>/dev/null || true; "$ipt" -X "$FO_CHAIN_NEW" 2>/dev/null || true
+        echo "fan-out limiter removed (v$fam)"
+        return 0
+    fi
+    "$ipt" -N "$FO_CHAIN" 2>/dev/null || "$ipt" -F "$FO_CHAIN"
+    "$ipt" -N "$FO_CHAIN_NEW" 2>/dev/null || "$ipt" -F "$FO_CHAIN_NEW"
+    # stage 1: first SYN to a (client, destination) pair not seen within ~1h
+    "$ipt" -A "$FO_CHAIN" -p tcp --syn -m conntrack --ctstate NEW -m hashlimit \
+        --hashlimit-mode srcip,dstip --hashlimit-upto 1/hour --hashlimit-burst 1 \
+        --hashlimit-htable-size 131072 --hashlimit-htable-max 524288 \
+        --hashlimit-htable-expire 3600000 --hashlimit-name "fo_pair$fam" -j "$FO_CHAIN_NEW"
+    "$ipt" -A "$FO_CHAIN" -j RETURN
+    # stage 2: cap new distinct destinations per client, fast-fail with RST
+    "$ipt" -A "$FO_CHAIN_NEW" -p tcp -m hashlimit --hashlimit-mode srcip \
+        --hashlimit-above "$FO_RATE" --hashlimit-burst "$FO_BURST" \
+        --hashlimit-htable-expire 600000 --hashlimit-name "fo_src$fam" \
+        -j REJECT --reject-with tcp-reset
+    "$ipt" -A "$FO_CHAIN_NEW" -j RETURN
+    # matches only NEW SYNs, falls through otherwise -> never bypasses the exit policy
+    "$ipt" -I "$chain" -j "$FO_CHAIN"
+    echo "applied fan-out limiter (v$fam): reject above $FO_RATE new destinations, burst $FO_BURST"
+}
+
 if [ "$have4" = 1 ]; then
     drain_nym_scan                     # removes legacy nym_scan ACCEPT and nym_scan_v2 DROP
     purge_exact -p tcp -m conntrack --ctstate NEW -j DROP   # legacy catch-all DROP
@@ -84,10 +133,15 @@ if [ "$have4" = 1 ]; then
     "$IPT" -I "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit \
         --hashlimit-mode srcip --hashlimit-above "$RL_RATE" --hashlimit-burst "$RL_BURST" \
         --hashlimit-name nym_scan_v2 -j DROP
+    fanout_apply "$IPT" "$CHAIN" 4
     "$IPT" -I "$CHAIN" -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
     echo "applied per-source rate-limit (drop above $RL_RATE burst $RL_BURST) to $CHAIN"
 else
     echo "skipped rate-limit: $CHAIN not present" >&2
+fi
+
+if [ "$have6" = 1 ]; then
+    fanout_apply "$IPT6" "$CHAIN6" 6
 fi
 
 if [ -f "$CACHE" ]; then
