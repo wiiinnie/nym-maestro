@@ -41,7 +41,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-AGENT_VERSION = "0.12.3"
+AGENT_VERSION = "0.12.4"
 
 try:
     with open(os.path.abspath(__file__), "rb") as _sf:
@@ -205,7 +205,27 @@ def _show_props(svc, *props):
     return d
 
 
-def _restart_service(svc, wait=150):
+# systemd keeps a unit in ActiveState=deactivating for the whole teardown
+# chain (stop-sigterm → stop-sigkill → stop-post → final-sigterm →
+# final-sigkill, each bounded by TimeoutStopSec=90s by default). An exit
+# gateway's nym-node can sit in that chain for minutes: with ~15k WireGuard
+# peers on the kernel nymwg interface the process blocks uninterruptibly in
+# the kernel while the interface is torn down, so even SIGKILL is only
+# honoured once the kernel returns ("Processes still around after SIGKILL.
+# Ignoring."). Seen on AT01: 4 min 08 s from "Stopping" to "Started", with the
+# restart completing fine afterwards. As long as the unit is still
+# deactivating, systemd has not given up, so neither do we — up to a hard
+# cap that covers the full chain.
+RESTART_SOFT_WAIT = 150   # normal budget: covers a slow-but-sane stop + start
+RESTART_HARD_WAIT = 420   # only used while ActiveState stays "deactivating"
+
+
+def _unit_state(svc):
+    p = _show_props(svc, "ActiveState", "SubState", "MainPID")
+    return p.get("ActiveState", ""), p.get("SubState", ""), p.get("MainPID", "0")
+
+
+def _restart_service(svc, wait=RESTART_SOFT_WAIT, max_wait=RESTART_HARD_WAIT):
     """Queue a restart with --no-block, then poll until the new instance is up.
 
     nym-node can take well over a minute to stop: its sqlite pool guard waits
@@ -217,6 +237,12 @@ def _restart_service(svc, wait=150):
     gives the truthful outcome instead. Success requires an active state with
     a MainPID different from the pre-restart one, so the still-running old
     instance can't count as "restarted".
+
+    `wait` is the soft budget. Past it we keep polling only while the unit is
+    still *deactivating* (see RESTART_HARD_WAIT above), because the restart
+    job is then demonstrably still in flight and will complete on its own.
+    A unit that merely never leaves "active"/"activating" still times out at
+    `wait`, so a genuinely stuck instance is reported promptly.
 
     Returns (restarted, active, error, elapsed_s).
     """
@@ -231,9 +257,10 @@ def _restart_service(svc, wait=150):
     start = time.monotonic()
     seen_transition = old_pid in ("", "0")  # no old instance: any active pid is the new one
     failed_reads = 0
-    while time.monotonic() - start < wait:
-        p = _show_props(svc, "ActiveState", "MainPID")
-        state, pid = p.get("ActiveState", ""), p.get("MainPID", "0")
+    state = sub = ""
+    elapsed = 0
+    while True:
+        state, sub, pid = _unit_state(svc)
         elapsed = int(time.monotonic() - start)
         if state != "active" or pid != old_pid:
             seen_transition = True
@@ -244,27 +271,42 @@ def _restart_service(svc, wait=150):
         failed_reads = failed_reads + 1 if state == "failed" else 0
         if failed_reads >= 2:
             return False, False, f"{svc} entered failed state after restart", elapsed
+        if elapsed >= wait and (state != "deactivating" or elapsed >= max_wait):
+            break
         time.sleep(2)
     active, _ = service_state()
-    return False, active, f"timed out after {wait}s waiting for {svc} to come back active", wait
+    where = f"{state}/{sub}" if sub else (state or "unknown")
+    if state == "deactivating":
+        msg = (f"{svc} still shutting down after {elapsed}s (systemd phase {sub or 'deactivating'}); "
+               f"the queued restart will complete once the old instance exits — re-check the node")
+    else:
+        msg = f"timed out after {elapsed}s waiting for {svc} to come back active (last state: {where})"
+    return False, active, msg, elapsed
 
 
-def _stop_service(svc, wait=150):
+def _stop_service(svc, wait=RESTART_SOFT_WAIT, max_wait=RESTART_HARD_WAIT):
     """Queue a stop with --no-block, then poll until the unit is down.
 
     Same rationale as _restart_service: a slow nym-node stop outlives short
-    subprocess timeouts. Returns (stopped, error, elapsed_s).
+    subprocess timeouts, and past `wait` we keep polling only while systemd is
+    still visibly tearing the unit down. Returns (stopped, error, elapsed_s).
     """
     rc, out, err = _run(["systemctl", "stop", "--no-block", svc], timeout=15)
     if rc != 0:
         return False, (err or out or "systemctl stop failed").strip(), 0
     start = time.monotonic()
-    while time.monotonic() - start < wait:
-        state = _show_props(svc, "ActiveState").get("ActiveState", "")
+    state = sub = ""
+    elapsed = 0
+    while True:
+        state, sub, _pid = _unit_state(svc)
+        elapsed = int(time.monotonic() - start)
         if state in ("inactive", "failed"):
-            return True, None, int(time.monotonic() - start)
+            return True, None, elapsed
+        if elapsed >= wait and (state != "deactivating" or elapsed >= max_wait):
+            break
         time.sleep(2)
-    return False, f"timed out after {wait}s waiting for {svc} to stop", wait
+    where = f"{state}/{sub}" if sub else (state or "unknown")
+    return False, f"timed out after {elapsed}s waiting for {svc} to stop (last state: {where})", elapsed
 
 
 def fail2ban_banned():

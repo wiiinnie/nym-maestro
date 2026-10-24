@@ -297,6 +297,74 @@ _r = agent._restart_service("nym-node.service", wait=10)
 check("restart_service times out truthfully when the old instance never dies",
       _r[0] is False and _r[1] is True and "timed out" in (_r[2] or ""))
 
+# --- adaptive wait: a unit still *deactivating* past the soft budget keeps
+# being polled (AT01: 248s kernel WireGuard teardown, SIGKILL ignored) ------
+_clk["t"] = 0.0
+_seq3 = {"polls": 0}
+
+
+def _fake_run_long_teardown(cmd, timeout=6, merge=False):
+    if cmd[:3] == ["systemctl", "restart", "--no-block"]:
+        return 0, "", ""
+    if cmd[:2] == ["systemctl", "show"] and "ActiveState" not in cmd:
+        return 0, "MainPID=111\n", ""
+    if cmd[:2] == ["systemctl", "show"]:
+        _seq3["polls"] += 1
+        t = _clk["t"]
+        if t < 90:
+            return 0, "ActiveState=deactivating\nSubState=stop-sigterm\nMainPID=111\n", ""
+        if t < 248:  # SIGKILL sent at 90s, process stuck in the kernel until 248s
+            return 0, "ActiveState=deactivating\nSubState=stop-sigkill\nMainPID=111\n", ""
+        return 0, "ActiveState=active\nSubState=running\nMainPID=222\n", ""
+    return 0, "", ""
+
+
+agent._run = _fake_run_long_teardown
+_r = agent._restart_service("nym-node.service", wait=150, max_wait=420)
+check("restart_service keeps polling past the soft wait while the unit is deactivating",
+      _r[0] is True and _r[1] is True and _r[2] is None and 248 <= _r[3] <= 252)
+
+_clk["t"] = 0.0
+
+
+def _fake_run_forever_deactivating(cmd, timeout=6, merge=False):
+    if cmd[:3] == ["systemctl", "restart", "--no-block"]:
+        return 0, "", ""
+    if cmd[:2] == ["systemctl", "is-active"]:
+        return 0, "deactivating", ""
+    if cmd[:2] == ["systemctl", "show"] and "ActiveState" not in cmd:
+        return 0, "MainPID=111\n", ""
+    if cmd[:2] == ["systemctl", "show"]:
+        return 0, "ActiveState=deactivating\nSubState=final-sigkill\nMainPID=111\n", ""
+    return 0, "", ""
+
+
+agent._run = _fake_run_forever_deactivating
+_r = agent._restart_service("nym-node.service", wait=20, max_wait=60)
+check("restart_service gives up at the hard cap and names the systemd phase",
+      _r[0] is False and _r[1] is False and "final-sigkill" in (_r[2] or "")
+      and "still shutting down" in (_r[2] or "") and 60 <= _r[3] <= 64)
+
+_clk["t"] = 0.0
+
+
+def _fake_run_activating_forever(cmd, timeout=6, merge=False):
+    if cmd[:3] == ["systemctl", "restart", "--no-block"]:
+        return 0, "", ""
+    if cmd[:2] == ["systemctl", "is-active"]:
+        return 0, "activating", ""
+    if cmd[:2] == ["systemctl", "show"] and "ActiveState" not in cmd:
+        return 0, "MainPID=111\n", ""
+    if cmd[:2] == ["systemctl", "show"]:
+        return 0, "ActiveState=activating\nSubState=auto-restart\nMainPID=0\n", ""
+    return 0, "", ""
+
+
+agent._run = _fake_run_activating_forever
+_r = agent._restart_service("nym-node.service", wait=20, max_wait=60)
+check("restart_service does not extend the wait for a unit that is not deactivating",
+      _r[0] is False and "timed out after 2" in (_r[2] or "") and "activating/auto-restart" in (_r[2] or ""))
+
 _clk["t"] = 0.0
 _seq2 = {"polls": 0}
 
@@ -314,6 +382,29 @@ def _fake_run_stop(cmd, timeout=6, merge=False):
 agent._run = _fake_run_stop
 _s = agent._stop_service("nym-node.service", wait=60)
 check("stop_service polls a slow stop through to inactive", _s[0] is True and _s[1] is None)
+
+_clk["t"] = 0.0
+
+
+def _fake_run_stop_long(cmd, timeout=6, merge=False):
+    if cmd[:3] == ["systemctl", "stop", "--no-block"]:
+        return 0, "", ""
+    if cmd[:2] == ["systemctl", "show"]:
+        state = "deactivating" if _clk["t"] < 240 else "inactive"
+        return 0, f"ActiveState={state}\nSubState=stop-sigkill\n", ""
+    return 0, "", ""
+
+
+agent._run = _fake_run_stop_long
+_s = agent._stop_service("nym-node.service", wait=150, max_wait=420)
+check("stop_service rides out a kernel-bound teardown past the soft wait",
+      _s[0] is True and _s[1] is None and 240 <= _s[2] <= 244)
+
+_clk["t"] = 0.0
+agent._run = lambda cmd, timeout=6, merge=False: (0, "ActiveState=deactivating\nSubState=stop-sigkill\n", "") if cmd[:2] == ["systemctl", "show"] else (0, "", "")
+_s = agent._stop_service("nym-node.service", wait=10, max_wait=30)
+check("stop_service gives up at the hard cap while still deactivating",
+      _s[0] is False and "stop-sigkill" in (_s[1] or "") and 30 <= _s[2] <= 34)
 
 agent._run = _orig_run
 agent.time.monotonic, agent.time.sleep = _orig_mono, _orig_sleep
