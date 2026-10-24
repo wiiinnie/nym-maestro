@@ -286,6 +286,57 @@ check("installer: fan-out applied to v4 and v6",
       'fanout_apply "$IPT" "$CHAIN" 4' in _fo and 'fanout_apply "$IPT6" "$CHAIN6" 6' in _fo)
 check("installer: fan-out has a kill switch", 'if [ "$FO_ENABLE" != 1 ]' in _fo)
 check("installer: fan-out writes no LOG rules (no client data stored)", "-j LOG" not in _fo)
+check("installer chain names match the agent's fan-out reader",
+      f'FO_CHAIN="{agent.EB_FO_CHAIN}"' in _fo and f'FO_CHAIN_NEW="{agent.EB_FO_CHAIN_NEW}"' in _fo)
+
+# 18. agent reads the fan-out REJECT counter (v4+v6 summed) and the NYM-EXIT hook
+_FO_L = {
+    "iptables": ("Chain NYM-FANOUT-NEWDST (1 references)\n"
+                 "    pkts      bytes target     prot opt in     out     source               destination\n"
+                 "    1234    74040 REJECT     6    --  *      *       0.0.0.0/0            0.0.0.0/0"
+                 "            limit: above 20/min burst 150 mode srcip htable-expire 600000 reject-with tcp-reset\n"
+                 "    5000   300000 RETURN     0    --  *      *       0.0.0.0/0            0.0.0.0/0\n"),
+    "ip6tables": ("Chain NYM-FANOUT-NEWDST (1 references)\n"
+                  "    pkts      bytes target     prot opt in     out     source               destination\n"
+                  "      66     5280 REJECT     6    --  *      *       ::/0                 ::/0"
+                  "                 limit: above 20/min burst 150 mode srcip reject-with tcp-reset\n"),
+}
+
+
+def _fo_run(hooked, chains=True):
+    def run(cmd, timeout=6, merge=False):
+        if cmd[0] in _FO_L and cmd[1] == "-S":
+            jump = f"-A {cmd[2]} -j NYM-FANOUT\n" if hooked else ""
+            return (0, f"-N {cmd[2]}\n" + jump, "")
+        if cmd[0] in _FO_L and cmd[1] == "-L" and cmd[2] == "NYM-FANOUT-NEWDST":
+            return (0, _FO_L[cmd[0]], "") if chains else (1, "", "No chain/target/match by that name.")
+        if cmd[:2] == ["systemctl", "show"]:
+            return (0, "0\n", "")
+        return (0, "", "")
+    return run
+
+
+_orig_run, _orig_v6 = agent._run, agent._eb_v6_supported
+agent._eb_v6_supported = lambda: True
+try:
+    agent._run = _fo_run(hooked=True)
+    _f = agent._eb_fanout_summary()
+    check("fan-out: rejects summed over v4+v6", _f["fanout_rejects"] == 1300)
+    check("fan-out: rate/burst parsed from the REJECT rule",
+          _f["fanout_rate"] == "20/min" and _f["fanout_burst"] == 150)
+    check("fan-out: jump in NYM-EXIT => active", _f["fanout_active"] is True)
+    agent._run = _fo_run(hooked=False)
+    _f = agent._eb_fanout_summary()
+    check("fan-out: chains without jump => not active, counter still reported",
+          _f["fanout_active"] is False and _f["fanout_rejects"] == 1300)
+    agent._run = _fo_run(hooked=False, chains=False)
+    _f = agent._eb_fanout_summary()
+    check("fan-out: not installed => inactive, rejects None",
+          _f["fanout_active"] is False and _f["fanout_rejects"] is None and _f["fanout_since"] is None)
+finally:
+    agent._run, agent._eb_v6_supported = _orig_run, _orig_v6
+check("fan-out fields are part of the polled extra-blocks state",
+      "fanout_rejects" in agent._extra_blocks_state() or not agent._eb_installed())
 
 check("rate parser understands the 'above' form",
       _re.search(r"limit:\s*(?:up to|above)\s+(\d+/\w+)\s+burst\s+(\d+)\s+mode\s+srcip",

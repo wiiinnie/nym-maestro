@@ -41,7 +41,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-AGENT_VERSION = "0.12.4"
+AGENT_VERSION = "0.12.5"
 
 try:
     with open(os.path.abspath(__file__), "rb") as _sf:
@@ -2142,6 +2142,53 @@ def _eb_chain_summary():
     return blocked, blocklist_size, rate, burst, chain_present
 
 
+EB_FO_CHAIN = "NYM-FANOUT"            # fan-out limiter sub-chains, written by the installer
+EB_FO_CHAIN_NEW = "NYM-FANOUT-NEWDST"
+
+
+def _eb_fanout_summary():
+    """Fan-out limiter (netscan protection) as seen live in iptables.
+
+    hooked: a "-j NYM-FANOUT" jump sits in NYM-EXIT (v4 or v6). nym-node flushes
+    NYM-EXIT on restart; the oneshot re-adds the jump, so hooked=False with the
+    sub-chains still present means the limiter is NOT in effect.
+    rejects: packet counter of the REJECT rule(s) in NYM-FANOUT-NEWDST, v4+v6
+    summed. The installer flushes the chain on every run, so the counter covers
+    the time since the oneshot last ran (since = its ActiveEnterTimestamp).
+    Only counters are read — no per-client data. None = not readable."""
+    hooked = False
+    rejects = None
+    rate = None
+    burst = None
+    fams = [("iptables", EB_CHAIN)]
+    if _eb_v6_supported():
+        fams.append(("ip6tables", EB_CHAIN6))
+    for ipt, chain in fams:
+        try:
+            rc, out, _ = _run([ipt, "-S", chain], timeout=10)
+            if rc == 0 and f"-A {chain} -j {EB_FO_CHAIN}" in (l.strip() for l in out.splitlines()):
+                hooked = True
+            # -x: exact counters (no K/M suffixes)
+            rc, out, _ = _run([ipt, "-L", EB_FO_CHAIN_NEW, "-n", "-v", "-x"], timeout=10)
+            if rc != 0:
+                continue
+            for line in out.splitlines():
+                m = re.match(r"\s*(\d+)\s+\d+\s+REJECT\b", line)
+                if not m:
+                    continue
+                rejects = (rejects or 0) + int(m.group(1))
+                m = re.search(r"limit:\s*above\s+(\d+/\w+)\s+burst\s+(\d+)", line)
+                if m and rate is None:
+                    rate, burst = m.group(1), int(m.group(2))
+        except Exception:
+            pass
+    return {"fanout_active": hooked,
+            "fanout_rejects": rejects,
+            "fanout_rate": rate,
+            "fanout_burst": burst,
+            "fanout_since": nym_node_since(EB_UNIT_NAME) if rejects is not None else None}
+
+
 def _extra_blocks_state():
     """State for the fleet column. One lightweight iptables read gives the live
     blocked-IP count (OUR blocklist entries present in the chain, not the whole
@@ -2152,14 +2199,16 @@ def _extra_blocks_state():
     active = _eb_is("is-active") == "active"
     enabled = _eb_is("is-enabled") in ("enabled", "enabled-runtime", "static", "alias")
     blocked, blocklist_size, rate, burst, chain_present = _eb_chain_summary()
-    return {"installed": True, "enabled": enabled, "active": active,
-            "state": "active" if active else "inactive",
-            "chain_present": chain_present,
-            "blocked_count": blocked,
-            "blocklist_size": blocklist_size,
-            "rate_limit_active": (rate is not None),
-            "rate_limit_rate": rate,
-            "rate_limit_burst": burst}
+    st = {"installed": True, "enabled": enabled, "active": active,
+          "state": "active" if active else "inactive",
+          "chain_present": chain_present,
+          "blocked_count": blocked,
+          "blocklist_size": blocklist_size,
+          "rate_limit_active": (rate is not None),
+          "rate_limit_rate": rate,
+          "rate_limit_burst": burst}
+    st.update(_eb_fanout_summary())
+    return st
 
 
 def _eb_url():
