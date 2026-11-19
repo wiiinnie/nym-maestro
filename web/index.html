@@ -2392,6 +2392,7 @@ function sortKeyVal(n, key){
     case 'traffic':   { const v = trafficVal(s); return v == null ? -1 : v; }
     case 'throughput': { const v = sumDevices(s.throughput); return v == null ? -1 : v; }
     case 'disk':      { const d = s.disk; return (d && d.percent_used != null) ? d.percent_used : -1; }
+    case 'os':        { const o = s.os; if(!o) return ''; const v = String(o.version_id || '').split('.').map(x => String(x).padStart(4,'0')).join('.'); return (o.id || '') + ' ' + v; }
     default:          return '';
   }
 }
@@ -2513,6 +2514,7 @@ function renderTable(){
   htr.append(sortHeader('Throughput', 'throughput'));
   htr.append(el('th', null, '24h'));
   htr.append(sortHeader('Disk', 'disk'));
+  htr.append(sortHeader('OS', 'os'));
   htr.append(el('th', null, ''));
   thead.append(htr); table.append(thead);
 
@@ -2646,6 +2648,10 @@ function renderTable(){
     const dTd = el('td');
     dTd.append(diskPie(s && s.disk));
     tr.append(dTd);
+
+    const oTd = el('td');
+    oTd.append(osCell(s && s.os));
+    tr.append(oTd);
 
     const aTd = el('td');
     const ra = el('div','row-actions');
@@ -3418,6 +3424,25 @@ function fmtBurstShort(n){
   if(n >= 1000 && n % 1000 === 0) return (n/1000) + 'k';
   if(n >= 1000) return (n/1000).toFixed(1).replace(/\.0$/,'') + 'k';
   return String(n);
+}
+
+function osCell(os){
+  // Distro + version from /etc/os-release (agent 0.12.7+; older agents only
+  // show it after a distro scan / dry run, marked as such in the tooltip).
+  if(!os || !(os.id || os.pretty)){
+    const dash = el('span','sub','—');
+    dash.title = 'No OS data (agent 0.12.7+ or a distro scan required)';
+    return dash;
+  }
+  const names = {ubuntu: 'Ubuntu', debian: 'Debian'};
+  const name = names[os.id] || (os.id ? os.id.charAt(0).toUpperCase() + os.id.slice(1) : '');
+  const label = (name && os.version_id) ? name + ' ' + os.version_id : (os.pretty || name);
+  const wrap = el('div');
+  wrap.style.whiteSpace = 'nowrap';
+  wrap.append(el('div', null, label));
+  if(os.codename) wrap.append(el('div', 'sub', os.codename));
+  wrap.title = (os.pretty || label) + (os.source === 'scan' ? ' (from last distro scan)' : '');
+  return wrap;
 }
 
 function diskPie(disk){

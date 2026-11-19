@@ -52,6 +52,7 @@ SELECT n.uid AS uid, n.node_id AS node_id, n.name AS name, n.ip AS ip,
        st.traffic_dir_json AS traffic_dir_json,
        st.throughput_dir_json AS throughput_dir_json,
        st.disk_json AS disk_json,
+       st.os_json AS os_json,
        st.last_seen AS last_seen,
        nx.address AS nyx_address, nx.balance_unym AS nyx_balance_unym,
        nx.balance_at AS nyx_balance_at, nx.error AS nyx_error,
@@ -111,6 +112,7 @@ class Store:
             ("node_status", "traffic_dir_json", "TEXT"),
             ("node_status", "throughput_dir_json", "TEXT"),
             ("node_status", "disk_json", "TEXT"),
+            ("node_status", "os_json", "TEXT"),
             ("node_nyx", "net_json", "TEXT"),
         }
         for table, col, decl in wanted:
@@ -304,7 +306,8 @@ class Store:
                       traffic_bytes=None, traffic=None, throughput=None,
                       agent_version=None, agent_sha=None, extra_blocks=None,
                       nym_node_since=None, uplink_device=None, boot_since=None,
-                      traffic_dir=None, throughput_dir=None, disk=None):
+                      traffic_dir=None, throughput_dir=None, disk=None,
+                      os_info=None):
         with self.lock:
             traffic_json = None
             if traffic is not None:
@@ -317,14 +320,15 @@ class Store:
             traffic_dir_json = json.dumps(traffic_dir) if traffic_dir is not None else None
             throughput_dir_json = json.dumps(throughput_dir) if throughput_dir is not None else None
             disk_json = json.dumps(disk) if disk is not None else None
+            os_json = json.dumps(os_info) if os_info is not None else None
             self.db.execute(
                 'INSERT INTO node_status (uid, reachable, version, mode, '
                 'mixnode, entry, "exit", wireguard, service_active, '
                 'fail2ban_banned, agent_version, agent_sha, traffic_bytes, '
                 'traffic_json, bandwidth_json, extra_blocks_json, '
                 'nym_node_since, uplink_device, boot_since, '
-                'traffic_dir_json, throughput_dir_json, disk_json, last_seen) '
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now')) "
+                'traffic_dir_json, throughput_dir_json, disk_json, os_json, last_seen) '
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now')) "
                 'ON CONFLICT(uid) DO UPDATE SET '
                 'reachable=excluded.reachable, version=excluded.version, '
                 'mode=excluded.mode, mixnode=excluded.mixnode, '
@@ -344,13 +348,14 @@ class Store:
                 'traffic_dir_json=excluded.traffic_dir_json, '
                 'throughput_dir_json=excluded.throughput_dir_json, '
                 'disk_json=excluded.disk_json, '
+                'os_json=excluded.os_json, '
                 'last_seen=excluded.last_seen',
                 (uid, 1 if reachable else 0, version, mode,
                  _ob(mixnode), _ob(entry), _ob(exit), _ob(wireguard),
                  _ob(service_active), fail2ban_banned, agent_version, agent_sha,
                  traffic_bytes, traffic_json, throughput_json, extra_blocks_json,
                  nym_node_since, uplink_device, boot_since,
-                 traffic_dir_json, throughput_dir_json, disk_json),
+                 traffic_dir_json, throughput_dir_json, disk_json, os_json),
             )
             self.db.commit()
 
@@ -897,6 +902,7 @@ def _row_to_view(r: sqlite3.Row) -> dict:
             "traffic_dir": (json.loads(r["traffic_dir_json"]) if ("traffic_dir_json" in r.keys() and r["traffic_dir_json"]) else None),
             "throughput_dir": (json.loads(r["throughput_dir_json"]) if ("throughput_dir_json" in r.keys() and r["throughput_dir_json"]) else None),
             "disk": (json.loads(r["disk_json"]) if ("disk_json" in r.keys() and r["disk_json"]) else None),
+            "os": (json.loads(r["os_json"]) if ("os_json" in r.keys() and r["os_json"]) else None),
             "last_seen": r["last_seen"],
         }
     nyx = None

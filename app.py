@@ -622,6 +622,7 @@ async def poll_all(app: FastAPI) -> dict:
             traffic_dir=res.get("traffic_dir"),
             throughput_dir=res.get("throughput_dir"),
             disk=res.get("disk"),
+            os_info=res.get("os"),
         )
     return {"polled": len(nodes), "reachable": reachable}
 
@@ -680,6 +681,7 @@ async def repoll_nodes(app: FastAPI, nodes: list):
             traffic_dir=res.get("traffic_dir"),
             throughput_dir=res.get("throughput_dir"),
             disk=res.get("disk"),
+            os_info=res.get("os"),
         )
 
 
@@ -1329,6 +1331,13 @@ async def list_nodes(request: Request):
         if st:
             st["agent_stale"] = bool(local_sha and st.get("agent_sha") and st["agent_sha"] != local_sha)
             st["local_agent_version"] = local_ver
+            if not st.get("os"):
+                # agents < 0.12.7 don't report the OS in status; fall back to
+                # the last distro scan / dry run (in-memory, if one ran)
+                scan = getattr(request.app.state, "distro_scan", {}).get(n["uid"])
+                sos = ((scan or {}).get("res") or {}).get("os")
+                if sos:
+                    st["os"] = dict(sos, source="scan")
         # real hosting country from the Nym topology (by IP), for accurate map placement
         nip = _norm_ip(n.get("ip", "")) or n.get("ip", "")
         rec = topo.get(nip) or {}

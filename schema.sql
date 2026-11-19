@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS node_status (
     boot_since       REAL,               -- epoch of last boot (uplink counter start)
     traffic_dir_json TEXT,               -- {dev: {rx,tx}} cumulative, for WG/Mixnet-exit in/out
     throughput_dir_json TEXT,            -- {dev: {rx,tx}} live rate
+    disk_json        TEXT,               -- {total,used,free,percent_used} of /
+    os_json          TEXT,               -- {id,version_id,codename,pretty} from /etc/os-release
     last_seen        TEXT,
     raw_json         TEXT
 );
