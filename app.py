@@ -1757,9 +1757,11 @@ async def exec_action(payload: ExecRequest, request: Request):
 
     async def run_one(node):
         try:
-            # agent-side restarts now poll up to 150s (slow nym-node shutdown);
+            # agent-side restarts poll 150s normally and up to 420s while systemd
+            # is still tearing the old nym-node down (exit gateways with ~15k
+            # WireGuard peers block in the kernel for minutes, SIGKILL included);
             # upgrade worst case stacks download + NTM run + that restart
-            timeout = 600 if payload.action == "upgrade" else 180
+            timeout = 900 if payload.action == "upgrade" else 480
             res = await agent_exec(app_, node, payload.action, payload.params, timeout=timeout)
             ok = bool(res.get("ok", True))
         except Exception as e:
@@ -1793,7 +1795,9 @@ async def _backup_node(app_, node):
     dir and restarts; we stream the archive into BACKUPS, verify its sha256 and
     remove the staged copy on the node. Returns the result dict with `ok` set —
     shared by /api/backup and the distro job's pre-upgrade backup."""
-    res = await agent_exec(app_, node, "backup", timeout=900)
+    # stop + restart may each poll up to 420s on a slow WireGuard teardown,
+    # plus the tar itself
+    res = await agent_exec(app_, node, "backup", timeout=1500)
     ok = bool(res.get("ok"))
     if ok:
         fname = res.get("filename") or ""
