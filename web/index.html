@@ -871,37 +871,36 @@
     <div style="display:flex;flex-direction:column;gap:12px;margin-bottom:14px">
 
       <div style="border:1px solid var(--line);border-radius:8px;padding:12px 14px">
-        <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">1 · Install / Update script</div>
-        <p style="font-size:12px;color:var(--muted);margin:0 0 8px">Ships the orchestrator's own <span class="mono" style="font-size:11px">install-nym-extra-blocks.sh</span> to the selected nodes over mTLS and runs it as root — sets up the systemd oneshot unit, the rate limiting and the IP blocklist. The script is integrity-checked (sha256) before it runs; nothing is fetched from the internet. To change rate-limit values, edit that local file, then run this.</p>
-        <button id="eb-install-script" onclick="ebInstallScript()">Run installer</button>
-      </div>
-
-      <div style="border:1px solid var(--line);border-radius:8px;padding:12px 14px">
-        <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">2 · Update blocklist only</div>
-        <p style="font-size:12px;color:var(--muted);margin:0 0 8px">Pulls the latest <span class="mono" style="font-size:11px">blocklist.txt</span> and applies the REJECT rules to the running <span class="mono" style="font-size:11px">NYM-EXIT</span> chain immediately. Does not touch the rate-limit rules.</p>
-        <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:6px">Blocklist URL
-          <input id="eb-url" placeholder="leave blank for the default list" style="margin-top:3px;font-size:11px;font-family:var(--mono)">
-        </label>
+        <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">1 · Blocklist (maintained here)</div>
+        <p style="font-size:12px;color:var(--muted);margin:0 0 8px">Destination IPs/CIDRs to REJECT in <span class="mono" style="font-size:11px">NYM-EXIT</span>. Enter one per line; <span class="mono" style="font-size:11px">#</span> starts a comment. This list is the source of truth: nodes no longer fetch anything from GitHub.</p>
+        <p style="font-size:12px;color:var(--muted);margin:0 0 8px">Rollout reconciles each selected node. It removes every rule marked <span class="mono" style="font-size:11px">nym_block</span>, then sets the current list, so entries you delete here also disappear from the nodes. The unmarked rules from older versions are replaced by marked ones on the first rollout.</p>
+        <textarea id="eb-list" rows="11" spellcheck="false" oninput="ebListChanged()" style="width:100%;box-sizing:border-box;font-family:var(--mono);font-size:12px;line-height:1.45"></textarea>
+        <div id="eb-list-check" class="sub" style="margin:6px 0 8px;font-size:12px"></div>
         <label class="f2b-check" style="font-size:12px;color:var(--muted);margin-bottom:8px"><input id="eb-restart" type="checkbox">
-          Also restart nym-node to verify on-restart re-application (brief service blip)</label>
+          Also restart nym-node to check that the rules come back after a restart (brief service blip)</label>
         <div style="display:flex;gap:8px">
-          <button id="eb-install" onclick="ebInstall()">Update blocklist</button>
-          <button id="eb-verify" onclick="ebVerify()">Verify</button>
+          <button id="eb-save" onclick="ebSave()">Save list</button>
+          <button id="eb-install" class="primary" onclick="ebInstall()">Save &amp; roll out to selected</button>
         </div>
       </div>
 
       <div style="border:1px solid var(--line);border-radius:8px;padding:12px 14px">
-        <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">3 · Service control</div>
-        <p style="font-size:12px;color:var(--muted);margin:0 0 8px">Restart the <span class="mono" style="font-size:11px">nym-extra-blocks</span> oneshot — re-fetches the blocklist and re-applies all REJECT rules and the rate-limit to the running chain. No nym-node restart needed.</p>
-        <button id="eb-svc-restart" onclick="ebRestartService()">Restart nym-extra-blocks</button>
+        <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">2 · Service control</div>
+        <p style="font-size:12px;color:var(--muted);margin:0 0 8px">Restart re-runs the <span class="mono" style="font-size:11px">nym-extra-blocks</span> oneshot with the list already on the node. It re-applies the block rules, the scan rate-limit and the fan-out limiter to the running chain, without restarting nym-node. Verify checks that every entry is present as a marked rule and that no stale ones are left.</p>
+        <div style="display:flex;gap:8px">
+          <button id="eb-svc-restart" onclick="ebRestartService()">Restart nym-extra-blocks</button>
+          <button id="eb-verify" onclick="ebVerify()">Verify</button>
+        </div>
       </div>
 
     </div>
 
-    <p class="f2b-warn" style="margin-bottom:0">IPv4 goes in <span class="mono">iptables NYM-EXIT</span>; IPv6 entries are applied to
+    <p class="f2b-warn" style="margin-bottom:0">IPv4 entries go into <span class="mono">iptables NYM-EXIT</span>. IPv6 entries go into
       <span class="mono">ip6tables NYM-EXIT</span> when the node has a v6 exit chain
       (set <span class="mono">MAESTRO_NYM_EXIT6</span> on the agent if yours is named differently).
-      The oneshot unit is PartOf nym-node.service, so the rules re-apply automatically on every nym-node restart.</p>
+      The oneshot unit is PartOf nym-node.service, so the rules re-apply automatically after every nym-node or NTM rebuild.
+      The scan rate-limit (<span class="mono">nym_scan_v2</span>, 200/sec · burst 1000) is maestro's own rule, set by the same unit.
+      Rollout needs agent 0.12.9 or newer.</p>
 
     <div class="modal-actions">
       <button id="eb-remove" class="ghost" onclick="ebRemove()" style="margin-right:auto">Remove</button>
@@ -1233,6 +1232,7 @@ async function health(){
 async function load(){
   try{
     nodes = await api('/api/nodes');
+    try{ fleetBlocklistSha = (await api('/api/blocklist')).sha; }catch(_){ /* column just skips the drift flag */ }
     renderMetrics(); renderTable(); renderMap();
     if(listMode === 'all') renderAggList();
   }catch(e){ toast(e.message, true); }
@@ -3616,14 +3616,29 @@ function extraBlocksBadge(s){
     // line 2: blocked IP count (our blocklist entries present in the chain)
     if(eb.blocked_count != null){
       const size = eb.blocklist_size;
-      const txt = (size != null && eb.blocked_count < size)
-        ? eb.blocked_count + '/' + size + ' IPs blocked'
-        : eb.blocked_count + ' IPs blocked';
+      // effectively blocked = marked rules + the unmarked ones an older version set
+      // (they still REJECT until the first rollout replaces them)
+      const eff = ebEffectiveBlocked(eb);
+      const txt = (size != null && eff < size) ? eff + '/' + size + ' IPs blocked' : eff + ' IPs blocked';
       const line = el('span','sub', txt);
       line.style.fontSize = '11px';
       line.style.whiteSpace = 'nowrap';
-      if(size != null && eb.blocked_count < size) line.style.color = 'var(--warn, #d9933a)';
-      line.title = 'Your blocklist REJECT rules present in NYM-EXIT (not the node-wide exit policy, which adds hundreds more).';
+      if(size != null && eff < size) line.style.color = 'var(--warn, #d9933a)';
+      line.title = 'Blocklist entries REJECTed in NYM-EXIT: ' + eb.blocked_count + ' as nym_block-marked rules' +
+        (eb.legacy_rules ? ', ' + eb.legacy_rules + ' still as unmarked rules from the pre-0.12.9 version' : '') +
+        '. The node-wide exit policy adds hundreds more, which are not counted.' +
+        (eb.hits != null ? '\n' + eb.hits.toLocaleString() + ' packets rejected since the rules were last applied' : '');
+      if(eb.hits) line.textContent += ' · ' + eb.hits.toLocaleString() + ' hits';
+      wrap.append(line);
+    }
+
+    // line 2b: list drift vs maestro, migration leftovers, stacking
+    const flags = ebListFlags(eb);
+    if(flags.length){
+      const line = el('span','sub', flags.map(f => f.text).join(' · '));
+      line.style.fontSize = '11px'; line.style.whiteSpace = 'nowrap';
+      line.style.color = 'var(--warn, #d9933a)';
+      line.title = flags.map(f => f.title).join('\n');
       wrap.append(line);
     }
 
@@ -3634,7 +3649,8 @@ function extraBlocksBadge(s){
       line.style.whiteSpace = 'nowrap';
       line.title = 'Per-source-IP connection rate-limit: new TCP connections up to ' +
         eb.rate_limit_rate + ' (burst ' + (eb.rate_limit_burst != null ? eb.rate_limit_burst : '?') +
-        ') per source IP are accepted; excess dropped. Established flows never limited.';
+        ') per source IP are accepted; excess dropped. Established flows never limited.\n' +
+        'maestro\'s own rule (nym_scan_v2), set by nym-extra-blocks. Not part of Nym\'s network-tunnel-manager.';
       wrap.append(line);
     } else if(eb.rate_limit_active === false){
       const line = el('span','sub','no rate-limit');
@@ -3685,13 +3701,72 @@ function fanoutInfo(eb){
 }
 
 let ebTargets = [];
+let fleetBlocklistSha = null;   // sha of the list saved in maestro (for "list outdated")
+let ebSavedText = null, ebCheckTimer = null;
 
 function openExtraBlocks(){
   const sel = selectedNodes().filter(n => n.status && n.status.reachable);
   if(sel.length === 0) return;
   ebTargets = sel.map(n => n.uid);
   document.getElementById('eb-overlay').classList.add('open');
-  loadEbStatus();
+  ebLoadList().then(loadEbStatus);
+}
+
+async function ebLoadList(){
+  try{
+    const b = await api('/api/blocklist');
+    ebSavedText = b.text; fleetBlocklistSha = b.sha;
+    document.getElementById('eb-list').value = b.text;
+    ebRenderCheck(b);
+  }catch(e){ toast(e.message, true); }
+}
+
+function ebListChanged(){
+  clearTimeout(ebCheckTimer);
+  ebCheckTimer = setTimeout(async () => {
+    try{
+      const r = await api('/api/blocklist/check', {method:'POST',
+        body: JSON.stringify({text: document.getElementById('eb-list').value})});
+      ebRenderCheck(r);
+    }catch(e){ toast(e.message, true); }
+  }, 300);
+}
+
+function ebRenderCheck(r){
+  const box = document.getElementById('eb-list-check'); box.innerHTML = '';
+  const dirty = document.getElementById('eb-list').value !== ebSavedText;
+  const head = el('div', null, r.count + ' entr' + (r.count === 1 ? 'y' : 'ies') + ' (' + r.v4 + ' IPv4 · ' + r.v6 + ' IPv6)' +
+    (dirty ? ' · unsaved changes' : ' · saved') + (r.sha ? ' · list ' + r.sha.slice(0, 8) : ''));
+  if(dirty) head.style.color = 'var(--warn)';
+  box.append(head);
+  (r.errors || []).forEach(e => {
+    const d = el('div', null, '✗ line ' + e.line + ': ' + (e.text || '') + ' — ' + e.error);
+    d.style.color = 'var(--danger)'; box.append(d);
+  });
+  (r.duplicates || []).forEach(d => {
+    const x = el('div', null, '· line ' + d.line + ': duplicate of ' + d.same_as + ' (ignored)');
+    x.style.color = 'var(--muted)'; box.append(x);
+  });
+  document.getElementById('eb-save').disabled = !r.valid;
+  document.getElementById('eb-install').disabled = !r.valid;
+}
+
+// PUT the editor text; returns the saved summary or null (errors shown inline)
+async function ebSave(){
+  const text = document.getElementById('eb-list').value;
+  const res = await fetch('/api/blocklist', {method:'PUT', headers:{'Content-Type':'application/json'},
+                                             body: JSON.stringify({text})});
+  const body = await res.json().catch(() => ({}));
+  if(!res.ok){
+    if(body.errors) ebRenderCheck(body);
+    toast(body.error || body.detail || ('save failed (' + res.status + ')'), true);
+    return null;
+  }
+  ebSavedText = text; fleetBlocklistSha = body.sha;
+  ebRenderCheck(body);
+  toast('Blocklist saved · ' + body.count + ' entries');
+  renderTable();
+  return body;
 }
 function closeExtraBlocks(){ document.getElementById('eb-overlay').classList.remove('open'); }
 
@@ -3717,12 +3792,13 @@ function ebCountsText(res){
   if(res.v6 && res.v6.size > 0)
     parts.push('v6 ' + (res.v6.applicable ? res.v6.present + '/' + res.v6.size : 'n/a'));
   if(!parts.length) return (res.rules_present ?? '?') + '/' + (res.blocklist_size ?? '?') + ' rules';
+  if(res.stale_rules) parts.push(res.stale_rules + ' stale');
+  if(res.legacy_rules) parts.push(res.legacy_rules + ' unmarked');
   return parts.join(' · ');
 }
 
 function renderEbStatus(results){
   const box = document.getElementById('eb-status'); box.innerHTML = '';
-  let prefillUrl = null;
   results.forEach(r => {
     const res = r.result || {};
     const row = el('div','f2b-node');
@@ -3737,8 +3813,8 @@ function renderEbStatus(results){
       row.append(el('span','sub','NYM-EXIT not present (nym-node not running?)'));
     } else if(res.blocklist_size != null){
       // blocked-IP count, shown as a clear pill: "N IPs blocked" (+ v6 note if any)
-      const nBlocked = (res.v4 ? res.v4.present : (res.rules_present ?? 0)) +
-                       (res.v6 && res.v6.applicable ? res.v6.present : 0);
+      const nBlocked = (res.v4 ? res.v4.present + (res.v4.legacy || 0) : (res.rules_present ?? 0)) +
+                       (res.v6 && res.v6.applicable ? res.v6.present + (res.v6.legacy || 0) : 0);
       const nTotal = (res.v4 ? res.v4.size : (res.blocklist_size ?? 0)) +
                      (res.v6 && res.v6.applicable ? res.v6.size : 0);
       const blk = el('span','pill ok', nBlocked + ' IPs blocked');
@@ -3767,33 +3843,61 @@ function renderEbStatus(results){
       p.title = fo.title;
       row.append(p);
     }
-    if(res.list_url && !prefillUrl) prefillUrl = res.list_url;
+    ebListFlags(res).forEach(f => { const p = el('span','pill ' + f.level, f.text); p.title = f.title; row.append(p); });
+    if(res.hits != null){
+      const p = el('span','pill info', res.hits.toLocaleString() + ' hits');
+      const per = Object.entries(res.hits_per_dest || {}).sort((a, b) => b[1] - a[1]);
+      p.title = 'Packets rejected by the nym_block rules since they were last applied:\n' +
+        (per.length ? per.map(([d, n]) => d + '  ' + n.toLocaleString()).join('\n') : 'none');
+      row.append(p);
+    }
     box.append(row);
   });
-  const urlEl = document.getElementById('eb-url');
-  if(prefillUrl && !urlEl.value) urlEl.placeholder = prefillUrl;
 }
 
-function ebBody(){
-  const url = (document.getElementById('eb-url').value || '').trim();
-  const b = {node_ids: ebTargets};
-  if(url) b.list_url = url;
-  return b;
+function ebEffectiveBlocked(eb){
+  const n = (eb.blocked_count || 0) + (eb.legacy_rules || 0);
+  return eb.blocklist_size != null ? Math.min(n, eb.blocklist_size) : n;
+}
+
+// warnings about the node's list vs. maestro's: [{text, level, title}]
+function ebListFlags(eb){
+  const f = [];
+  if(!eb || !eb.installed) return f;
+  if(eb.list_sha === undefined){
+    f.push({text: 'agent < 0.12.9', level: 'warn', title: 'This agent still fetches the list from GitHub — run Update agent, then roll out.'});
+    return f;
+  }
+  if(fleetBlocklistSha && eb.list_sha && eb.list_sha !== fleetBlocklistSha)
+    f.push({text: 'list outdated', level: 'warn', title: 'The node runs a different list than the one saved in maestro — roll out to update it.'});
+  if(eb.legacy_rules)
+    f.push({text: eb.legacy_rules + ' unmarked → roll out', level: 'warn', title: eb.legacy_rules + ' block(s) still use the unmarked rules of the pre-0.12.9 version. They do block, but maestro can only reconcile marked rules. The next rollout replaces them with nym_block-marked rules.'});
+  if(eb.stale_rules)
+    f.push({text: eb.stale_rules + ' stale', level: 'warn', title: 'nym_block rules for entries that are no longer on the node\'s list. Run Restart or roll out.'});
+  if(eb.rate_limit_rules > 1)
+    f.push({text: eb.rate_limit_rules + '× nym_scan_v2', level: 'warn', title: 'The scan rate-limit rule is stacked. Restart nym-extra-blocks to drain the duplicates.'});
+  return f;
 }
 
 async function ebInstall(){
   const restart = document.getElementById('eb-restart').checked;
-  if(restart && !confirm('This restarts nym-node on ' + ebTargets.length +
-     ' node(s) — a brief service interruption. Continue?')) return;
-  const body = Object.assign(ebBody(), {restart_node: restart});
+  const check = await api('/api/blocklist/check', {method:'POST',
+    body: JSON.stringify({text: document.getElementById('eb-list').value})}).catch(e => { toast(e.message, true); return null; });
+  if(!check || !check.valid) return;
+  if(!confirm('Roll out ' + check.count + ' entr' + (check.count === 1 ? 'y' : 'ies') + ' to ' + ebTargets.length + ' node(s)?\n' +
+     'Each node is reconciled: nym_block rules not on this list are removed.' +
+     (check.count === 0 ? '\n\nThe list is EMPTY — this removes every block.' : '') +
+     (restart ? '\n\nnym-node is restarted on every node (brief service interruption).' : ''))) return;
+  if(!(await ebSave())) return;
   const btn = document.getElementById('eb-install');
-  btn.disabled = true; btn.textContent = restart ? 'Installing + restarting…' : 'Installing…';
+  btn.disabled = true; btn.textContent = restart ? 'Rolling out + restarting…' : 'Rolling out…';
   try{
-    const r = await api('/api/extra-blocks/install', {method:'POST', body: JSON.stringify(body)});
-    showResults('Extra blocks · install', r.results);
+    const r = await api('/api/extra-blocks/install', {method:'POST',
+      body: JSON.stringify({node_ids: ebTargets, restart_node: restart})});
+    showResults('Extra blocks · rollout', r.results);
     await loadEbStatus(); await load();
   }catch(e){ toast(e.message, true); }
-  btn.disabled = false; btn.textContent = 'Install';
+  btn.disabled = false; btn.textContent = 'Save & roll out to selected';
 }
 
 
@@ -3809,7 +3913,7 @@ async function ebVerify(){
 }
 
 async function ebRemove(){
-  if(!confirm('Remove the extra-blocks unit and delete its REJECT rules from NYM-EXIT on ' +
+  if(!confirm('Remove the extra-blocks unit and delete its nym_block REJECT rules from NYM-EXIT on ' +
      ebTargets.length + ' node(s)?')) return;
   const btn = document.getElementById('eb-remove');
   btn.disabled = true; btn.textContent = 'Removing…';
@@ -3819,17 +3923,6 @@ async function ebRemove(){
     await loadEbStatus(); await load();
   }catch(e){ toast(e.message, true); }
   btn.disabled = false; btn.textContent = 'Remove';
-}
-
-async function ebInstallScript(){
-  const btn = document.getElementById('eb-install-script');
-  btn.disabled = true; btn.textContent = 'Running installer…';
-  try{
-    const r = await api('/api/extra-blocks/install-script', {method:'POST', body: JSON.stringify({node_ids: ebTargets})});
-    showResults('Extra blocks · install script', r.results);
-    await loadEbStatus(); await load();
-  }catch(e){ toast(e.message, true); }
-  btn.disabled = false; btn.textContent = 'Run installer';
 }
 
 async function ebRestartService(){

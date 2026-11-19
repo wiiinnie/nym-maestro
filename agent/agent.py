@@ -41,7 +41,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-AGENT_VERSION = "0.12.8"
+AGENT_VERSION = "0.12.9"
 
 try:
     with open(os.path.abspath(__file__), "rb") as _sf:
@@ -1959,38 +1959,60 @@ def act_peers(params):
 
 
 # --- extra destination blocks (abuse mitigation) ---------------------------
-# A oneshot systemd unit that runs AFTER nym-node (PartOf/WantedBy) and inserts
-# REJECT rules for a fetched blocklist into the NYM-EXIT chain. nym-node flushes
-# that chain on start, so the blocks must be (re)applied on top each time.
+# A oneshot systemd unit that runs AFTER nym-node (PartOf/WantedBy) and applies,
+# on top of the NYM-EXIT chain nym-node rebuilds on every start: maestro's scan
+# rate-limit (nym_scan_v2), the fan-out limiter and the destination blocklist.
+# The blocklist is maintained in maestro (orchestrator DB) and shipped with the
+# install action; the node never fetches it. Every block REJECT carries the
+# comment "nym_block", so maestro reconciles exactly its own rules and never
+# touches nym-node's exit-policy REJECTs.
 
 EB_SH = "/usr/local/sbin/nym-extra-blocks.sh"
 EB_UNIT_NAME = "nym-extra-blocks.service"
 EB_UNIT = "/etc/systemd/system/" + EB_UNIT_NAME
 EB_STATE_DIR = "/var/lib/nym-extra-blocks"
-EB_CACHE = EB_STATE_DIR + "/blocklist.txt"
-EB_URL_FILE = EB_STATE_DIR + "/list_url"
+EB_CACHE = EB_STATE_DIR + "/blocklist.txt"     # current list (written by maestro)
+EB_LEGACY = EB_STATE_DIR + "/legacy.txt"       # pre-marker list, for migration
+EB_URL_FILE = EB_STATE_DIR + "/list_url"       # pre-0.12.9 leftover, removed on install
 EB_CHAIN = "NYM-EXIT"
 EB_CHAIN6 = os.environ.get("MAESTRO_NYM_EXIT6", "NYM-EXIT")  # ip6tables chain (same name by default)
-EB_DEFAULT_LIST_URL = ("https://raw.githubusercontent.com/wiiinnie/nym-maestro/"
-                       "refs/heads/main/blocklist.txt")
+EB_MARK = "nym_block"
+EB_MAX_ENTRIES = 5000
+# Guard against a typo taking the whole exit down (e.g. 0.0.0.0/0). Same bounds
+# as the orchestrator's blocklist.py.
+EB_MIN_PREFIX = {4: 16, 6: 32}
 
 EB_SCRIPT = r"""#!/usr/bin/env bash
 # nym-maestro-managed — do not edit by hand; reinstall via maestro instead.
+# Re-applies to NYM-EXIT on every nym-node start (nym-node / NTM flush the chain):
+#   1. per-source scan rate-limit (nym_scan_v2) — maestro's own rule
+#   2. fan-out limiter (own sub-chains, one jump in NYM-EXIT)
+#   3. destination blocklist: REJECTs marked with the comment nym_block. The list
+#      is written by maestro (blocklist.txt); nothing is fetched from the network.
+# Every delete is by exact spec and count-/loop-based (never by line number: that
+# fails silently on the nf_tables backend and lets rules stack).
 set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+IPT=$(command -v iptables || echo /usr/sbin/iptables)
+IPT6=$(command -v ip6tables || echo /usr/sbin/ip6tables)
 
-LIST_URL="$(cat /var/lib/nym-extra-blocks/list_url 2>/dev/null || true)"
-CACHE="/var/lib/nym-extra-blocks/blocklist.txt"
+STATE_DIR="/var/lib/nym-extra-blocks"
+LIST="$STATE_DIR/blocklist.txt"     # current list, written by maestro
+LEGACY="$STATE_DIR/legacy.txt"      # list of the pre-marker versions (migration)
 CHAIN="NYM-EXIT"
 CHAIN6="__CHAIN6__"
+MARK="nym_block"
 IP_RE='^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$'
 IP6_RE='^[0-9a-fA-F:]*:[0-9a-fA-F:]+(/[0-9]{1,3})?$'
+RL_RATE="200/sec"
+RL_BURST="1000"
 
 # Fan-out limiter (netscan protection, Hetzner 2610:3I8XTEPNAC40): caps how many
 # NEW DISTINCT destinations one tunnel client may open. Stage 1 lets only the
 # first SYN per (client, dst) pair within ~1h through to stage 2; stage 2 counts
 # those per client and RSTs above FO_RATE/FO_BURST. Repeat connections to known
 # destinations are never counted. No LOG target: nothing about clients is stored.
-# FO_ENABLE=0 + "Run installer" removes the limiter again (kill switch).
+# FO_ENABLE=0 + reinstall removes the limiter again (kill switch).
 FO_ENABLE=1
 FO_RATE="20/minute"
 FO_BURST="150"
@@ -2035,86 +2057,111 @@ fanout_apply() {
     echo "applied fan-out limiter (v$fam): reject above $FO_RATE new destinations, burst $FO_BURST"
 }
 
-mkdir -p "$(dirname "$CACHE")"
-
-# Fetch; only overwrite cache on a clean download, else keep last-known-good.
-if curl -fsS --max-time 15 "$LIST_URL" -o "${CACHE}.new"; then
-    mv "${CACHE}.new" "$CACHE"
-else
-    echo "fetch failed, using cached list" >&2
-    rm -f "${CACHE}.new"
-fi
-[ -f "$CACHE" ] || { echo "no list available, nothing to do"; exit 0; }
-
 # nym-node flushes/recreates the exit chains on start, so wait for the v4 chain to
 # exist before applying ON TOP. Poll rather than rely on a fixed sleep.
 have4=0
 for _ in $(seq 1 30); do
-    iptables -nL "$CHAIN" >/dev/null 2>&1 && { have4=1; break; }
+    "$IPT" -nL "$CHAIN" >/dev/null 2>&1 && { have4=1; break; }
     sleep 2
 done
 [ "$have4" = 1 ] || echo "$CHAIN (v4) not present after waiting" >&2
 
 # IPv6 is best-effort: only if ip6tables and the v6 exit chain exist on this node.
 have6=0
-if command -v ip6tables >/dev/null 2>&1 && ip6tables -nL "$CHAIN6" >/dev/null 2>&1; then
+if [ -x "$IPT6" ] && "$IPT6" -nL "$CHAIN6" >/dev/null 2>&1; then
     have6=1
 else
-    echo "$CHAIN6 (v6) not present / ip6tables unavailable; skipping IPv6 blocks" >&2
+    echo "$CHAIN6 (v6) not present / ip6tables unavailable; skipping IPv6" >&2
 fi
 
-# Per-source rate-limit: DROP new TCP connections ABOVE 200/sec per source IP and
-# let everything else FALL THROUGH to nym-node's exit-policy rules below.
-# Never ACCEPT NEW here: an ACCEPT above the policy would bypass its port filter
-# (every TCP port reachable, only throttled) — that was the pre-0.12.3 behaviour.
-# Remove any prior copies first (incl. the legacy upto/ACCEPT + NEW/DROP pair) so
-# re-runs don't stack duplicates.
+# Delete EVERY rule exactly matching the spec; re-count each pass (count-based).
+purge_exact() {   # $1=ipt $2=chain $3..=spec
+    local ipt="$1" ch="$2" n; shift 2
+    n=$("$ipt" -S "$ch" 2>/dev/null | grep -Fxc -- "-A $ch $*" || true)
+    while [ "${n:-0}" -gt 0 ]; do
+        "$ipt" -D "$ch" "$@" 2>/dev/null || break
+        n=$("$ipt" -S "$ch" 2>/dev/null | grep -Fxc -- "-A $ch $*" || true)
+    done
+}
+
+# Delete every rule whose -S line matches the (grep -E) pattern, by its exact
+# spec as printed by -S. Loops until none is left.
+drain_matching() {   # $1=ipt $2=chain $3=pattern [$4=exclude pattern]
+    local ipt="$1" ch="$2" pat="$3" excl="${4:-}" line n=0
+    local -a spec
+    while :; do
+        if [ -n "$excl" ]; then
+            line=$("$ipt" -S "$ch" 2>/dev/null | grep -E -- "$pat" | grep -Ev -- "$excl" | head -n1 || true)
+        else
+            line=$("$ipt" -S "$ch" 2>/dev/null | grep -E -- "$pat" | head -n1 || true)
+        fi
+        [ -n "$line" ] || return 0
+        read -r -a spec <<< "${line#-A $ch }"
+        "$ipt" -D "$ch" "${spec[@]}" || return 1
+        n=$((n+1)); [ "$n" -lt 10000 ] || return 1
+    done
+}
+
+# --- 1+2. scan rate-limit + fan-out limiter ----------------------------------
+# DROP only the excess and let the rest FALL THROUGH to the exit policy. Never
+# ACCEPT NEW here: an ACCEPT above the policy would bypass its port filter (every
+# TCP port reachable, only throttled) — that was the pre-0.12.3 behaviour.
+# All nym_scan* copies (legacy upto/ACCEPT and nym_scan_v2 at any rate) are
+# drained first, so re-runs never stack; port 465 (NTM's SMTPS limit) is untouched.
 if [ "$have4" = 1 ]; then
-    iptables -D "$CHAIN" -p tcp -m conntrack --ctstate NEW -j DROP 2>/dev/null || true
-    while iptables -D "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit \
-        --hashlimit-mode srcip --hashlimit-upto 200/sec --hashlimit-burst 1000 \
-        --hashlimit-name nym_scan -j ACCEPT 2>/dev/null; do :; done
-    while iptables -D "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit \
-        --hashlimit-mode srcip --hashlimit-above 200/sec --hashlimit-burst 1000 \
-        --hashlimit-name nym_scan_v2 -j DROP 2>/dev/null; do :; done
-    while iptables -D "$CHAIN" -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
-
-    iptables -I "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit \
-        --hashlimit-mode srcip --hashlimit-above 200/sec --hashlimit-burst 1000 \
+    drain_matching "$IPT" "$CHAIN" 'nym_scan' 'dport 465' || echo "nym_scan drain incomplete" >&2
+    purge_exact "$IPT" "$CHAIN" -p tcp -m conntrack --ctstate NEW -j DROP   # legacy catch-all DROP
+    purge_exact "$IPT" "$CHAIN" -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    "$IPT" -I "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit \
+        --hashlimit-mode srcip --hashlimit-above "$RL_RATE" --hashlimit-burst "$RL_BURST" \
         --hashlimit-name nym_scan_v2 -j DROP
-    fanout_apply iptables "$CHAIN" 4 || echo "fan-out limiter FAILED (v4), continuing" >&2
-    iptables -I "$CHAIN" -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-    echo "applied rate-limit rules to $CHAIN"
+    fanout_apply "$IPT" "$CHAIN" 4 || echo "fan-out limiter FAILED (v4), continuing" >&2
+    "$IPT" -I "$CHAIN" -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    echo "applied rate-limit (drop above $RL_RATE burst $RL_BURST) to $CHAIN"
 fi
-
 if [ "$have6" = 1 ]; then
-    fanout_apply ip6tables "$CHAIN6" 6 || echo "fan-out limiter FAILED (v6), continuing" >&2
+    fanout_apply "$IPT6" "$CHAIN6" 6 || echo "fan-out limiter FAILED (v6), continuing" >&2
 fi
 
+# --- 3. blocklist: reconcile, not append --------------------------------------
+# (a) drain ALL nym_block-marked REJECTs -> entries removed in maestro disappear
+# (b) migration: drain the unmarked REJECTs older versions inserted, for every
+#     entry of the current and the legacy list (exact old spec only, so nym-node's
+#     own policy REJECTs with ports/other targets are never touched)
+# (c) insert the current list, marked, at the top of the chain
+entries() { [ -f "$1" ] || return 0; sed -e 's/#.*//' -e 's/[[:space:]]//g' "$1" | grep -v '^$' || true; }
 c4=0; c6=0
-while IFS= read -r line; do
-    ip="${line%%#*}"; ip="$(echo "$ip" | xargs)"   # strip comments/whitespace
-    [ -z "$ip" ] && continue
+if [ "$have4" = 1 ]; then
+    drain_matching "$IPT" "$CHAIN" "--comment $MARK( |\$)" || echo "v4 $MARK drain incomplete" >&2
+fi
+if [ "$have6" = 1 ]; then
+    drain_matching "$IPT6" "$CHAIN6" "--comment $MARK( |\$)" || echo "v6 $MARK drain incomplete" >&2
+fi
+for ip in $( { entries "$LIST"; entries "$LEGACY"; } | sort -u ); do
     if [[ "$ip" =~ $IP_RE ]]; then
         [ "$have4" = 1 ] || continue
-        # delete + re-insert so every block always sits at the TOP of the chain,
-        # above the ESTABLISHED accept (a -C skip would leave older entries buried)
-        while iptables -D "$CHAIN" -d "$ip" -j REJECT --reject-with icmp-port-unreachable 2>/dev/null; do :; done
-        iptables -I "$CHAIN" -d "$ip" -j REJECT --reject-with icmp-port-unreachable \
-            || { echo "v4 add failed: $ip" >&2; continue; }
+        while "$IPT" -D "$CHAIN" -d "$ip" -j REJECT --reject-with icmp-port-unreachable 2>/dev/null; do :; done
+    elif [[ "$ip" == *:* && "$ip" =~ $IP6_RE ]]; then
+        [ "$have6" = 1 ] || continue
+        while "$IPT6" -D "$CHAIN6" -d "$ip" -j REJECT --reject-with icmp6-port-unreachable 2>/dev/null; do :; done
+    fi
+done
+for ip in $(entries "$LIST"); do
+    if [[ "$ip" =~ $IP_RE ]]; then
+        [ "$have4" = 1 ] || continue
+        "$IPT" -I "$CHAIN" -d "$ip" -m comment --comment "$MARK" \
+            -j REJECT --reject-with icmp-port-unreachable || { echo "v4 add failed: $ip" >&2; continue; }
         c4=$((c4+1))
     elif [[ "$ip" == *:* && "$ip" =~ $IP6_RE ]]; then
         [ "$have6" = 1 ] || continue
-        while ip6tables -D "$CHAIN6" -d "$ip" -j REJECT --reject-with icmp6-port-unreachable 2>/dev/null; do :; done
-        ip6tables -I "$CHAIN6" -d "$ip" -j REJECT --reject-with icmp6-port-unreachable \
-            || { echo "v6 add failed: $ip" >&2; continue; }
+        "$IPT6" -I "$CHAIN6" -d "$ip" -m comment --comment "$MARK" \
+            -j REJECT --reject-with icmp6-port-unreachable || { echo "v6 add failed: $ip" >&2; continue; }
         c6=$((c6+1))
     else
         echo "skipping invalid entry: $ip" >&2
     fi
-done < "$CACHE"
-
-echo "applied $c4 IPv4 + $c6 IPv6 block entries"
+done
+echo "applied $c4 IPv4 + $c6 IPv6 $MARK entries"
 """
 
 EB_UNIT_TPL = """[Unit]
@@ -2125,7 +2172,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStartPre=/bin/sleep 5
+ExecStartPre=/bin/sleep 10
 ExecStart=/usr/local/sbin/nym-extra-blocks.sh
 RemainAfterExit=yes
 
@@ -2143,75 +2190,193 @@ def _eb_is(state_cmd):
     return out.strip()
 
 
-def _eb_entries_cached():
-    """Valid IPv4/IPv6 (optionally CIDR) blocklist entries from the ON-DISK cache
-    only — never the network. Used by the per-poll status path so building status
-    can't block on a slow GitHub fetch. Returns [] if the cache is missing."""
-    text = _read_file(EB_CACHE)
+def eb_canonical(entry):
+    """Canonical network string ("1.2.3.4/32", "2001:db8::/48") or None.
+    Host bits set ("10.0.0.5/24") and too-broad prefixes are rejected, not
+    silently widened/accepted."""
+    if not isinstance(entry, str):
+        return None
+    e = entry.strip()
+    if not e or len(e) > 64:
+        return None
+    try:
+        net = ipaddress.ip_network(e, strict=True)
+    except ValueError:
+        return None
+    if net.prefixlen < EB_MIN_PREFIX[net.version]:
+        return None
+    return str(net)
+
+
+def eb_list_sha(entries):
+    """Order-independent fingerprint of a list; the orchestrator computes the same
+    one so the UI can flag nodes that still run an older list."""
+    canon = sorted({c for c in (eb_canonical(e) for e in entries) if c})
+    return hashlib.sha256("\n".join(canon).encode()).hexdigest()
+
+
+def _eb_parse_file(path):
     out = []
-    for line in (text or "").splitlines():
+    for line in (_read_file(path) or "").splitlines():
         e = line.split("#", 1)[0].strip()
         if not e:
             continue
         try:
-            ipaddress.ip_network(e, strict=False)
+            out.append(str(ipaddress.ip_network(e, strict=False)))
         except ValueError:
             continue
-        out.append(e)
     return out
 
 
-def _eb_chain_summary():
-    """Live summary for the fleet column. Returns (blocked_count, blocklist_size,
-    rate, burst, chain_present).
+def _eb_entries_cached():
+    """Blocklist entries from the on-disk list (canonical form). Never the network."""
+    return _eb_parse_file(EB_CACHE)
 
-    chain_present is whether the NYM-EXIT (v4) chain exists at all: when it does
-    not, the oneshot can apply neither rate-limit nor blocks, so the overview must
-    flag it rather than showing a reassuring "Active, 0/N".
 
-    blocked_count is how many of OUR blocklist entries are actually present in the
-    chain — NOT the total REJECT count. The NYM-EXIT chain also carries hundreds of
-    REJECTs from nym-node's own exit policy; counting all of them would be
-    misleading (it would show ~432 when our blocklist has only a handful). We use
-    the same blocklist-aware count as _eb_verify().
+def _eb_fetch_entries(url=None):
+    # kept for callers of the old name: the list is local now
+    return _eb_entries_cached()
 
-    rate/burst come from parsing the per-source hashlimit line. Fields that can't
-    be read come back as None."""
-    blocked = None
-    blocklist_size = None
-    chain_present = None
+
+def _eb_family(entry):
     try:
-        # IMPORTANT: read the blocklist from the LOCAL cache only, never the network.
-        # This runs on every status poll; a network fetch here (even with a timeout)
-        # can stall the whole /v1/status endpoint and take the node offline when the
-        # path to GitHub is slow. The extra-blocks installer keeps EB_CACHE current.
-        entries = _eb_entries_cached()
-        v4 = [e for e in entries if _eb_family(e) == 4]
-        v6 = [e for e in entries if _eb_family(e) == 6]
-        chain_present, d4 = _eb_chain_rules("iptables", EB_CHAIN)
-        if _eb_v6_supported():
-            _, d6 = _eb_chain_rules("ip6tables", EB_CHAIN6)
-        else:
-            d6 = set()
-        blocked = _eb_present(v4, d4) + _eb_present(v6, d6)
-        blocklist_size = len(entries)
-    except Exception:
-        blocked = None
-        blocklist_size = None
+        return ipaddress.ip_network(entry, strict=False).version
+    except ValueError:
+        return None
 
-    rate = None
-    burst = None
+
+def _eb_norm(d):
     try:
-        rc, out, _ = _run(["iptables", "-L", EB_CHAIN, "-n", "-v"], timeout=10)
-        if rc == 0:
-            m = re.search(r"limit:\s*(?:up to|above)\s+(\d+/\w+)\s+burst\s+(\d+)\s+mode\s+srcip", out)
-            if m:
-                rate = m.group(1)
-                burst = int(m.group(2))
-    except Exception:
-        pass
+        return str(ipaddress.ip_network(d, strict=False))
+    except ValueError:
+        return d
 
-    return blocked, blocklist_size, rate, burst, chain_present
+
+_EB_LEGACY_RE = re.compile(r"^-A (\S+) -d (\S+) -j REJECT --reject-with icmp6?-port-unreachable$")
+
+
+def _eb_chain_rules(cmd, chain):
+    """(chain_present, {marked dests}, {unmarked old-style dests}) from `-S`.
+    Marked = REJECTs carrying the nym_block comment (ours). Unmarked old-style =
+    the exact form pre-0.12.9 maestro inserted; nym-node's policy REJECTs may share
+    it, so callers only ever look at dests that are (or were) on our list."""
+    rc, out, _ = _run([cmd, "-S", chain])
+    if rc != 0:
+        return False, set(), set()
+    marked, legacy = set(), set()
+    for line in out.splitlines():
+        line = line.strip()
+        if "-j REJECT" not in line:
+            continue
+        m = re.match(r"-A\s+" + re.escape(chain) + r"\s+-d\s+(\S+)\s", line)
+        if not m:
+            continue
+        if re.search(r"--comment\s+\"?" + EB_MARK + r"\"?(\s|$)", line):
+            marked.add(_eb_norm(m.group(1)))
+        elif _EB_LEGACY_RE.match(line):
+            legacy.add(_eb_norm(m.group(1)))
+    return True, marked, legacy
+
+
+def _eb_v6_supported():
+    return shutil.which("ip6tables") is not None
+
+
+def _eb_hits(cmd, chain):
+    """Packet counters of our marked REJECTs: (total, {dest: pkts}) or (None, {})."""
+    rc, out, _ = _run([cmd, "-L", chain, "-n", "-v", "-x"], timeout=10)
+    if rc != 0:
+        return None, {}
+    total, per = 0, {}
+    for line in out.splitlines():
+        if "REJECT" not in line or ("/* " + EB_MARK + " */") not in line:
+            continue
+        m = re.match(r"\s*(\d+)\s+\d+\s+REJECT\s", line)
+        if not m:
+            continue
+        cols = line.split("/*", 1)[0].split()
+        dest = _eb_norm(cols[-1]) if cols else "?"
+        per[dest] = per.get(dest, 0) + int(m.group(1))
+        total += int(m.group(1))
+    return total, per
+
+
+def _eb_scan(entries=None):
+    """One read of both families: per-family presence of the list as marked
+    rules, stale marked rules (not on the list), leftover unmarked old-style
+    rules for list/legacy entries, and hit counters."""
+    entries = _eb_entries_cached() if entries is None else entries
+    legacy_src = set(_eb_parse_file(EB_LEGACY)) | set(entries)
+    v6_supported = _eb_v6_supported()
+    fams = {}
+    for fam, cmd, chain in ((4, "iptables", EB_CHAIN), (6, "ip6tables", EB_CHAIN6)):
+        want = [e for e in entries if _eb_family(e) == fam]
+        if fam == 6 and not v6_supported:
+            fams[fam] = {"size": len(want), "present": 0, "chain_present": False, "stale": 0,
+                         "legacy": 0, "hits": None, "per_dest": {}, "supported": False,
+                         "applicable": False}
+            continue
+        cp, marked, legacy = _eb_chain_rules(cmd, chain)
+        hits, per = _eb_hits(cmd, chain) if cp else (None, {})
+        fams[fam] = {
+            "size": len(want),
+            "present": sum(1 for e in want if e in marked),
+            "chain_present": cp,
+            "stale": len(marked - set(want)),
+            "legacy": len({d for d in legacy if d in legacy_src and _eb_family(d) == fam}),
+            "hits": hits, "per_dest": per,
+            "supported": True, "applicable": bool(cp),
+        }
+    return entries, fams
+
+
+def _eb_verify(entries=None):
+    """Authoritative check of the blocklist rules. IPv6 is best-effort: a node
+    without a v6 exit chain is not a failure."""
+    entries, f = _eb_scan(entries)
+    v4, v6 = f[4], f[6]
+    v4_ok = v4["size"] == 0 or (v4["chain_present"] and v4["present"] >= v4["size"])
+    v6_ok = v6["size"] == 0 or not v6["applicable"] or v6["present"] >= v6["size"]
+    hits = [x["hits"] for x in (v4, v6) if x["hits"] is not None]
+    per = dict(v4["per_dest"]); per.update(v6["per_dest"])
+    sample = entries[0] if entries else None
+    return {
+        "chain_present": v4["chain_present"],
+        "blocklist_size": len(entries),
+        "rules_present": v4["present"] + (v6["present"] if v6["applicable"] else 0),
+        "stale_rules": v4["stale"] + v6["stale"],
+        "legacy_rules": v4["legacy"] + v6["legacy"],
+        "hits": sum(hits) if hits else None,
+        "hits_per_dest": per,
+        "sample_ip": sample,
+        "sample_blocked": (sample is not None and per.get(sample) is not None) if sample else None,
+        # an empty list is a valid, fully applied state
+        "all_present": v4_ok and v6_ok and v4["stale"] + v6["stale"] == 0,
+        "list_sha": eb_list_sha(entries),
+        "v4": {k: v4[k] for k in ("size", "present", "chain_present", "stale", "legacy")},
+        "v6": {k: v6[k] for k in ("size", "present", "chain_present", "stale", "legacy",
+                                   "supported", "applicable")},
+    }
+
+
+def _eb_rate_limit():
+    """(rate, burst, count) of maestro's nym_scan_v2 rule, read by name from -S.
+    count > 1 means stacked duplicates."""
+    rc, out, _ = _run(["iptables", "-S", EB_CHAIN], timeout=10)
+    if rc != 0:
+        return None, None, 0
+    rate = burst = None
+    n = 0
+    for line in out.splitlines():
+        if "--hashlimit-name nym_scan_v2" not in line:
+            continue
+        n += 1
+        m = re.search(r"--hashlimit-above (\S+)", line)
+        b = re.search(r"--hashlimit-burst (\d+)", line)
+        if m and rate is None:
+            rate = m.group(1)
+            burst = int(b.group(1)) if b else None
+    return rate, burst, n
 
 
 EB_FO_CHAIN = "NYM-FANOUT"            # fan-out limiter sub-chains, written by the installer
@@ -2262,131 +2427,33 @@ def _eb_fanout_summary():
 
 
 def _extra_blocks_state():
-    """State for the fleet column. One lightweight iptables read gives the live
-    blocked-IP count (OUR blocklist entries present in the chain, not the whole
-    exit policy) and the active per-source rate/burst, so the overview can show
-    them without opening the modal."""
+    """State for the fleet column: blocklist presence (marked rules only), hits,
+    list fingerprint, migration leftovers, rate-limit and fan-out. Reads only the
+    local list and iptables — never the network (runs on every status poll)."""
     if not _eb_installed():
         return {"installed": False, "enabled": False, "active": False, "state": "missing"}
     active = _eb_is("is-active") == "active"
     enabled = _eb_is("is-enabled") in ("enabled", "enabled-runtime", "static", "alias")
-    blocked, blocklist_size, rate, burst, chain_present = _eb_chain_summary()
     st = {"installed": True, "enabled": enabled, "active": active,
-          "state": "active" if active else "inactive",
-          "chain_present": chain_present,
-          "blocked_count": blocked,
-          "blocklist_size": blocklist_size,
-          "rate_limit_active": (rate is not None),
-          "rate_limit_rate": rate,
-          "rate_limit_burst": burst}
+          "state": "active" if active else "inactive"}
+    try:
+        v = _eb_verify()
+        st.update({
+            "chain_present": v["chain_present"],
+            "blocked_count": v["rules_present"],
+            "blocklist_size": v["blocklist_size"],
+            "stale_rules": v["stale_rules"],
+            "legacy_rules": v["legacy_rules"],
+            "hits": v["hits"],
+            "list_sha": v["list_sha"],
+        })
+    except Exception:
+        st.update({"chain_present": None, "blocked_count": None, "blocklist_size": None})
+    rate, burst, n = _eb_rate_limit()
+    st.update({"rate_limit_active": rate is not None, "rate_limit_rate": rate,
+               "rate_limit_burst": burst, "rate_limit_rules": n})
     st.update(_eb_fanout_summary())
     return st
-
-
-def _eb_url():
-    txt = _read_file(EB_URL_FILE)
-    return txt.strip() if txt and txt.strip() else EB_DEFAULT_LIST_URL
-
-
-def _eb_fetch_entries(url=None):
-    """Valid IPv4/IPv6 (optionally CIDR) entries from the URL or the on-disk cache."""
-    url = url or _eb_url()
-    text = None
-    try:
-        with urllib.request.urlopen(url, timeout=15) as r:
-            text = r.read().decode("utf-8", "replace")
-    except Exception:
-        text = _read_file(EB_CACHE)
-    out = []
-    for line in (text or "").splitlines():
-        e = line.split("#", 1)[0].strip()
-        if not e:
-            continue
-        try:
-            ipaddress.ip_network(e, strict=False)
-        except ValueError:
-            continue
-        out.append(e)
-    return out
-
-
-# kept for callers/tests that expect the old name (now dual-stack)
-_eb_fetch_list = _eb_fetch_entries
-
-
-def _eb_family(entry):
-    try:
-        return ipaddress.ip_network(entry, strict=False).version
-    except ValueError:
-        return None
-
-
-def _eb_chain_rules(cmd, chain):
-    """(chain_present, {blocked dests}) for REJECT rules in `chain` (cmd = iptables|ip6tables)."""
-    rc, out, _ = _run([cmd, "-S", chain])
-    if rc != 0:
-        return False, set()
-    dests = set()
-    for line in out.splitlines():
-        m = re.match(r"-A\s+" + re.escape(chain) + r"\s+-d\s+(\S+)\s+.*-j\s+REJECT", line)
-        if m:
-            d = m.group(1)
-            dests.add(d)
-            if "/" in d:
-                dests.add(d.split("/")[0])
-    return True, dests
-
-
-def _eb_present(entries, dests):
-    n = 0
-    for e in entries:
-        base = e.split("/")[0]
-        if e in dests or base in dests or (base + "/32") in dests or (base + "/128") in dests:
-            n += 1
-    return n
-
-
-def _eb_v6_supported():
-    return shutil.which("ip6tables") is not None
-
-
-def _eb_verify(url=None):
-    """Authoritative check: are the blocklist's REJECT rules present in the exit
-    chains? We verify the installed rules (v4 in iptables/NYM-EXIT, v6 in
-    ip6tables/NYM-EXIT), not node-originated reachability — those chains govern
-    FORWARDed exit traffic, so a probe from the node's own stack wouldn't traverse
-    them. IPv6 is best-effort: a v4-only node (no v6 exit chain) is not a failure."""
-    entries = _eb_fetch_entries(url)
-    v4 = [e for e in entries if _eb_family(e) == 4]
-    v6 = [e for e in entries if _eb_family(e) == 6]
-    cp4, d4 = _eb_chain_rules("iptables", EB_CHAIN)
-    v6_supported = _eb_v6_supported()
-    cp6, d6 = _eb_chain_rules("ip6tables", EB_CHAIN6) if v6_supported else (False, set())
-    p4, p6 = _eb_present(v4, d4), _eb_present(v6, d6)
-    v6_applicable = bool(v6) and v6_supported and cp6
-
-    v4_ok = (not v4) or (cp4 and p4 >= len(v4))
-    # v6 counts only when the node actually has a v6 exit chain to apply to
-    v6_ok = (not v6) or (not (v6_supported and cp6)) or (p6 >= len(v6))
-
-    sample = (v4 + v6)[0] if (v4 or v6) else None
-    sample_blocked = None
-    if sample is not None:
-        dests = d4 if _eb_family(sample) == 4 else d6
-        base = sample.split("/")[0]
-        sample_blocked = (sample in dests or base in dests
-                          or (base + "/32") in dests or (base + "/128") in dests)
-    return {
-        "chain_present": cp4,
-        "blocklist_size": len(entries),
-        "rules_present": p4 + p6,
-        "sample_ip": sample,
-        "sample_blocked": sample_blocked,
-        "all_present": bool(entries) and v4_ok and v6_ok,
-        "v4": {"size": len(v4), "present": p4, "chain_present": cp4},
-        "v6": {"size": len(v6), "present": p6, "chain_present": cp6,
-               "supported": v6_supported, "applicable": v6_applicable},
-    }
 
 
 def act_extra_blocks_status(params):
@@ -2394,29 +2461,27 @@ def act_extra_blocks_status(params):
     st["ok"] = True
     st["chain"] = EB_CHAIN
     st["chain6"] = EB_CHAIN6
-    st["list_url"] = _eb_url()
-    st.update({k: v for k, v in _eb_verify().items() if k != "ok"})
-    # parse rate limit values from the live iptables chain
-    rate_limit_active = False
-    rate_limit_rate = None
-    rate_limit_burst = None
-    try:
-        rc, out, _ = _run(["iptables", "-L", EB_CHAIN, "-n", "-v"], timeout=10)
-        # iptables prints hashlimit as "limit: above 200/sec burst 1000 mode srcip"
-        # (legacy rules: "limit: up to ...")
-        # (no literal "hashlimit"), so detect the per-source limit line directly.
-        if rc == 0:
-            m_rate = re.search(r"limit:\s*(?:up to|above)\s+(\d+/\w+)\s+burst\s+(\d+)\s+mode\s+srcip", out)
-            if m_rate:
-                rate_limit_active = True
-                rate_limit_rate = m_rate.group(1)
-                rate_limit_burst = int(m_rate.group(2))
-    except Exception:
-        pass
-    st["rate_limit_active"] = rate_limit_active
-    st["rate_limit_rate"] = rate_limit_rate
-    st["rate_limit_burst"] = rate_limit_burst
+    st["mark"] = EB_MARK
+    if st.get("installed"):
+        st.update({k: v for k, v in _eb_verify().items() if k != "ok"})
     return st
+
+
+def _eb_validate_entries(raw):
+    """(canonical entries, error). The orchestrator validates first; this is the
+    node's own check before anything reaches a root shell."""
+    if not isinstance(raw, list):
+        return None, "entries must be a list"
+    if len(raw) > EB_MAX_ENTRIES:
+        return None, f"too many entries (max {EB_MAX_ENTRIES})"
+    out, seen = [], set()
+    for e in raw:
+        c = eb_canonical(e)
+        if c is None:
+            return None, f"invalid or too broad entry: {str(e)[:64]!r}"
+        if c not in seen:
+            seen.add(c); out.append(c)
+    return out, None
 
 
 def _eb_backup_existing():
@@ -2439,19 +2504,24 @@ def _eb_backup_existing():
     return backed, handmade
 
 
-def _eb_write_files(list_url):
-    if not _EB_URL_OK(list_url):
-        return False, "blocklist URL must be http(s)", {}
+def _eb_write_files(entries):
     nym = resolve_service()
     backed, handmade = _eb_backup_existing()
     try:
         os.makedirs(EB_STATE_DIR, exist_ok=True)
         os.makedirs(os.path.dirname(EB_SH), exist_ok=True)
-        # Write the URL the runtime script reads (via cat) BEFORE the script itself,
-        # so a concurrently-triggered oneshot always finds it. The URL is no longer
-        # baked into the script text — reading it from a file means its contents can
-        # never be re-parsed by the shell (closes the LIST_URL injection vector).
-        _write_file(EB_URL_FILE, list_url + "\n")
+        # Migration: the list an older version applied (unmarked REJECTs) is kept
+        # once as legacy.txt so the script can replace exactly those rules.
+        if not os.path.exists(EB_LEGACY) and os.path.exists(EB_CACHE):
+            _write_file(EB_LEGACY, _read_file(EB_CACHE) or "")
+        # list before the script, so a concurrently-triggered oneshot finds it
+        tmp = EB_CACHE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write("# written by nym-maestro — edit the list in maestro, not here\n")
+            f.write("".join(e + "\n" for e in entries))
+        os.replace(tmp, EB_CACHE)
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(EB_URL_FILE)
         tmp = EB_SH + ".tmp"
         with open(tmp, "w") as f:
             f.write(EB_SCRIPT.replace("__CHAIN6__", EB_CHAIN6))
@@ -2467,18 +2537,8 @@ def _eb_write_files(list_url):
                         "backups": backed}
 
 
-# Defence-in-depth alongside reading the URL from a file at runtime: reject any
-# value that isn't a plain http(s) URL (no quotes, whitespace, backticks or other
-# shell metacharacters) before it is ever persisted or handed to curl.
-_EB_URL_RE = re.compile(r"^https?://[\w.\-~:/?#\[\]@!$&()*+,;=%]+$")
-
-
-def _EB_URL_OK(url):
-    return isinstance(url, str) and len(url) < 2000 and bool(_EB_URL_RE.match(url))
-
-
-def _eb_wait_rules(want, deadline_s=90):
-    """Poll until the blocklist rules appear (after a nym-node restart), bounded."""
+def _eb_wait_rules(deadline_s=90):
+    """Poll until the list is fully applied (after a nym-node restart), bounded."""
     end = time.time() + deadline_s
     last = _eb_verify()
     while time.time() < end:
@@ -2490,15 +2550,22 @@ def _eb_wait_rules(want, deadline_s=90):
 
 
 def act_extra_blocks_install(params):
-    list_url = params.get("list_url") or EB_DEFAULT_LIST_URL
+    """Write the list maestro sent + script + unit, then apply. This is also the
+    'roll out blocklist' action: the oneshot reconciles (drains every nym_block
+    REJECT, then sets the current list), so removed entries disappear too."""
+    if "entries" not in params:
+        return {"ok": False, "error": "no blocklist entries sent — the list is managed in "
+                                      "maestro now; update the orchestrator"}
+    entries, err = _eb_validate_entries(params.get("entries"))
+    if err:
+        return {"ok": False, "error": err}
     restart_node = bool(params.get("restart_node", False))
     log = []
-
-    before = _eb_verify(list_url)
-    ok, err, meta = _eb_write_files(list_url)
+    before = _eb_verify()
+    ok, err, meta = _eb_write_files(entries)
     if not ok:
         return {"ok": False, "error": err}
-    log.append(f"installed {EB_UNIT_NAME} (enabled), targeting {resolve_service()}")
+    log.append(f"wrote {len(entries)} entries + {EB_UNIT_NAME} (enabled), targeting {resolve_service()}")
     if meta.get("replaced_existing"):
         log.append("backed up the pre-existing " +
                    ("hand-made " if meta.get("replaced_handmade") else "") +
@@ -2513,10 +2580,10 @@ def act_extra_blocks_install(params):
         log.append(f"restarted {svc} ({elapsed}s)")
         # the oneshot is WantedBy nym-node and fires on its own; poll for the rules,
         # then nudge it once if they haven't landed yet
-        after = _eb_wait_rules(want=before["blocklist_size"], deadline_s=75)
+        after = _eb_wait_rules(deadline_s=75)
         if not after["all_present"]:
             _run(["systemctl", "restart", EB_UNIT_NAME], timeout=90)
-            after = _eb_wait_rules(want=before["blocklist_size"], deadline_s=45)
+            after = _eb_wait_rules(deadline_s=45)
         applied = after["all_present"]
         return {
             "ok": applied, "mode": "install+restart", "restarted": svc,
@@ -2529,90 +2596,104 @@ def act_extra_blocks_install(params):
                      "`journalctl -u nym-extra-blocks` and that the NYM-EXIT chain exists.",
         }
 
-    # install only: apply to the LIVE chain now (non-disruptive; no nym-node restart),
-    # so the node is protected immediately. Use restart (not start) so the freshly
-    # written script actually re-runs even if the oneshot was already active.
+    # apply to the LIVE chain now (no nym-node restart). restart, not start: on an
+    # active RemainAfterExit oneshot `start` is a no-op and nothing would change.
     rc, out, errx = _run(["systemctl", "restart", EB_UNIT_NAME], timeout=90)
     log.append("ran extra-blocks once: " + ("ok" if rc == 0 else "FAILED " + (errx or out).strip()))
-    after = _eb_verify(list_url)
-    applied_now = after["chain_present"] and after["all_present"]
+    after = _eb_verify()
+    applied_now = rc == 0 and after["chain_present"] and after["all_present"]
+    if after.get("legacy_rules"):
+        log.append(f"{after['legacy_rules']} unmarked pre-0.12.9 REJECT(s) still present")
     return {
-        "ok": True, "mode": "install-only", "applied_now": applied_now,
+        "ok": rc == 0 and (applied_now or not after["chain_present"]),
+        "mode": "install-only", "applied_now": applied_now,
         "replaced_existing": meta.get("replaced_existing", False),
         "replaced_handmade": meta.get("replaced_handmade", False),
         "before": before, "after": after, "state": _extra_blocks_state(),
         "output": "\n".join(log),
-        "note": ("blocks applied to the running NYM-EXIT chain now; no nym-node restart was done. "
-                 "Restart nym-node when convenient, then use 'verify' to confirm they re-apply.")
+        "note": ("list applied to the running NYM-EXIT chain (reconciled: removed entries are gone). "
+                 "It re-applies automatically on every nym-node start.")
                 if applied_now else
-                ("service installed and enabled, but NYM-EXIT was not present to apply to yet "
-                 "(is nym-node running?). It will apply automatically on the next nym-node start; "
-                 "use 'verify' afterwards."),
-        "error": None,
+                ("unit installed and enabled, but NYM-EXIT was not present to apply to yet "
+                 "(is nym-node running?). It applies automatically on the next nym-node start; "
+                 "use 'verify' afterwards.") if not after["chain_present"] else None,
+        "error": None if (rc == 0 and (applied_now or not after["chain_present"])) else
+                 ("extra-blocks oneshot failed" if rc != 0 else
+                  f"only {after['rules_present']}/{after['blocklist_size']} entries present"
+                  + (f", {after['stale_rules']} stale" if after["stale_rules"] else "")),
     }
 
 
 def act_extra_blocks_upgrade(params):
-    """Rewrite the runtime script (EB_SH) from the agent's built-in template,
-    preserving the currently configured list_url, then restart the service so
-    the new script runs immediately. Use this to push rate-limit or script
-    logic changes fleet-wide without re-running the external installer."""
-    list_url = _eb_url()
-    log = [f"rewriting {EB_SH} from built-in template (url: {list_url})"]
-    ok, err, meta = _eb_write_files(list_url)
+    """Rewrite script + unit from the built-in template, keeping the node's list,
+    then restart the oneshot so the new script runs now."""
+    entries = _eb_entries_cached()
+    log = [f"rewriting {EB_SH} from built-in template ({len(entries)} entries kept)"]
+    ok, err, meta = _eb_write_files(entries)
     if not ok:
         return {"ok": False, "error": err, "output": "\n".join(log)}
-    log.append("script and unit rewritten")
     rc, out, errx = _run(["systemctl", "restart", EB_UNIT_NAME], timeout=90)
     log.append("restarted extra-blocks: " + ("ok" if rc == 0 else "FAILED " + (errx or out).strip()))
-    after = _eb_verify(list_url)
-    return {
-        "ok": rc == 0,
-        "list_url": list_url,
-        "after": after,
-        "state": _extra_blocks_state(),
-        "output": "\n".join(log),
-        "error": None if rc == 0 else "service restart failed after script update",
-    }
+    return {"ok": rc == 0, "after": _eb_verify(), "state": _extra_blocks_state(),
+            "output": "\n".join(log),
+            "error": None if rc == 0 else "service restart failed after script update"}
 
 
 def act_extra_blocks_verify(params):
-    """Confirm the blocks are in place — e.g. after a manual nym-node restart."""
-    url = params.get("list_url") or _eb_url()
-    v = _eb_verify(url)
+    """Confirm the list is in place — e.g. after a manual nym-node restart."""
+    v = _eb_verify()
     v["ok"] = True
     v["state"] = _extra_blocks_state()["state"]
-    v["error"] = None if (v["chain_present"] and v["all_present"]) else (
-        "NYM-EXIT chain not present (is nym-node running?)" if not v["chain_present"]
-        else f"only {v['rules_present']}/{v['blocklist_size']} block rules present in {EB_CHAIN}")
+    if not v["chain_present"]:
+        v["error"] = "NYM-EXIT chain not present (is nym-node running?)"
+    elif not v["all_present"]:
+        v["error"] = (f"only {v['rules_present']}/{v['blocklist_size']} entries present in {EB_CHAIN}"
+                      + (f", {v['stale_rules']} stale {EB_MARK} rule(s)" if v["stale_rules"] else ""))
+    else:
+        v["error"] = None
     return v
 
 
+def _eb_drain(cmd, chain, legacy_dests):
+    """Python twin of the script's reconcile teardown: every marked REJECT by its
+    exact -S spec, plus the unmarked old-style REJECT for each legacy dest."""
+    removed = 0
+    for _ in range(EB_MAX_ENTRIES + 10):
+        rc, out, _ = _run([cmd, "-S", chain])
+        if rc != 0:
+            break
+        hit = next((l.strip() for l in out.splitlines()
+                    if "-j REJECT" in l and re.search(r"--comment\s+\"?" + EB_MARK + r"\"?(\s|$)", l)), None)
+        if not hit:
+            break
+        if _run([cmd, "-D", chain] + hit.split()[2:])[0] != 0:
+            break
+        removed += 1
+    rej = "icmp6-port-unreachable" if cmd == "ip6tables" else "icmp-port-unreachable"
+    for d in legacy_dests:
+        for _ in range(50):
+            if _run([cmd, "-D", chain, "-d", d, "-j", "REJECT", "--reject-with", rej])[0] != 0:
+                break
+            removed += 1
+    return removed
+
+
 def act_extra_blocks_remove(params):
-    """Disable + remove the unit/script and flush our REJECT rules from the exit chains."""
+    """Disable + remove the unit/script/list and every nym_block REJECT (plus the
+    unmarked pre-marker ones). Rate-limit and fan-out rules are left as they are;
+    the next nym-node start rebuilds NYM-EXIT without them."""
     log = []
     _run(["systemctl", "disable", "--now", EB_UNIT_NAME], timeout=30)
-    removed = 0
-    entries = _eb_fetch_entries()
-    cp4, d4 = _eb_chain_rules("iptables", EB_CHAIN)
-    v6_supported = _eb_v6_supported()
-    cp6, d6 = _eb_chain_rules("ip6tables", EB_CHAIN6) if v6_supported else (False, set())
-    for e in entries:
-        fam, base = _eb_family(e), e.split("/")[0]
-        if fam == 4 and cp4 and (e in d4 or base in d4 or (base + "/32") in d4):
-            if _run(["iptables", "-D", EB_CHAIN, "-d", e, "-j", "REJECT",
-                     "--reject-with", "icmp-port-unreachable"])[0] == 0:
-                removed += 1
-        elif fam == 6 and cp6 and (e in d6 or base in d6 or (base + "/128") in d6):
-            if _run(["ip6tables", "-D", EB_CHAIN6, "-d", e, "-j", "REJECT",
-                     "--reject-with", "icmp6-port-unreachable"])[0] == 0:
-                removed += 1
-    for p in (EB_SH, EB_UNIT, EB_URL_FILE):
+    legacy = set(_eb_parse_file(EB_LEGACY)) | set(_eb_entries_cached())
+    removed = _eb_drain("iptables", EB_CHAIN, [d for d in legacy if _eb_family(d) == 4])
+    if _eb_v6_supported():
+        removed += _eb_drain("ip6tables", EB_CHAIN6, [d for d in legacy if _eb_family(d) == 6])
+    for p in (EB_SH, EB_UNIT, EB_URL_FILE, EB_CACHE, EB_LEGACY):
         with contextlib.suppress(Exception):
             if os.path.exists(p):
                 os.remove(p)
     _run(["systemctl", "daemon-reload"], timeout=20)
-    log.append(f"removed unit + script; deleted {removed} REJECT rules from the exit chains")
+    log.append(f"removed unit + script + list; deleted {removed} REJECT rules from the exit chains")
     return {"ok": True, "removed_rules": removed, "state": _extra_blocks_state(),
             "output": "\n".join(log), "error": None}
 

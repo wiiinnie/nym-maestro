@@ -32,6 +32,7 @@ from pydantic import BaseModel, field_validator
 
 from store import Conflict, Store
 import abuse
+import blocklist
 import distro
 import hoster
 import landing
@@ -1237,28 +1238,21 @@ class ConcurrencyLimitRequest(BaseModel):
         return _nc_check_limit(v)
 
 
-# A blocklist URL is forwarded to every targeted agent, where it is persisted and
-# read by a root-run script. Validate it as a plain http(s) URL here (no quotes,
-# whitespace or shell metacharacters) so the control plane never hands an agent a
-# value that could break out of a shell context.
-_EB_URL_RE = re.compile(r"^https?://[\w.\-~:/?#\[\]@!$&()*+,;=%]+$")
-
-
 class ExtraBlocksInstallRequest(BaseModel):
+    # The list itself is NOT part of the request: rollout always ships the list
+    # saved in maestro (blocklist.BLOCKLIST_KEY), so what the UI shows is what lands.
     node_ids: list[str]
     restart_node: bool = False
-    list_url: str | None = None
 
-    @field_validator("list_url")
+
+class BlocklistText(BaseModel):
+    text: str
+
+    @field_validator("text")
     @classmethod
-    def _check_list_url(cls, v):
-        if v is None:
-            return v
-        v = v.strip()
-        if not v:
-            return None
-        if len(v) >= 2000 or not _EB_URL_RE.match(v):
-            raise ValueError("list_url must be a plain http(s) URL")
+    def _cap(cls, v):
+        if len(v) > 512_000:
+            raise ValueError("blocklist text too large")
         return v
 
 
@@ -1364,14 +1358,6 @@ def local_agent_source():
     if m:
         version = m.group(1)
     return text, version, hashlib.sha256(data).hexdigest()
-
-
-def local_installer_source():
-    """Read the orchestrator's own install-nym-extra-blocks.sh — the script whose
-    content is pushed to agents over mTLS and run as root. Returns (text, sha256).
-    Edit that file (e.g. rate-limit values) and the next 'Run installer' ships it."""
-    data = (BASE / "install-nym-extra-blocks.sh").read_bytes()
-    return data.decode("utf-8"), hashlib.sha256(data).hexdigest()
 
 
 def _require_node(request: Request, uid: str) -> dict:
@@ -2065,27 +2051,94 @@ async def extra_blocks_status(payload: ExtraBlocksRequest, request: Request):
     return {"results": results}
 
 
+# ------------------------------------------------------------------ blocklist
+# maestro is the source of truth for the destination blocklist (no GitHub fetch).
+# Seeded once from the repo's blocklist.txt, then edited in the UI.
+EB_MIN_AGENT = "0.12.9"     # first agent that takes `entries` and marks nym_block
+
+
+def _blocklist_text(store) -> str:
+    text = store.get_config(blocklist.BLOCKLIST_KEY)
+    if text is None:
+        try:
+            text = (BASE / "blocklist.txt").read_text(encoding="utf-8")
+        except Exception:
+            text = ""
+        store.set_config(blocklist.BLOCKLIST_KEY, text)   # seed once, then it's ours
+    return text
+
+
+def _vtuple(v):
+    try:
+        return tuple(int(x) for x in str(v).split(".")[:3])
+    except (TypeError, ValueError):
+        return (0,)
+
+
+@app.get("/api/blocklist")
+def blocklist_get(request: Request):
+    text = _blocklist_text(request.app.state.store)
+    return dict(blocklist.summary(text), text=text)
+
+
+@app.post("/api/blocklist/check")
+def blocklist_check(payload: BlocklistText):
+    """Validate without saving (live marking in the editor)."""
+    return blocklist.summary(payload.text)
+
+
+@app.put("/api/blocklist")
+def blocklist_put(payload: BlocklistText, request: Request):
+    s = blocklist.summary(payload.text)
+    if s["errors"]:
+        # reject the whole save: a half-applied list is worse than none
+        return JSONResponse(status_code=400, content=dict(
+            s, error=f"{len(s['errors'])} invalid line(s) — nothing saved"))
+    request.app.state.store.set_config(blocklist.BLOCKLIST_KEY, payload.text)
+    request.app.state.store.audit("ui", "blocklist_save", None, None,
+                                  json.dumps({"count": s["count"], "sha": s["sha"]}))
+    return dict(s, text=payload.text)
+
+
 @app.post("/api/extra-blocks/install")
 async def extra_blocks_install(payload: ExtraBlocksInstallRequest, request: Request):
     store, nodes = _eb_targets(request, payload.node_ids)
-    params = {"restart_node": payload.restart_node, "list_url": payload.list_url}
+    bl = blocklist.summary(_blocklist_text(store))
+    if bl["errors"]:
+        raise HTTPException(400, "saved blocklist has invalid lines — fix and save it first")
+    # an older agent would ignore `entries` and fall back to its GitHub URL, so
+    # never send it there: skip with an actionable message instead
+    old = [n for n in nodes
+           if _vtuple((n.get("status") or {}).get("agent_version")) < _vtuple(EB_MIN_AGENT)]
+    nodes = [n for n in nodes if n not in old]
+    skipped = [{"uid": n["uid"], "node_id": n["node_id"], "name": n["name"], "ok": False,
+                "result": {"ok": False, "error": f"agent {((n.get('status') or {}).get('agent_version') or '?')}"
+                                                 f" is too old for the maestro blocklist (needs {EB_MIN_AGENT})"
+                                                 " — run Update agent first"}}
+               for n in old]
+    if not nodes:
+        return {"job_id": None, "status": "failed", "results": skipped, "list_sha": bl["sha"]}
+    params = {"restart_node": payload.restart_node, "entries": bl["entries"]}
     # a restart polls up to 150s for nym-node, then waits for the oneshot to
     # re-apply (75s + 90s nudge + 45s), so give the full chain room
     timeout = 420 if payload.restart_node else 120
     job_id = uuid.uuid4().hex
     store.record_job(job_id, "extra_blocks_install",
-                     json.dumps({"nodes": len(nodes), "restart": payload.restart_node}), len(nodes))
+                     json.dumps({"nodes": len(nodes), "restart": payload.restart_node,
+                                 "entries": bl["count"], "list_sha": bl["sha"]}), len(nodes))
     results = await _f2b_fanout(request.app, store, nodes, "extra_blocks_install", params,
                                 timeout, "extra_blocks_install")
     for r in results:
         store.record_target(job_id, r["uid"], "done" if r["ok"] else "failed", None,
                             json.dumps(r["result"]))
     ok_count = sum(1 for r in results if r["ok"])
-    status = "done" if ok_count == len(results) else ("failed" if ok_count == 0 else "partial")
+    status = "done" if ok_count == len(results) and not skipped else (
+        "failed" if ok_count == 0 else "partial")
     store.finish_job(job_id, status)
     # refresh the fleet column promptly after a change
     await repoll_nodes(request.app, nodes)
-    return {"job_id": job_id, "status": status, "results": results}
+    return {"job_id": job_id, "status": status, "results": list(results) + skipped,
+            "list_sha": bl["sha"]}
 
 
 @app.post("/api/extra-blocks/upgrade")
@@ -2114,29 +2167,6 @@ async def extra_blocks_remove(payload: ExtraBlocksRequest, request: Request):
                                 "extra_blocks_remove")
     await repoll_nodes(request.app, nodes)
     return {"results": results}
-
-
-@app.post("/api/extra-blocks/install-script")
-async def extra_blocks_install_script(payload: ExtraBlocksRequest, request: Request):
-    # Ship the orchestrator's own install-nym-extra-blocks.sh to the nodes over the
-    # mTLS channel with its sha256; the agent verifies the hash before running it as
-    # root. No node ever fetches installer code from the internet.
-    store, nodes = _eb_targets(request, payload.node_ids)
-    content, sha = local_installer_source()
-    params = {"content": content, "sha256": sha}
-    job_id = uuid.uuid4().hex
-    store.record_job(job_id, "extra_blocks_install_script",
-                     json.dumps({"nodes": len(nodes), "sha256": sha}), len(nodes))
-    results = await _f2b_fanout(request.app, store, nodes, "extra_blocks_install_script",
-                                params, 200, "extra_blocks_install_script")
-    for r in results:
-        store.record_target(job_id, r["uid"], "done" if r["ok"] else "failed", None,
-                            json.dumps(r["result"]))
-    ok_count = sum(1 for r in results if r["ok"])
-    status = "done" if ok_count == len(results) else ("failed" if ok_count == 0 else "partial")
-    store.finish_job(job_id, status)
-    await repoll_nodes(request.app, nodes)
-    return {"job_id": job_id, "status": status, "sha256": sha, "results": results}
 
 
 @app.post("/api/extra-blocks/restart-service")
@@ -2264,8 +2294,7 @@ def landing_master_html():
 
 
 def local_landing_source():
-    """Read the rendered page that gets pushed to the nodes over mTLS, the way
-    local_installer_source() does for the extra-blocks script.
+    """Read the rendered page that gets pushed to the nodes over mTLS.
     Returns (text, sha256, version)."""
     data = LANDING_SERVE.read_bytes()
     text = data.decode("utf-8")
