@@ -2,6 +2,7 @@ import os
 import tempfile
 
 os.environ["MAESTRO_DB"] = os.path.join(tempfile.mkdtemp(), "test.db")
+os.environ.setdefault("MAESTRO_HOSTER_POLL", "0")   # no RIPEstat lookups for fixture IPs
 
 from fastapi.testclient import TestClient
 import app as appmod

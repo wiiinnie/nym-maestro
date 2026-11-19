@@ -58,10 +58,14 @@ SELECT n.uid AS uid, n.node_id AS node_id, n.name AS name, n.ip AS ip,
        nx.address AS nyx_address, nx.balance_unym AS nyx_balance_unym,
        nx.balance_at AS nyx_balance_at, nx.error AS nyx_error,
        nx.net_json AS nyx_net_json,
-       nx.checked_at AS nyx_checked_at
+       nx.checked_at AS nyx_checked_at,
+       ho.ip AS hoster_ip, ho.asn AS hoster_asn, ho.prefix AS hoster_prefix,
+       ho.holder AS hoster_holder, ho.name AS hoster_name, ho.error AS hoster_error,
+       ho.checked_at AS hoster_checked_at
 FROM nodes n
 LEFT JOIN node_status st ON st.uid = n.uid
 LEFT JOIN node_nyx nx ON nx.uid = n.uid
+LEFT JOIN node_hoster ho ON ho.uid = n.uid
 """
 
 
@@ -160,6 +164,12 @@ class Store:
             " address TEXT, balance_unym INTEGER, balance_at TEXT, error TEXT,"
             " net_json TEXT,"
             " checked_at TEXT NOT NULL DEFAULT (datetime('now')));"
+            # VPS hoster from the IP's origin AS (hoster.py). Own table: looked up
+            # rarely (IP change / weekly), never touched by the agent poll.
+            "CREATE TABLE IF NOT EXISTS node_hoster ("
+            " uid TEXT PRIMARY KEY REFERENCES nodes(uid) ON DELETE CASCADE,"
+            " ip TEXT, asn INTEGER, prefix TEXT, holder TEXT, name TEXT, error TEXT,"
+            " checked_at REAL);"
         )
         self.db.commit()
         self._ensure_history_unique_indexes()
@@ -381,6 +391,26 @@ class Store:
                 "error=excluded.error, checked_at=excluded.checked_at",
                 (uid, address, balance_unym, balance_unym, error, net_json),
             )
+            self.db.commit()
+
+    def set_hoster(self, uid, ip, asn=None, prefix=None, holder=None, name=None, error=None):
+        """Record a hoster lookup for `ip`. On failure (name None) the last known
+        hoster is kept and only `error` is set — unless the IP changed, in which
+        case the old hoster no longer applies and is cleared."""
+        import time as _t
+        with self.lock:
+            prev = self.db.execute("SELECT ip FROM node_hoster WHERE uid = ?", (uid,)).fetchone()
+            if name is None and prev is not None and (prev["ip"] or "") == (ip or ""):
+                self.db.execute("UPDATE node_hoster SET error = ?, checked_at = ? WHERE uid = ?",
+                                (error, _t.time(), uid))
+            else:
+                self.db.execute(
+                    "INSERT INTO node_hoster (uid, ip, asn, prefix, holder, name, error, checked_at) "
+                    "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(uid) DO UPDATE SET "
+                    "ip=excluded.ip, asn=excluded.asn, prefix=excluded.prefix, "
+                    "holder=excluded.holder, name=excluded.name, error=excluded.error, "
+                    "checked_at=excluded.checked_at",
+                    (uid, ip, asn, prefix, holder, name, error, _t.time()))
             self.db.commit()
 
     def backfill_throughput(self, uid, rows):
@@ -910,6 +940,17 @@ def _row_to_view(r: sqlite3.Row) -> dict:
             "concurrency": (json.loads(r["concurrency_json"]) if ("concurrency_json" in r.keys() and r["concurrency_json"]) else None),
             "last_seen": r["last_seen"],
         }
+    hoster = None
+    if "hoster_checked_at" in r.keys() and r["hoster_checked_at"] is not None:
+        hoster = {
+            "name": r["hoster_name"],
+            "asn": r["hoster_asn"],
+            "holder": r["hoster_holder"],
+            "prefix": r["hoster_prefix"],
+            "ip": r["hoster_ip"],
+            "error": r["hoster_error"],
+            "checked_at": r["hoster_checked_at"],
+        }
     nyx = None
     if "nyx_checked_at" in r.keys() and r["nyx_checked_at"] is not None:
         bu = r["nyx_balance_unym"]
@@ -938,4 +979,5 @@ def _row_to_view(r: sqlite3.Row) -> dict:
         "updated_at": r["updated_at"],
         "status": status,
         "nyx": nyx,
+        "hoster": hoster,
     }

@@ -25,7 +25,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, field_validator
@@ -33,6 +33,7 @@ from pydantic import BaseModel, field_validator
 from store import Conflict, Store
 import abuse
 import distro
+import hoster
 import landing
 import nyx
 import wallet
@@ -947,6 +948,76 @@ async def _nyx_loop(app: FastAPI, interval: int):
         await asyncio.sleep(interval)
 
 
+# --- VPS hoster per node (origin AS of the node IP, via RIPEstat) -------------
+# The node IPs are the public exit IPs (also on the landing page); only the IP
+# is sent. Cached per node; refreshed on IP change or weekly (hoster.py).
+_HOSTER_SEM = asyncio.Semaphore(4)
+_HOSTER_HEADERS = {"Accept": "application/json", "User-Agent": "nym-maestro"}
+
+
+async def _hoster_lookup(client, ip):
+    """(asn, prefix, holder, error) for one IP."""
+    try:
+        r = await client.get(hoster.network_info_url(ip), headers=_HOSTER_HEADERS)
+        r.raise_for_status()
+        asn, prefix = hoster.parse_network_info(r.json())
+    except Exception as e:
+        return None, None, None, f"network-info: {type(e).__name__}"
+    if asn is None:
+        return None, prefix, None, "no origin AS announced for this IP"
+    try:
+        r = await client.get(hoster.as_overview_url(asn), headers=_HOSTER_HEADERS)
+        r.raise_for_status()
+        holder = hoster.parse_as_overview(r.json())
+    except Exception as e:
+        # the ASN alone still identifies a known hoster
+        return asn, prefix, None, f"as-overview: {type(e).__name__}"
+    return asn, prefix, holder, None
+
+
+async def _hoster_check_one(client, store, node):
+    ip = (node.get("ip") or "").strip()
+    async with _HOSTER_SEM:
+        asn, prefix, holder, err = await _hoster_lookup(client, ip)
+    name = hoster.short_name(asn, holder) if asn else None
+    if name and asn in hoster.KNOWN_ASNS:
+        err = None                    # known ASN: holder text is optional
+    store.set_hoster(node["uid"], ip, asn=asn, prefix=prefix, holder=holder,
+                     name=name, error=None if name else err)
+    return {"uid": node["uid"], "name": node["name"], "ok": bool(name), "hoster": name,
+            "asn": asn, "error": None if name else err}
+
+
+async def _hoster_on_change(app: FastAPI):
+    if getattr(app.state, "hoster_poll", 0) > 0:
+        await refresh_hosters(app)
+
+
+async def refresh_hosters(app: FastAPI, force=False) -> dict:
+    store = app.state.store
+    now = time.time()
+    nodes = [n for n in store.list_nodes()
+             if hoster.is_public_ip(n.get("ip")) and (force or hoster.needs_lookup(n, now))]
+    if not nodes:
+        return {"checked": 0, "ok": 0, "results": []}
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+        results = await asyncio.gather(*[_hoster_check_one(client, store, n) for n in nodes])
+    return {"checked": len(results), "ok": sum(1 for r in results if r["ok"]),
+            "results": list(results)}
+
+
+async def _hoster_loop(app: FastAPI, interval: int):
+    # cheap: each pass only looks up nodes that are new, moved or stale
+    if interval <= 0:
+        return
+    while True:
+        try:
+            await refresh_hosters(app)
+        except Exception:
+            pass
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db = default_db()
@@ -961,10 +1032,14 @@ async def lifespan(app: FastAPI):
     onwire_task = asyncio.create_task(_onwire_loop(app, onwire_interval))
     history_task = asyncio.create_task(_history_loop(app, history_interval))
     nyx_task = asyncio.create_task(_nyx_loop(app, nyx_interval))
+    # MAESTRO_HOSTER_POLL=0 switches hoster lookups off entirely (also the
+    # on-create/on-IP-change trigger), e.g. for tests
+    app.state.hoster_poll = int(os.environ.get("MAESTRO_HOSTER_POLL", "3600"))
+    hoster_task = asyncio.create_task(_hoster_loop(app, app.state.hoster_poll))
     try:
         yield
     finally:
-        for t in (task, onwire_task, history_task, nyx_task):
+        for t in (task, onwire_task, history_task, nyx_task, hoster_task):
             t.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await t
@@ -1695,7 +1770,7 @@ def get_node(uid: str, request: Request):
 
 
 @app.post("/api/nodes", status_code=201)
-def create_node(n: NodeCreate, request: Request):
+def create_node(n: NodeCreate, request: Request, background: BackgroundTasks):
     node_id, name, ip = n.node_id.strip(), n.name.strip(), n.ip.strip()
     if not (node_id and name and ip):
         raise HTTPException(400, "node_id, name and ip are required")
@@ -1710,11 +1785,12 @@ def create_node(n: NodeCreate, request: Request):
         uid = request.app.state.store.create_node(data)
     except Conflict as e:
         raise HTTPException(409, str(e))
+    background.add_task(_hoster_on_change, request.app)   # look up the new node's hoster
     return request.app.state.store.get_node(uid)
 
 
 @app.patch("/api/nodes/{uid}")
-def update_node(uid: str, patch: NodePatch, request: Request):
+def update_node(uid: str, patch: NodePatch, request: Request, background: BackgroundTasks):
     fields = patch.model_dump(exclude_unset=True)
     for k in ("hostname", "agent_fp", "service_name", "binary_path", "notes"):
         if k in fields and isinstance(fields[k], str):
@@ -1728,6 +1804,8 @@ def update_node(uid: str, patch: NodePatch, request: Request):
         raise HTTPException(409, str(e))
     if not ok:
         raise HTTPException(404, "no node with that id")
+    if "ip" in fields:
+        background.add_task(_hoster_on_change, request.app)   # moved node: re-resolve hoster
     return request.app.state.store.get_node(uid)
 
 
@@ -1743,6 +1821,13 @@ async def refresh(request: Request):
     if not request.app.state.pki.ready():
         raise HTTPException(400, "PKI not initialised — run: python pki.py init")
     return await poll_all(request.app)
+
+
+@app.post("/api/hoster/refresh")
+async def hoster_refresh(request: Request):
+    """Look up the hoster of every node now (normally only new/moved/stale ones,
+    on MAESTRO_HOSTER_POLL, default hourly)."""
+    return await refresh_hosters(request.app, force=True)
 
 
 @app.post("/api/nyx/refresh")

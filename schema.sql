@@ -204,3 +204,18 @@ CREATE TABLE IF NOT EXISTS node_nyx (
     checked_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- ---------------------------------------------------------------------------
+-- VPS hoster per node, from the IP's origin AS via RIPEstat (hoster.py).
+-- Looked up on IP change or when older than a week; ip = the IP it was
+-- resolved for, so a changed node IP invalidates it.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS node_hoster (
+    uid          TEXT PRIMARY KEY REFERENCES nodes(uid) ON DELETE CASCADE,
+    ip           TEXT,
+    asn          INTEGER,
+    prefix       TEXT,
+    holder       TEXT,                   -- AS holder as registered ("OVH OVH SAS")
+    name         TEXT,                   -- short display name ("OVH")
+    error        TEXT,
+    checked_at   REAL                    -- epoch of the last attempt
+);
