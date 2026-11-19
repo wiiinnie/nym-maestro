@@ -549,6 +549,7 @@
     <button id="btn-fail2ban" onclick="openFail2ban()" disabled>Fail2ban</button>
     <button id="btn-ssh" onclick="openSsh()" disabled>SSH keys</button>
     <button id="btn-extra-blocks" onclick="openExtraBlocks()" disabled title="Install/verify NYM-EXIT abuse blocklist">Extra blocks</button>
+    <button id="btn-concurrency" onclick="openConcurrency()" disabled title="Per-client concurrent-connection cap on high ports (anti-BitTorrent)">Nym concurrency</button>
     <button id="btn-update-agent" onclick="openAgentUpdate()" disabled title="Push the local agent to selected nodes">Update agent</button>
     <button id="btn-distro" onclick="openDistro()" disabled title="Dry-run check of distro versions, compatibility & CVEs; rolling headless OS upgrades">OS upgrade</button>
     <button id="btn-landing" onclick="openLanding()" title="Rebuild and deploy the public node-overview page">Landing page</button>
@@ -905,6 +906,53 @@
     <div class="modal-actions">
       <button id="eb-remove" class="ghost" onclick="ebRemove()" style="margin-right:auto">Remove</button>
       <button onclick="closeExtraBlocks()">Close</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="nc-overlay">
+  <div class="modal wide">
+    <h2>Nym concurrency · per-client connection cap</h2>
+    <p class="sub">Drops <b>new</b> connections to high ports (12000–65535, TCP + UDP) from a tunnel client that already holds more than <i>limit</i> of them at once. Aimed at BitTorrent, including encrypted (MSE) traffic: it counts connections, not payload. Calibration: legitimate clients ≤ 26, torrent clients 279–670. Established connections are never touched. Lives in its own <span class="mono">mangle NYM-CONCURRENCY</span> chain, hooked from PREROUTING on <span class="mono">nymwg</span>/<span class="mono">nymtun0</span>. It is independent of the extra-blocks rules in NYM-EXIT. Exit gateways only; other selected nodes are skipped.</p>
+    <div id="nc-note" class="sub" style="margin-bottom:8px"></div>
+    <div id="nc-status" class="f2b-status"></div>
+
+    <div style="display:flex;flex-direction:column;gap:12px;margin-bottom:14px">
+
+      <div style="border:1px solid var(--line);border-radius:8px;padding:12px 14px">
+        <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">1 · Install / update</div>
+        <p style="font-size:12px;color:var(--muted);margin:0 0 8px">Writes <span class="mono" style="font-size:11px">nym-concurrency.sh</span> and the oneshot unit from the agent's built-in template, then re-applies the rules (the unit is restarted, not just started). The unit is PartOf nym-node, so the rules come back after every nym-node restart. Leave the limit blank to keep each node's current value (50 on a first install).</p>
+        <div style="display:flex;gap:8px;align-items:center">
+          <label style="font-size:12px;color:var(--muted)">Limit <input id="nc-install-limit" type="number" min="10" max="10000" step="1" placeholder="keep" style="width:90px;margin-left:4px"></label>
+          <button id="nc-install" onclick="ncInstall()">Install / update</button>
+        </div>
+      </div>
+
+      <div style="border:1px solid var(--line);border-radius:8px;padding:12px 14px">
+        <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">2 · Change limit</div>
+        <p style="font-size:12px;color:var(--muted);margin:0 0 8px">Sets the max number of concurrent high-port connections per client (10–10000) on the selected nodes and re-applies the rules right away. The script and unit are left as they are. Drop counters restart from zero.</p>
+        <div style="display:flex;gap:8px;align-items:center">
+          <label style="font-size:12px;color:var(--muted)">Limit <input id="nc-limit" type="number" min="10" max="10000" step="1" value="50" style="width:90px;margin-left:4px"></label>
+          <button id="nc-set-limit" onclick="ncSetLimit()">Apply limit</button>
+        </div>
+      </div>
+
+      <div style="border:1px solid var(--line);border-radius:8px;padding:12px 14px">
+        <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">3 · Service control</div>
+        <p style="font-size:12px;color:var(--muted);margin:0 0 8px">Restart re-applies the rules from the current script and limit, with no nym-node restart. Verify checks the unit, the chain, both limit rules, the hooks on both interfaces, and that the live limit matches the configured one.</p>
+        <div style="display:flex;gap:8px">
+          <button id="nc-restart" onclick="ncRestart()">Restart nym-concurrency</button>
+          <button id="nc-verify" onclick="ncVerify()">Verify</button>
+        </div>
+      </div>
+
+    </div>
+
+    <p class="f2b-warn" style="margin-bottom:0">Drop counts are packets, not connections, so UDP retries push them up. They reset whenever the rules are re-applied (install, limit change, restart, or a nym-node restart). IPv4 and IPv6 are counted separately (v6 per /128, best-effort). Remove deletes the hooks, the chain, the unit and the script.</p>
+
+    <div class="modal-actions">
+      <button id="nc-remove" class="ghost" onclick="ncRemove()" style="margin-right:auto">Remove</button>
+      <button onclick="closeConcurrency()">Close</button>
     </div>
   </div>
 </div>
@@ -2387,6 +2435,7 @@ function sortKeyVal(n, key){
     case 'service':   return s.service_active === true ? 1 : (s.service_active === false ? 0 : -1);
     case 'bans':      return s.fail2ban_banned == null ? -1 : s.fail2ban_banned;
     case 'eblocks':   { const e = s.extra_blocks; return !e || !e.installed ? 0 : (e.active ? 2 : 1); }
+    case 'conc':      { const c = s.concurrency; return !c || !c.installed ? -1 : (c.drops != null ? c.drops : 0); }
     case 'stake':     { const v = n.stake; return v && v.total_stake != null ? v.total_stake : -1; }
     case 'nyx':       { const v = n.nyx; return v && v.shown_balance_nym != null ? v.shown_balance_nym : -1; }
     case 'traffic':   { const v = trafficVal(s); return v == null ? -1 : v; }
@@ -2510,6 +2559,7 @@ function renderTable(){
   htr.append(sortHeader('Service', 'service'));
   htr.append(sortHeader('Jailed IPs', 'bans'));
   htr.append(sortHeader('Extra blocks', 'eblocks'));
+  htr.append(sortHeader('Concurrency', 'conc'));
   htr.append(sortHeader('Traffic', 'traffic'));
   htr.append(sortHeader('Throughput', 'throughput'));
   htr.append(el('th', null, '24h'));
@@ -2626,6 +2676,10 @@ function renderTable(){
     ebTd.append(extraBlocksBadge(s));
     tr.append(ebTd);
 
+    const ncTd = el('td');
+    ncTd.append(concurrencyBadge(s));
+    tr.append(ncTd);
+
     const tTd = el('td');
     const tv = trafficVal(s);
     tTd.append(tv != null ? el('span','mono', fmtBytes(tv)) : dash());
@@ -2694,6 +2748,7 @@ function updateBulk(){
   document.getElementById('btn-fail2ban').disabled = reachable.length === 0;
   document.getElementById('btn-ssh').disabled = reachable.length === 0;
   document.getElementById('btn-extra-blocks').disabled = reachable.length === 0;
+  document.getElementById('btn-concurrency').disabled = reachable.length === 0;
   document.getElementById('btn-upgrade').disabled = reachable.length === 0;
   document.getElementById('btn-update-agent').disabled = reachable.length === 0;
   document.getElementById('btn-distro').disabled = reachable.length === 0;
@@ -3761,6 +3816,171 @@ async function ebRestartService(){
   btn.disabled = false; btn.textContent = 'Restart nym-extra-blocks';
 }
 
+// ===== Nym concurrency (anti-BitTorrent connlimit, agent >= 0.12.8) ========
+function isExitNode(n){
+  const s = n.status || {};
+  if(s.exit === false) return false;
+  return s.exit === true || s.mode === 'exit-gateway';
+}
+
+// {text, level, title} for the live drop counter, or null
+function ncDropsInfo(c){
+  if(c.drops == null) return null;
+  const since = c.since ? ' since ' + fmtSince(c.since) : '';
+  const split = 'TCP ' + (c.drops_tcp ?? 0).toLocaleString() + ' · UDP ' + (c.drops_udp ?? 0).toLocaleString();
+  return {text: c.drops.toLocaleString() + ' drops',
+          title: c.drops.toLocaleString() + ' dropped packets' + since + ' (' + split +
+                 (c.v6_drops != null ? ', of which v6 ' + c.v6_drops.toLocaleString() : '') + ').\n' +
+                 'Packets that would have opened a high-port connection beyond the per-client limit. ' +
+                 'A rising counter means the rule is catching high-concurrency (torrent) clients. ' +
+                 'Resets when the rules are re-applied.'};
+}
+
+// problems that make an installed limiter not (fully) effective, [] if fine
+function ncProblems(c){
+  const p = [];
+  if(!c.active) p.push('unit inactive');
+  if(c.chain_present === false) p.push('chain missing');
+  else if(!c.hooked) p.push('not hooked');
+  if(c.configured_limit != null && c.limit != null && c.limit !== c.configured_limit)
+    p.push('limit ' + c.limit + ' ≠ configured ' + c.configured_limit);
+  if(c.configured_limit === null) p.push('invalid limit file');
+  return p;
+}
+
+function concurrencyBadge(s){
+  const c = s && s.concurrency;
+  if(!s || s.reachable === false) return dash();
+  if(c === undefined || c === null){
+    const d = dash(); d.title = 'Agent older than 0.12.8: no nym_concurrency support'; return d;
+  }
+  if(!c.installed){
+    if(c.state === 'unmanaged'){
+      const p = el('span','pill warn','Unmanaged');
+      p.title = 'NYM-CONCURRENCY rules are present, but maestro\'s unit is not installed (a manual test install?). Run Install / update to take it over, or Remove.';
+      return p;
+    }
+    return s.exit ? el('span','pill muted','Missing') : dash();
+  }
+  const wrap = el('div');
+  wrap.style.cssText = 'display:flex;flex-direction:column;gap:3px;align-items:flex-start';
+  const probs = ncProblems(c);
+  const pill = probs.length ? el('span','pill warn', probs[0]) : el('span','pill ok', 'Active · ≤' + c.limit);
+  pill.title = probs.length ? probs.join('\n') :
+    'At most ' + c.limit + ' concurrent high-port connections per client (live value from the rule). Hooked on ' +
+    (c.hooked_ifaces || []).join(', ') + (c.v6_active ? '; v6 active' : (c.v6_supported ? '; v6 NOT active' : '')) + '.';
+  wrap.append(pill);
+  const d = ncDropsInfo(c);
+  if(d){
+    const line = el('span','sub', d.text);
+    line.style.fontSize = '11px'; line.style.whiteSpace = 'nowrap';
+    line.title = d.title;
+    wrap.append(line);
+  }
+  return wrap;
+}
+
+let ncTargets = [];
+
+function openConcurrency(){
+  const sel = selectedNodes().filter(n => n.status && n.status.reachable);
+  if(sel.length === 0) return;
+  ncTargets = sel.map(n => n.uid);
+  const exits = sel.filter(isExitNode).length;
+  document.getElementById('nc-note').textContent = sel.length + ' node(s) selected · ' + exits +
+    ' exit gateway(s)' + (exits < sel.length ? ' (the others are skipped for install, limit and restart)' : '');
+  document.getElementById('nc-overlay').classList.add('open');
+  loadNcStatus();
+}
+function closeConcurrency(){ document.getElementById('nc-overlay').classList.remove('open'); }
+
+async function loadNcStatus(){
+  const box = document.getElementById('nc-status');
+  box.textContent = 'Checking…';
+  try{
+    const r = await api('/api/concurrency/status', {method:'POST', body: JSON.stringify({node_ids: ncTargets})});
+    renderNcStatus(r.results);
+  }catch(e){ box.textContent = e.message; }
+}
+
+function renderNcStatus(results){
+  const box = document.getElementById('nc-status'); box.innerHTML = '';
+  const limits = new Set();
+  results.forEach(r => {
+    const res = r.result || {};
+    const row = el('div','f2b-node');
+    row.append(el('span','nm', r.name));
+    if(res.ok === false && res.installed === undefined){
+      row.append(el('span','pill warn', 'error'));
+      row.append(el('span','sub', res.error || 'no answer'));
+      box.append(row); return;
+    }
+    if(!res.installed){
+      row.append(res.state === 'unmanaged' ? el('span','pill warn','Unmanaged') : el('span','pill muted','Missing'));
+      if(res.state === 'unmanaged' && res.limit != null) row.append(el('span','pill','live limit ' + res.limit));
+      box.append(row); return;
+    }
+    const probs = ncProblems(res);
+    row.append(probs.length ? el('span','pill warn','Inactive / incomplete') : el('span','pill ok','Active'));
+    if(res.limit != null){
+      row.append(el('span','pill ' + (res.limit === res.configured_limit ? 'ok' : 'warn'), 'limit ' + res.limit));
+      limits.add(res.limit);
+    }
+    probs.forEach(p => row.append(el('span','pill warn', p)));
+    const hk = el('span','sub mono', (res.hooked_ifaces || []).join(', ') || 'no hook');
+    hk.title = 'PREROUTING hooks into NYM-CONCURRENCY';
+    row.append(hk);
+    row.append(el('span','pill ' + (res.v6_active ? 'ok' : 'muted'), res.v6_supported ? (res.v6_active ? 'v6 on' : 'v6 off') : 'no v6'));
+    const d = ncDropsInfo(res);
+    if(d){ const p = el('span','pill info', d.text); p.title = d.title; row.append(p); }
+    box.append(row);
+  });
+  // prefill the change-limit field with the fleet's live value when it is uniform
+  if(limits.size === 1) document.getElementById('nc-limit').value = [...limits][0];
+}
+
+function ncLimitVal(id, required){
+  const raw = (document.getElementById(id).value || '').trim();
+  if(!raw) return required ? NaN : null;
+  const v = Number(raw);
+  return (Number.isInteger(v) && v >= 10 && v <= 10000) ? v : NaN;
+}
+
+async function ncRun(btnId, busy, idle, path, body, title){
+  const btn = document.getElementById(btnId);
+  btn.disabled = true; btn.textContent = busy;
+  try{
+    const r = await api(path, {method:'POST', body: JSON.stringify(body)});
+    showResults(title, r.results);
+    await loadNcStatus(); await load();
+  }catch(e){ toast(e.message, true); }
+  btn.disabled = false; btn.textContent = idle;
+}
+
+function ncInstall(){
+  const limit = ncLimitVal('nc-install-limit', false);
+  if(Number.isNaN(limit)) return toast('Limit must be an integer 10–10000 (or blank to keep)', true);
+  const body = {node_ids: ncTargets};
+  if(limit != null) body.limit = limit;
+  return ncRun('nc-install', 'Installing…', 'Install / update', '/api/concurrency/install', body, 'Nym concurrency · install');
+}
+function ncSetLimit(){
+  const limit = ncLimitVal('nc-limit', true);
+  if(Number.isNaN(limit)) return toast('Limit must be an integer 10–10000', true);
+  if(!confirm('Set the concurrency limit to ' + limit + ' on ' + ncTargets.length + ' node(s) and re-apply now?')) return;
+  return ncRun('nc-set-limit', 'Applying…', 'Apply limit', '/api/concurrency/limit', {node_ids: ncTargets, limit}, 'Nym concurrency · limit');
+}
+function ncRestart(){
+  return ncRun('nc-restart', 'Restarting…', 'Restart nym-concurrency', '/api/concurrency/restart', {node_ids: ncTargets}, 'Nym concurrency · restart');
+}
+function ncVerify(){
+  return ncRun('nc-verify', 'Verifying…', 'Verify', '/api/concurrency/verify', {node_ids: ncTargets}, 'Nym concurrency · verify');
+}
+function ncRemove(){
+  if(!confirm('Remove nym-concurrency (hooks, chain, unit and script) from ' + ncTargets.length + ' node(s)?')) return;
+  return ncRun('nc-remove', 'Removing…', 'Remove', '/api/concurrency/remove', {node_ids: ncTargets}, 'Nym concurrency · remove');
+}
+
 // ===== Landing page (public node overview) ================================
 // Two steps on purpose: Rebuild only rewrites the local master, Deploy is what
 // makes it public. So a failed deploy retries without regenerating, and a fresh
@@ -4242,6 +4462,23 @@ function buildResultCards(container, results){
         (res.previous_version ? ' (was ' + res.previous_version + ')' : '') +
         (res.verified ? ' · verified on disk' : '')));
       if(res.path) card.append(el('div','sub', res.path));
+    }
+    if(res.kind === 'concurrency'){
+      if(res.skipped) head.append(el('span','pill muted','skipped'));
+      const st = res.state;
+      if(st && st.installed){
+        card.append(el('div','sub', 'limit ' + (st.limit ?? '?') + ' (configured ' + (st.configured_limit ?? '?') + ')' +
+          ' · hooks: ' + ((st.hooked_ifaces || []).join(', ') || 'none') +
+          ' · v6 ' + (st.v6_supported ? (st.v6_active ? 'on' : 'off') : 'n/a') +
+          (st.drops != null ? ' · ' + st.drops.toLocaleString() + ' drops' : '')));
+      } else if(st && res.mode === 'remove'){
+        card.append(el('div','sub', st.chain_present || (st.hooked_ifaces || []).length ? 'rules still present' : 'no rules left on the node'));
+      }
+      (res.checks || []).forEach(c => {
+        const e = el('div','sub', (c.ok ? '✓ ' : '✗ ') + c.name + (c.detail ? ' — ' + c.detail : ''));
+        if(!c.ok) e.style.color = c.name.startsWith('v6') ? 'var(--warn)' : 'var(--danger)';
+        card.append(e);
+      });
     }
     if(res.verified !== undefined && !res.password_auth && res.kind !== 'landing')
       card.append(el('div','sub', res.verified ? 'key login verified' : 'key login NOT verified'));
@@ -5206,11 +5443,12 @@ document.getElementById('ssh-overlay').addEventListener('click', e => { if(e.tar
 document.getElementById('w-overlay').addEventListener('click', e => { if(e.target.id === 'w-overlay') closeWallets(); });
 document.getElementById('wm-overlay').addEventListener('click', e => { if(e.target.id === 'wm-overlay') closeWalletManage(); });
 document.getElementById('lp-overlay').addEventListener('click', e => { if(e.target.id === 'lp-overlay') closeLanding(); });
+document.getElementById('nc-overlay').addEventListener('click', e => { if(e.target.id === 'nc-overlay') closeConcurrency(); });
 document.getElementById('tg-overlay').addEventListener('click', e => { if(e.target.id === 'tg-overlay') closeTgPost(); });
 document.getElementById('du-overlay').addEventListener('click', e => { if(e.target.id === 'du-overlay') closeDistro(); });
 document.getElementById('ac-overlay').addEventListener('click', e => { if(e.target.id === 'ac-overlay') closeAbCase(); });
 document.getElementById('at-overlay').addEventListener('click', e => { if(e.target.id === 'at-overlay') closeAbTemplate(); });
-document.addEventListener('keydown', e => { if(e.key === 'Escape'){ closeModal(); closeToggle(); closeSF(); closeAU(); closeUp(); closeRes(); closeTput(); closeF2b(); closeSsh(); closeWallets(); closeWalletManage(); closeLanding(); closeTgPost(); closeDistro(); closeAbCase(); closeAbTemplate(); } });
+document.addEventListener('keydown', e => { if(e.key === 'Escape'){ closeModal(); closeToggle(); closeSF(); closeAU(); closeUp(); closeRes(); closeTput(); closeF2b(); closeSsh(); closeWallets(); closeWalletManage(); closeLanding(); closeConcurrency(); closeTgPost(); closeDistro(); closeAbCase(); closeAbTemplate(); } });
 
 health();
 load();

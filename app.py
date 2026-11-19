@@ -623,6 +623,7 @@ async def poll_all(app: FastAPI) -> dict:
             throughput_dir=res.get("throughput_dir"),
             disk=res.get("disk"),
             os_info=res.get("os"),
+            concurrency=res.get("concurrency"),
         )
     return {"polled": len(nodes), "reachable": reachable}
 
@@ -682,6 +683,7 @@ async def repoll_nodes(app: FastAPI, nodes: list):
             throughput_dir=res.get("throughput_dir"),
             disk=res.get("disk"),
             os_info=res.get("os"),
+            concurrency=res.get("concurrency"),
         )
 
 
@@ -1121,6 +1123,43 @@ class PeersRequest(BaseModel):
 
 class ExtraBlocksRequest(BaseModel):
     node_ids: list[str]
+
+
+# nym_concurrency limit bounds — mirrored agent-side (NC_LIMIT_MIN/MAX), which
+# validates again before anything is written on the node.
+NC_LIMIT_MIN, NC_LIMIT_MAX = 10, 10000
+
+
+def _nc_check_limit(v):
+    if v is None:
+        return v
+    if isinstance(v, bool) or not isinstance(v, int) or not (NC_LIMIT_MIN <= v <= NC_LIMIT_MAX):
+        raise ValueError(f"limit must be an integer {NC_LIMIT_MIN}..{NC_LIMIT_MAX}")
+    return v
+
+
+class ConcurrencyRequest(BaseModel):
+    node_ids: list[str]
+
+
+class ConcurrencyInstallRequest(BaseModel):
+    node_ids: list[str]
+    limit: int | None = None      # None = keep the node's current value (default 50 on first install)
+
+    @field_validator("limit")
+    @classmethod
+    def _check_limit(cls, v):
+        return _nc_check_limit(v)
+
+
+class ConcurrencyLimitRequest(BaseModel):
+    node_ids: list[str]
+    limit: int
+
+    @field_validator("limit")
+    @classmethod
+    def _check_limit(cls, v):
+        return _nc_check_limit(v)
 
 
 # A blocklist URL is forwarded to every targeted agent, where it is persisted and
@@ -2022,6 +2061,108 @@ async def extra_blocks_restart_service(payload: ExtraBlocksRequest, request: Req
                                 120, "extra_blocks_restart_service")
     await repoll_nodes(request.app, nodes)
     return {"results": results}
+
+
+# ------------------------------------------------------------- nym_concurrency
+# Per-client concurrent-connection cap on high ports (anti-BitTorrent). Agent
+# actions concurrency_* (agent >= 0.12.8). Exit gateways only: the rule needs
+# clearnet exit traffic, so other nodes are skipped (landing.is_exit_gateway —
+# the node's own report wins).
+
+def _nc_targets(request: Request, node_ids, exits_only=True):
+    _require_pki(request)
+    store = request.app.state.store
+    nodes = [n for n in (store.get_node(i) for i in node_ids) if n]
+    if not nodes:
+        raise HTTPException(400, "no valid target nodes")
+    if not exits_only:            # status/verify/remove: also clean up a misplaced install
+        return store, nodes, []
+    exits = [n for n in nodes if landing.is_exit_gateway(n)]
+    skipped = [{"uid": n["uid"], "node_id": n["node_id"], "name": n["name"], "ok": False,
+                "result": {"ok": False, "kind": "concurrency", "skipped": True,
+                           "error": "not an exit gateway — skipped"}}
+               for n in nodes if not landing.is_exit_gateway(n)]
+    return store, exits, skipped
+
+
+async def _nc_fanout(app_, store, nodes, action, params, timeout, label):
+    """Like _f2b_fanout, but surfaces the agent's own error (httpx drops the body)
+    and maps an old agent's 'unknown action' to an actionable message."""
+    async def one(node):
+        try:
+            res = await agent_exec(app_, node, action, params, timeout=timeout)
+            ok = bool(res.get("ok", True))
+        except Exception as e:
+            msg = str(e)
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                try:
+                    msg = ((resp.json() or {}).get("error") or "").strip() or msg
+                except Exception:
+                    pass
+            if "unknown action" in msg:
+                msg = ("this node's agent is too old for nym_concurrency (needs 0.12.8) — "
+                       "push the current agent to it first with Update agent")
+            res, ok = {"ok": False, "error": msg}, False
+        if isinstance(res, dict):
+            res.setdefault("kind", "concurrency")
+        store.audit("ui", label, None, node["uid"], json.dumps(res))
+        return {"uid": node["uid"], "node_id": node["node_id"], "name": node["name"],
+                "ok": ok, "result": res}
+    return list(await asyncio.gather(*[one(n) for n in nodes]))
+
+
+async def _nc_job(request, payload, action, params, timeout, record=True, exits_only=True):
+    store, nodes, skipped = _nc_targets(request, payload.node_ids, exits_only)
+    job_id = None
+    if record and nodes:
+        job_id = uuid.uuid4().hex
+        store.record_job(job_id, action, json.dumps({"nodes": len(nodes), **params}), len(nodes))
+    results = await _nc_fanout(request.app, store, nodes, action, params, timeout, action) if nodes else []
+    if job_id:
+        for r in results:
+            store.record_target(job_id, r["uid"], "done" if r["ok"] else "failed", None,
+                                json.dumps(r["result"]))
+        ok_count = sum(1 for r in results if r["ok"])
+        store.finish_job(job_id, "done" if ok_count == len(results)
+                         else ("failed" if ok_count == 0 else "partial"))
+    if nodes and action != "concurrency_status":
+        await repoll_nodes(request.app, nodes)   # refresh the fleet column promptly
+    return {"job_id": job_id, "results": results + skipped}
+
+
+@app.post("/api/concurrency/status")
+async def concurrency_status(payload: ConcurrencyRequest, request: Request):
+    return await _nc_job(request, payload, "concurrency_status", {}, 25, record=False,
+                         exits_only=False)
+
+
+@app.post("/api/concurrency/install")
+async def concurrency_install(payload: ConcurrencyInstallRequest, request: Request):
+    params = {"limit": payload.limit} if payload.limit is not None else {}
+    # ExecStartPre sleeps 10s, the agent's restart waits up to 90s
+    return await _nc_job(request, payload, "concurrency_install", params, 150)
+
+
+@app.post("/api/concurrency/limit")
+async def concurrency_limit(payload: ConcurrencyLimitRequest, request: Request):
+    return await _nc_job(request, payload, "concurrency_set_limit", {"limit": payload.limit}, 150)
+
+
+@app.post("/api/concurrency/restart")
+async def concurrency_restart(payload: ConcurrencyRequest, request: Request):
+    return await _nc_job(request, payload, "concurrency_restart", {}, 150, record=False)
+
+
+@app.post("/api/concurrency/verify")
+async def concurrency_verify(payload: ConcurrencyRequest, request: Request):
+    return await _nc_job(request, payload, "concurrency_verify", {}, 40, record=False,
+                         exits_only=False)
+
+
+@app.post("/api/concurrency/remove")
+async def concurrency_remove(payload: ConcurrencyRequest, request: Request):
+    return await _nc_job(request, payload, "concurrency_remove", {}, 120, exits_only=False)
 
 
 # ------------------------------------------------------------------ landing page

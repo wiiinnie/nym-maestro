@@ -46,6 +46,7 @@ SELECT n.uid AS uid, n.node_id AS node_id, n.name AS name, n.ip AS ip,
        st.agent_version AS agent_version, st.agent_sha AS agent_sha,
        st.traffic_json AS traffic_json, st.bandwidth_json AS bandwidth_json,
        st.extra_blocks_json AS extra_blocks_json,
+       st.concurrency_json AS concurrency_json,
        st.nym_node_since AS nym_node_since,
        st.uplink_device AS uplink_device,
        st.boot_since AS boot_since,
@@ -106,6 +107,7 @@ class Store:
             ("node_status", "agent_version", "TEXT"),
             ("node_status", "agent_sha", "TEXT"),
             ("node_status", "extra_blocks_json", "TEXT"),
+            ("node_status", "concurrency_json", "TEXT"),
             ("node_status", "nym_node_since", "REAL"),
             ("node_status", "uplink_device", "TEXT"),
             ("node_status", "boot_since", "REAL"),
@@ -307,7 +309,7 @@ class Store:
                       agent_version=None, agent_sha=None, extra_blocks=None,
                       nym_node_since=None, uplink_device=None, boot_since=None,
                       traffic_dir=None, throughput_dir=None, disk=None,
-                      os_info=None):
+                      os_info=None, concurrency=None):
         with self.lock:
             traffic_json = None
             if traffic is not None:
@@ -321,14 +323,15 @@ class Store:
             throughput_dir_json = json.dumps(throughput_dir) if throughput_dir is not None else None
             disk_json = json.dumps(disk) if disk is not None else None
             os_json = json.dumps(os_info) if os_info is not None else None
+            concurrency_json = json.dumps(concurrency) if concurrency is not None else None
             self.db.execute(
                 'INSERT INTO node_status (uid, reachable, version, mode, '
                 'mixnode, entry, "exit", wireguard, service_active, '
                 'fail2ban_banned, agent_version, agent_sha, traffic_bytes, '
                 'traffic_json, bandwidth_json, extra_blocks_json, '
                 'nym_node_since, uplink_device, boot_since, '
-                'traffic_dir_json, throughput_dir_json, disk_json, os_json, last_seen) '
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now')) "
+                'traffic_dir_json, throughput_dir_json, disk_json, os_json, concurrency_json, last_seen) '
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now')) "
                 'ON CONFLICT(uid) DO UPDATE SET '
                 'reachable=excluded.reachable, version=excluded.version, '
                 'mode=excluded.mode, mixnode=excluded.mixnode, '
@@ -349,13 +352,14 @@ class Store:
                 'throughput_dir_json=excluded.throughput_dir_json, '
                 'disk_json=excluded.disk_json, '
                 'os_json=excluded.os_json, '
+                'concurrency_json=excluded.concurrency_json, '
                 'last_seen=excluded.last_seen',
                 (uid, 1 if reachable else 0, version, mode,
                  _ob(mixnode), _ob(entry), _ob(exit), _ob(wireguard),
                  _ob(service_active), fail2ban_banned, agent_version, agent_sha,
                  traffic_bytes, traffic_json, throughput_json, extra_blocks_json,
                  nym_node_since, uplink_device, boot_since,
-                 traffic_dir_json, throughput_dir_json, disk_json, os_json),
+                 traffic_dir_json, throughput_dir_json, disk_json, os_json, concurrency_json),
             )
             self.db.commit()
 
@@ -903,6 +907,7 @@ def _row_to_view(r: sqlite3.Row) -> dict:
             "throughput_dir": (json.loads(r["throughput_dir_json"]) if ("throughput_dir_json" in r.keys() and r["throughput_dir_json"]) else None),
             "disk": (json.loads(r["disk_json"]) if ("disk_json" in r.keys() and r["disk_json"]) else None),
             "os": (json.loads(r["os_json"]) if ("os_json" in r.keys() and r["os_json"]) else None),
+            "concurrency": (json.loads(r["concurrency_json"]) if ("concurrency_json" in r.keys() and r["concurrency_json"]) else None),
             "last_seen": r["last_seen"],
         }
     nyx = None

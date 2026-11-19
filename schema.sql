@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS node_status (
     throughput_dir_json TEXT,            -- {dev: {rx,tx}} live rate
     disk_json        TEXT,               -- {total,used,free,percent_used} of /
     os_json          TEXT,               -- {id,version_id,codename,pretty} from /etc/os-release
+    concurrency_json TEXT,               -- nym_concurrency state: limit, hooks, drop counters (agent >= 0.12.8)
     last_seen        TEXT,
     raw_json         TEXT
 );
