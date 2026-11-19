@@ -198,7 +198,7 @@ web/index.html  dashboard (vanilla JS)
 schema.sql      applied on first run, additive migrations on restart
 requirements.txt
 run.sh          launcher (handles venv + deps)
-install-nym-extra-blocks.sh   NYM-EXIT rate-limit + abuse blocklist installer
+install-nym-extra-blocks.sh   standalone copy of the agent's extra-blocks template (manual installs only)
 ```
 
 Wallet material stays in `~/.nym_wallets` — never in the DB, never on a node.
@@ -231,6 +231,10 @@ charts stay gap-free even when the orchestrator is offline or moved to another h
 | `MAESTRO_REWARDS_DIR` | `<wallet_dir>/rewards/` | Rewards CSV output directory |
 | `MAESTRO_HISTORY_POLL` | `300` | History-sync interval in seconds (0 = disable) |
 | `MAESTRO_HISTORY_MAX_PAGES` | `8` | Max `/v1/history` pages pulled per node per sync |
+| `MAESTRO_NYX_POLL` | `900` | Nyx balance check interval in seconds (0 = disable) |
+| `MAESTRO_NYX_MIN_NYM` | `5` | Warn when a node's Nyx account holds less NYM than this |
+| `MAESTRO_NODE_API_PORT` | `8080` | nym-node public HTTP API port (Nyx address lookup) |
+| `MAESTRO_NYM_ANNOTATION_URL` | `validator.nymtech.net/api/v2/nym-nodes/annotation/` | nym-api per-node annotation base (network verdict) |
 
 **Agent-side (set on each node's `nym-maestro-agent.service` if needed):**
 
@@ -320,10 +324,28 @@ No double-counting: a 1 GB download = ~1 GB OUT, not 2 GB.
 Beyond version, roles, WG, and service state, each row shows:
 
 - **Extra blocks** — NYM-EXIT abuse blocklist status: `Active`/`Inactive`, the count
-  of your blocklist IPs actually present in the chain (not the node-wide exit policy,
-  which adds hundreds), and the live per-source rate-limit (`rate/sec · burst`), all
-  read straight from `iptables`. The 3-section modal installs/updates the blocklist
-  script, refreshes the list, or restarts the oneshot.
+  of blocklist entries present as `nym_block`-marked REJECTs (not the node-wide exit
+  policy, which adds hundreds), their hit counter, and the live per-source scan
+  rate-limit (`nym_scan_v2`, maestro's own rule — Nym's NTM ships none). Flags
+  `list outdated` when a node runs a different list than the one saved in maestro,
+  and `N unmarked` while pre-0.12.9 rules await migration. The blocklist itself is
+  edited in the modal (maestro is the source of truth, no GitHub fetch) and rolled
+  out per selection; a rollout reconciles, so removed entries leave the nodes too.
+- **NYX** — balance of the node's own Nyx account, the one that pays for ticket
+  redemptions. The address comes from the node's public HTTP API
+  (`http://<ip>:8080/api/v2/auxiliary-details`), the balance from the Nyx LCDs
+  (`MAESTRO_NYX_REST`, same list as the wallet feature). Refreshed every
+  `MAESTRO_NYX_POLL` seconds (default 15 min) and on **Refresh**. Below
+  `MAESTRO_NYX_MIN_NYM` (default 5) the cell turns red with a "below N NYM" pill and
+  the fleet summary counts it under **NYX low** — top the account up before the node
+  stops redeeming tickets. The amount links to the account on cosmoscan. If a check
+  fails the last known balance stays visible, marked *stale* (hover for the error).
+  The same cell carries the **network's own verdict** from nym-api's per-node
+  annotation (looked up by the numeric nym-node id from the bonded list): a red
+  `network: insufficient` pill when `has_sufficient_tokens` is false (the node is
+  losing config score, nym-api's bar is 1 NYM), and a `feegrant` note when another
+  account pays the node's fees (then a low own balance is not warned about). When
+  the live LCD read fails, nym-api's cached balance is shown dimmed as a fallback.
 - **24h** — throughput sparkline over the last 24 hours (click to expand).
 - **Disk** — green/red pie of the **root partition** usage (`os.statvfs("/")`, so it
   works regardless of the device name, which differs per VPS). Colour escalates:
@@ -414,7 +436,10 @@ GET    /api/onwire/avg            on-wire avg from the peers sampler
 GET    /api/throughput            sparkline/24h chart (backfilled from agent history)
 GET    /api/throughput/avg        24h average (labels real span if < 24h, e.g. Ø6h)
 POST   /api/history/sync          force an immediate history backfill from all agents
-POST   /api/extra-blocks/install-script    run the NYM-EXIT blocklist installer
+GET    /api/blocklist                      the saved blocklist (text + parsed summary + sha)
+PUT    /api/blocklist                      save it (400 + per-line errors if any line is invalid)
+POST   /api/blocklist/check                validate without saving
+POST   /api/extra-blocks/install           roll the saved list out (reconcile) to the given nodes
 POST   /api/extra-blocks/restart-service   restart the nym-extra-blocks oneshot
 GET    /favicon.ico | /favicon.svg | /apple-touch-icon.png
 ```
