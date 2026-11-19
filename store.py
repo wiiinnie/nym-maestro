@@ -52,9 +52,14 @@ SELECT n.uid AS uid, n.node_id AS node_id, n.name AS name, n.ip AS ip,
        st.traffic_dir_json AS traffic_dir_json,
        st.throughput_dir_json AS throughput_dir_json,
        st.disk_json AS disk_json,
-       st.last_seen AS last_seen
+       st.last_seen AS last_seen,
+       nx.address AS nyx_address, nx.balance_unym AS nyx_balance_unym,
+       nx.balance_at AS nyx_balance_at, nx.error AS nyx_error,
+       nx.net_json AS nyx_net_json,
+       nx.checked_at AS nyx_checked_at
 FROM nodes n
 LEFT JOIN node_status st ON st.uid = n.uid
+LEFT JOIN node_nyx nx ON nx.uid = n.uid
 """
 
 
@@ -106,6 +111,7 @@ class Store:
             ("node_status", "traffic_dir_json", "TEXT"),
             ("node_status", "throughput_dir_json", "TEXT"),
             ("node_status", "disk_json", "TEXT"),
+            ("node_nyx", "net_json", "TEXT"),
         }
         for table, col, decl in wanted:
             have = [r[1] for r in self.db.execute(f"PRAGMA table_info({table})").fetchall()]
@@ -142,6 +148,14 @@ class Store:
             " reply_text TEXT NOT NULL DEFAULT '',"
             " notes TEXT NOT NULL DEFAULT '');"
             "CREATE INDEX IF NOT EXISTS idx_abuse_complainant ON abuse_cases(complainant);"
+            # per-node Nyx account (ticket-redemption funds): address as published
+            # by the node's own HTTP API, balance from a Nyx LCD. Separate from
+            # node_status so an agent poll never clobbers it and vice versa.
+            "CREATE TABLE IF NOT EXISTS node_nyx ("
+            " uid TEXT PRIMARY KEY REFERENCES nodes(uid) ON DELETE CASCADE,"
+            " address TEXT, balance_unym INTEGER, balance_at TEXT, error TEXT,"
+            " net_json TEXT,"
+            " checked_at TEXT NOT NULL DEFAULT (datetime('now')));"
         )
         self.db.commit()
         self._ensure_history_unique_indexes()
@@ -337,6 +351,26 @@ class Store:
                  traffic_bytes, traffic_json, throughput_json, extra_blocks_json,
                  nym_node_since, uplink_device, boot_since,
                  traffic_dir_json, throughput_dir_json, disk_json),
+            )
+            self.db.commit()
+
+    def set_nyx(self, uid, address=None, balance_unym=None, error=None, net=None):
+        """Record a Nyx balance check. address/balance/net are kept from the
+        previous row when None (so a transient fetch failure leaves the last
+        known value visible, flagged by `error`); checked_at always advances.
+        `net` is the reduced nym-api annotation (see nyx.parse_annotation)."""
+        net_json = json.dumps(net) if net is not None else None
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO node_nyx (uid, address, balance_unym, balance_at, error, net_json, checked_at) "
+                "VALUES (?,?,?, CASE WHEN ? IS NULL THEN NULL ELSE datetime('now') END, ?, ?, datetime('now')) "
+                "ON CONFLICT(uid) DO UPDATE SET "
+                "address=COALESCE(excluded.address, node_nyx.address), "
+                "balance_unym=COALESCE(excluded.balance_unym, node_nyx.balance_unym), "
+                "balance_at=COALESCE(excluded.balance_at, node_nyx.balance_at), "
+                "net_json=COALESCE(excluded.net_json, node_nyx.net_json), "
+                "error=excluded.error, checked_at=excluded.checked_at",
+                (uid, address, balance_unym, balance_unym, error, net_json),
             )
             self.db.commit()
 
@@ -865,6 +899,18 @@ def _row_to_view(r: sqlite3.Row) -> dict:
             "disk": (json.loads(r["disk_json"]) if ("disk_json" in r.keys() and r["disk_json"]) else None),
             "last_seen": r["last_seen"],
         }
+    nyx = None
+    if "nyx_checked_at" in r.keys() and r["nyx_checked_at"] is not None:
+        bu = r["nyx_balance_unym"]
+        nyx = {
+            "address": r["nyx_address"],
+            "balance_unym": bu,
+            "balance_nym": (round(bu / 1_000_000, 6) if bu is not None else None),
+            "balance_at": r["nyx_balance_at"],
+            "error": r["nyx_error"],
+            "net": (json.loads(r["nyx_net_json"]) if ("nyx_net_json" in r.keys() and r["nyx_net_json"]) else None),
+            "checked_at": r["nyx_checked_at"],
+        }
     return {
         "uid": r["uid"],
         "node_id": r["node_id"],
@@ -880,4 +926,5 @@ def _row_to_view(r: sqlite3.Row) -> dict:
         "created_at": r["created_at"],
         "updated_at": r["updated_at"],
         "status": status,
+        "nyx": nyx,
     }

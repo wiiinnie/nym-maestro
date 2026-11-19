@@ -1193,10 +1193,17 @@ async function load(){
 async function refresh(){
   const btn = document.getElementById('refresh-btn');
   btn.disabled = true; btn.textContent = 'Polling…';
+  // agent poll and the Nyx balance check run side by side; the latter is slow
+  // (node API + LCD per node) and independent of the PKI, so its failure never
+  // masks the poll result
+  const nyxP = api('/api/nyx/refresh', {method:'POST'}).catch(e => ({error: e.message}));
   try{
     const r = await api('/api/refresh', {method:'POST'});
     toast('Polled ' + r.polled + ' · ' + r.reachable + ' online');
   }catch(e){ toast(e.message, true); }
+  const nx = await nyxP;
+  if(nx && nx.error) toast('NYX check: ' + nx.error, true);
+  else if(nx && nx.low > 0) toast(nx.low + ' node account(s) below ' + nx.threshold + ' NYM', true);
   btn.disabled = false; btn.textContent = 'Refresh';
   await load();
 }
@@ -2288,6 +2295,88 @@ function fmtStake(v){
   return Math.floor(v).toLocaleString() + ' NYM';
 }
 
+// NYX column: the node's Nyx account that pays for ticket redemptions. Balance
+// from a Nyx LCD, address from the node's own HTTP API (:8080). Below the
+// threshold (MAESTRO_NYX_MIN_NYM, default 5) the cell turns into a warning —
+// a node whose account runs dry stops redeeming tickets.
+const NYX_EXPLORER_ACCOUNT_URL = 'https://cosmoscan.com/nyx/account/';
+function fmtNyx(v){
+  if(v == null) return '—';
+  // 3 decimals so a value just under the threshold never rounds up onto it
+  return v.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 3}) + ' NYM';
+}
+function nyxCell(x){
+  if(!x){
+    const d = dash(); d.title = 'Nyx balance not checked yet'; return d;
+  }
+  const w = el('div');
+  w.style.display = 'flex'; w.style.flexDirection = 'column'; w.style.gap = '2px';
+  const tip = [];
+  if(x.address) tip.push('Nyx account ' + x.address);
+  if(x.balance_at && x.balance_source === 'lcd') tip.push('balance read ' + x.balance_at + ' UTC');
+  if(x.balance_source === 'nym-api') tip.push('balance from nym-api cache (live LCD read failed)');
+  const net = x.net;
+  if(net){
+    if(net.node_id != null) tip.push('nym-node id ' + net.node_id);
+    if(net.sufficient != null) tip.push('nym-api: ' + (net.sufficient ? 'sufficient tokens ✓' : 'INSUFFICIENT tokens — config score penalised'));
+    if(net.feegrant) tip.push('fee grant active — fees paid by the granter, balance not required');
+  }
+  if(x.error) tip.push('last check failed: ' + x.error);
+  const netPills = () => {
+    const out = [];
+    if(x.insufficient){
+      const p = el('span','pill bad','network: insufficient');
+      p.style.fontSize = '11px'; p.style.whiteSpace = 'nowrap';
+      p.title = 'nym-api reports has_sufficient_tokens = false (below 1 NYM): the node loses config score until topped up';
+      out.push(p);
+    }
+    if(x.feegrant){
+      const p = el('span','sub','feegrant'); p.style.fontSize = '11px';
+      p.title = 'Fee grant active — another account pays this node\'s fees, so its own balance is not required';
+      out.push(p);
+    }
+    return out;
+  };
+  if(x.shown_balance_nym == null){
+    const d = dash(); d.title = tip.join('\n') || 'no balance yet';
+    w.append(d);
+    if(x.error){
+      const e = el('span','sub','check failed'); e.style.fontSize = '11px';
+      e.style.color = 'var(--warn, #d9933a)'; e.title = x.error; w.append(e);
+    }
+    netPills().forEach(p => w.append(p));
+    return w;
+  }
+  let v;
+  if(x.address){
+    v = el('a','mono', fmtNyx(x.shown_balance_nym));
+    v.href = NYX_EXPLORER_ACCOUNT_URL + encodeURIComponent(x.address);
+    v.target = '_blank'; v.rel = 'noopener';
+    v.style.color = 'inherit'; v.style.textDecoration = 'underline dotted';
+    v.style.textUnderlineOffset = '3px';
+  } else {
+    v = el('span','mono', fmtNyx(x.shown_balance_nym));
+  }
+  v.style.whiteSpace = 'nowrap';
+  v.title = tip.join('\n');
+  if(x.low || x.insufficient) v.style.color = 'var(--danger)';
+  if(x.balance_source === 'nym-api') v.style.opacity = '0.75';
+  w.append(v);
+  netPills().forEach(p => w.append(p));
+  if(x.low){
+    const warn = el('span','pill bad','⚠ below ' + x.threshold + ' NYM');
+    warn.style.fontSize = '11px'; warn.style.whiteSpace = 'nowrap';
+    warn.title = 'Ticket-redemption account is running dry — top up ' + (x.address || 'the node account');
+    w.append(warn);
+  } else if(x.error){
+    const st = el('span','sub','stale'); st.style.fontSize = '11px';
+    st.style.color = 'var(--warn, #d9933a)';
+    st.title = 'Last check failed: ' + x.error + ' — showing the last known balance';
+    w.append(st);
+  }
+  return w;
+}
+
 function sortKeyVal(n, key){
   const s = n.status || {};
   switch(key){
@@ -2299,6 +2388,7 @@ function sortKeyVal(n, key){
     case 'bans':      return s.fail2ban_banned == null ? -1 : s.fail2ban_banned;
     case 'eblocks':   { const e = s.extra_blocks; return !e || !e.installed ? 0 : (e.active ? 2 : 1); }
     case 'stake':     { const v = n.stake; return v && v.total_stake != null ? v.total_stake : -1; }
+    case 'nyx':       { const v = n.nyx; return v && v.shown_balance_nym != null ? v.shown_balance_nym : -1; }
     case 'traffic':   { const v = trafficVal(s); return v == null ? -1 : v; }
     case 'throughput': { const v = sumDevices(s.throughput); return v == null ? -1 : v; }
     case 'disk':      { const d = s.disk; return (d && d.percent_used != null) ? d.percent_used : -1; }
@@ -2347,10 +2437,11 @@ function renderFleetSummary(){
   box.innerHTML = '';
   if(nodes.length === 0){ box.style.display = 'none'; return; }
   box.style.display = '';
-  let stake = null, traffic = null, tput = null;
+  let stake = null, traffic = null, tput = null, nyxLow = 0, nyxKnown = 0, nyxThr = null;
   nodes.forEach(n => {
     const s = n.status;
     if(n.stake && n.stake.total_stake != null) stake = (stake || 0) + n.stake.total_stake;
+    if(n.nyx && n.nyx.shown_balance_nym != null){ nyxKnown++; if(n.nyx.low || n.nyx.insufficient) nyxLow++; nyxThr = n.nyx.threshold; }
     const tv = trafficVal(s);
     if(tv != null) traffic = (traffic || 0) + tv;
     const bw = s ? sumDevices(s.throughput) : null;
@@ -2370,6 +2461,12 @@ function renderFleetSummary(){
          'Traffic counters summed over all nodes (selected interfaces)'),
     item('Total throughput', tput != null ? fmtRate(tput, bwUnit()) : '—',
          'Live throughput summed over all nodes (selected interfaces)'));
+  const nx = item('NYX low', nyxKnown ? String(nyxLow) : '—',
+    nyxKnown
+      ? nyxLow + ' of ' + nyxKnown + ' checked node accounts hold less than ' + nyxThr + ' NYM for ticket redemptions (or are flagged insufficient by nym-api)'
+      : 'Nyx balances not checked yet');
+  if(nyxLow > 0) nx.querySelector('.fs-val').style.color = 'var(--danger)';
+  box.append(nx);
 }
 
 function renderTable(){
@@ -2407,6 +2504,7 @@ function renderTable(){
   htr.append(sortHeader('Version', 'version'));
   htr.append(sortHeader('Roles', 'roles'));
   htr.append(sortHeader('Stake', 'stake'));
+  htr.append(sortHeader('NYX', 'nyx'));
   htr.append(sortHeader('WG', 'wg'));
   htr.append(sortHeader('Service', 'service'));
   htr.append(sortHeader('Jailed IPs', 'bans'));
@@ -2504,6 +2602,10 @@ function renderTable(){
       stTd.append(dash());
     }
     tr.append(stTd);
+
+    const nxTd = el('td');
+    nxTd.append(nyxCell(n.nyx));
+    tr.append(nxTd);
 
     const wgTd = el('td');
     wgTd.append(statePill(s ? s.wireguard : null, 'on', 'off'));

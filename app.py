@@ -34,6 +34,7 @@ from store import Conflict, Store
 import abuse
 import distro
 import landing
+import nyx
 import wallet
 
 # Python 3.14+ deprecated asyncio.iscoroutinefunction, but some stdlib asyncio
@@ -822,6 +823,126 @@ async def _onwire_loop(app: FastAPI, interval: int):
         await asyncio.sleep(interval)
 
 
+# --- per-node Nyx account balance (ticket-redemption funds) -------------------
+# Each nym-node publishes its Nyx address on its own HTTP API (port 8080, plain
+# http, no mTLS — this is the public node API, not the maestro agent). The balance
+# is read from the Nyx LCDs already configured for the wallet feature. Slow-moving
+# data, so it runs on its own timer, independent of the agent poll.
+_NYX_SEM = asyncio.Semaphore(6)
+_NYX_HEADERS = {"Accept": "application/json", "User-Agent": wallet.REST_UA}
+
+
+async def _nyx_fetch_address(client, node):
+    """Nyx address from the node's auxiliary-details, or (None, error)."""
+    try:
+        r = await client.get(nyx.aux_details_url(node["ip"]), headers=_NYX_HEADERS)
+        r.raise_for_status()
+        addr = nyx.parse_aux_details(r.json())
+    except Exception as e:
+        return None, f"node api: {type(e).__name__}"
+    if not addr:
+        return None, "node api: no nyx address in auxiliary-details"
+    return addr, None
+
+
+async def _nyx_fetch_balance(client, address):
+    """Balance in uNYM from the first LCD that answers, or (None, error)."""
+    last_err = "no endpoints configured"
+    for base in wallet.NYX_REST_BASES:
+        try:
+            r = await client.get(base + nyx.balance_path(address), headers=_NYX_HEADERS)
+            r.raise_for_status()
+            unym = nyx.parse_balances(r.json())
+        except httpx.HTTPStatusError as e:
+            last_err = f"HTTP {e.response.status_code} @ {wallet._host(base)}"
+            continue
+        except Exception as e:
+            last_err = f"{type(e).__name__} @ {wallet._host(base)}"
+            continue
+        if unym is None:
+            last_err = f"unexpected balance payload @ {wallet._host(base)}"
+            continue
+        return unym, None
+    return None, f"lcd: {last_err}"
+
+
+async def _nyx_fetch_annotation(client, node_id):
+    """nym-api's per-node annotation reduced to the chain-interaction bits, or
+    (None, error). This is the network's own verdict (has_sufficient_tokens
+    gates the config score) plus the feegrant flag and its cached balance."""
+    try:
+        r = await client.get(nyx.annotation_url(node_id), headers=_NYX_HEADERS)
+        r.raise_for_status()
+        net = nyx.parse_annotation(r.json())
+    except Exception as e:
+        return None, f"nym-api: {type(e).__name__}"
+    if net is None:
+        return None, "nym-api: unexpected annotation payload"
+    return net, None
+
+
+def _nym_node_id(node, stake):
+    """Numeric nym-node id from the bonded-nodes cache (by IP, else hostname)."""
+    nip = _norm_ip(node.get("ip", "")) or node.get("ip", "")
+    rec = stake.get(nip) or stake.get((node.get("hostname") or "").strip().lower()) or {}
+    nid = rec.get("nym_node_id")
+    try:
+        return int(nid) if nid is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def _nyx_check_one(client, store, node, stake):
+    async with _NYX_SEM:
+        nid = _nym_node_id(node, stake)
+        net = nerr = None
+        if nid is not None:
+            net, nerr = await _nyx_fetch_annotation(client, nid)
+        addr, err = await _nyx_fetch_address(client, node)
+        if not addr:
+            # fall back to the last known address so a node whose API is down
+            # still gets its balance checked
+            prev = (node.get("nyx") or {}).get("address")
+            if not prev:
+                store.set_nyx(node["uid"], error=err, net=net)
+                return {"uid": node["uid"], "ok": False, "error": err, "net": net}
+            addr = prev
+        unym, berr = await _nyx_fetch_balance(client, addr)
+        error = berr or err or nerr
+        store.set_nyx(node["uid"], address=addr, balance_unym=unym, error=error, net=net)
+        return {"uid": node["uid"], "ok": unym is not None,
+                "address": addr, "balance_unym": unym, "error": error, "net": net}
+
+
+async def refresh_nyx_all(app: FastAPI) -> dict:
+    store = app.state.store
+    nodes = [n for n in store.list_nodes() if n["enabled"]]
+    if not nodes:
+        return {"checked": 0, "ok": 0, "low": 0, "threshold": nyx.MIN_NYM}
+    stake = await fetch_nym_stake()   # node ids for the nym-api annotation
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+        results = await asyncio.gather(*[_nyx_check_one(client, store, n, stake) for n in nodes])
+    ok = [r for r in results if r["ok"]]
+    low = 0
+    for n in store.list_nodes():
+        a = nyx.annotate(n.get("nyx"))
+        if a and a["low"]:
+            low += 1
+    return {"checked": len(results), "ok": len(ok), "low": low,
+            "threshold": nyx.MIN_NYM}
+
+
+async def _nyx_loop(app: FastAPI, interval: int):
+    if interval <= 0:
+        return
+    while True:
+        try:
+            await refresh_nyx_all(app)
+        except Exception:
+            pass
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db = default_db()
@@ -831,13 +952,15 @@ async def lifespan(app: FastAPI):
     interval = int(os.environ.get("MAESTRO_POLL", "30"))
     onwire_interval = int(os.environ.get("MAESTRO_ONWIRE_POLL", "60"))
     history_interval = int(os.environ.get("MAESTRO_HISTORY_POLL", "300"))
+    nyx_interval = int(os.environ.get("MAESTRO_NYX_POLL", "900"))
     task = asyncio.create_task(_poll_loop(app, interval))
     onwire_task = asyncio.create_task(_onwire_loop(app, onwire_interval))
     history_task = asyncio.create_task(_history_loop(app, history_interval))
+    nyx_task = asyncio.create_task(_nyx_loop(app, nyx_interval))
     try:
         yield
     finally:
-        for t in (task, onwire_task, history_task):
+        for t in (task, onwire_task, history_task, nyx_task):
             t.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await t
@@ -1217,6 +1340,8 @@ async def list_nodes(request: Request):
         srec = stake.get(nip) or stake.get((n.get("hostname") or "").strip().lower())
         if srec:
             n["stake"] = srec
+        # Nyx account balance (ticket-redemption funds) + low-balance verdict
+        n["nyx"] = nyx.annotate(n.get("nyx"))
     return nodes
 
 
@@ -1570,6 +1695,14 @@ async def refresh(request: Request):
     if not request.app.state.pki.ready():
         raise HTTPException(400, "PKI not initialised — run: python pki.py init")
     return await poll_all(request.app)
+
+
+@app.post("/api/nyx/refresh")
+async def nyx_refresh(request: Request):
+    """Re-read every node's Nyx address (node HTTP API) and balance (Nyx LCD)
+    now. Normally runs on a timer (MAESTRO_NYX_POLL, default 15 min). Needs no
+    PKI: neither source is behind mTLS."""
+    return await refresh_nyx_all(request.app)
 
 
 @app.post("/api/history/sync")

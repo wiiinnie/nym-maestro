@@ -184,3 +184,20 @@ CREATE TABLE IF NOT EXISTS onwire_history (
 );
 
 CREATE INDEX IF NOT EXISTS idx_onwire_uid_ts ON onwire_history(uid, ts);
+
+-- ---------------------------------------------------------------------------
+-- Per-node Nyx account (ticket-redemption funds). address = as published by
+-- the node's own HTTP API (/api/v2/auxiliary-details), balance from a Nyx LCD.
+-- Kept apart from node_status so agent polls and balance checks never clobber
+-- each other. balance_at = when balance_unym was last read successfully.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS node_nyx (
+    uid          TEXT PRIMARY KEY REFERENCES nodes(uid) ON DELETE CASCADE,
+    address      TEXT,
+    balance_unym INTEGER,
+    balance_at   TEXT,
+    error        TEXT,
+    net_json     TEXT,                   -- reduced nym-api annotation (has_sufficient_tokens, feegrant, cached balance)
+    checked_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
