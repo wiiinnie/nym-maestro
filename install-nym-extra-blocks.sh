@@ -110,16 +110,17 @@ fanout_apply() {
     "$ipt" -A "$FO_CHAIN" -p tcp --syn -m conntrack --ctstate NEW -m hashlimit \
         --hashlimit-mode srcip,dstip --hashlimit-upto 1/hour --hashlimit-burst 1 \
         --hashlimit-htable-size 131072 --hashlimit-htable-max 524288 \
-        --hashlimit-htable-expire 3600000 --hashlimit-name "fo_pair$fam" -j "$FO_CHAIN_NEW"
+        --hashlimit-htable-expire 3600000 --hashlimit-name "fo_pair$fam" -j "$FO_CHAIN_NEW" || return 1
     "$ipt" -A "$FO_CHAIN" -j RETURN
     # stage 2: cap new distinct destinations per client, fast-fail with RST
     "$ipt" -A "$FO_CHAIN_NEW" -p tcp -m hashlimit --hashlimit-mode srcip \
         --hashlimit-above "$FO_RATE" --hashlimit-burst "$FO_BURST" \
         --hashlimit-htable-expire 600000 --hashlimit-name "fo_src$fam" \
-        -j REJECT --reject-with tcp-reset
+        -j REJECT --reject-with tcp-reset || return 1
     "$ipt" -A "$FO_CHAIN_NEW" -j RETURN
-    # matches only NEW SYNs, falls through otherwise -> never bypasses the exit policy
-    "$ipt" -I "$chain" -j "$FO_CHAIN"
+    # matches only NEW SYNs, falls through otherwise -> never bypasses the exit policy.
+    # Hooked last, so a failed rule above leaves no half-built limiter in NYM-EXIT.
+    "$ipt" -I "$chain" -j "$FO_CHAIN" || return 1
     echo "applied fan-out limiter (v$fam): reject above $FO_RATE new destinations, burst $FO_BURST"
 }
 
@@ -133,7 +134,7 @@ if [ "$have4" = 1 ]; then
     "$IPT" -I "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit \
         --hashlimit-mode srcip --hashlimit-above "$RL_RATE" --hashlimit-burst "$RL_BURST" \
         --hashlimit-name nym_scan_v2 -j DROP
-    fanout_apply "$IPT" "$CHAIN" 4
+    fanout_apply "$IPT" "$CHAIN" 4 || echo "fan-out limiter FAILED (v4), continuing" >&2
     "$IPT" -I "$CHAIN" -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
     echo "applied per-source rate-limit (drop above $RL_RATE burst $RL_BURST) to $CHAIN"
 else
@@ -141,7 +142,7 @@ else
 fi
 
 if [ "$have6" = 1 ]; then
-    fanout_apply "$IPT6" "$CHAIN6" 6
+    fanout_apply "$IPT6" "$CHAIN6" 6 || echo "fan-out limiter FAILED (v6), continuing" >&2
 fi
 
 if [ -f "$CACHE" ]; then

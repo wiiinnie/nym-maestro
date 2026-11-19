@@ -286,6 +286,68 @@ check("installer: fan-out applied to v4 and v6",
       'fanout_apply "$IPT" "$CHAIN" 4' in _fo and 'fanout_apply "$IPT6" "$CHAIN6" 6' in _fo)
 check("installer: fan-out has a kill switch", 'if [ "$FO_ENABLE" != 1 ]' in _fo)
 check("installer: fan-out writes no LOG rules (no client data stored)", "-j LOG" not in _fo)
+
+# 17b. Upgrade/Install rewrite the runtime script from the agent's EB_SCRIPT, so the
+#      built-in template must carry the identical limiter — else it silently vanishes
+#      on the next nym-node restart after a maestro Upgrade/Install.
+def _fo_block(src):
+    """FO_* config + the fanout_apply function (not adjacent in the installer)."""
+    a = src.index("# Fan-out limiter (netscan protection")
+    cfg = src[a:src.index("\n", src.index('FO_CHAIN_NEW="', a)) + 1]
+    f = src.index("# Apply (or with FO_ENABLE=0 remove) the fan-out limiter")
+    return cfg + src[f:src.index("\n}\n", f) + 3]
+_bi = agent.EB_SCRIPT.replace("\\\n", " ")
+check("built-in: fan-out config + fanout_apply identical to the installer",
+      _fo_block(agent.EB_SCRIPT) == _fo_block(_inst))
+check("built-in: fan-out applied to v4 and v6",
+      'fanout_apply iptables "$CHAIN" 4' in _bi and 'fanout_apply ip6tables "$CHAIN6" 6' in _bi)
+for _name, _src in (("built-in", _bi), ("installer", _fo)):
+    check(f"{_name}: a fan-out failure cannot abort the blocklist/ESTABLISHED steps",
+          all("|| echo" in l for l in _src.splitlines() if l.strip().startswith("fanout_apply ")))
+    _ia = _src.index('fanout_apply iptables' if _name == "built-in" else 'fanout_apply "$IPT"')
+    check(f"{_name}: v4 fan-out hooked before the ESTABLISHED accept is re-inserted",
+          _ia < _src.index("--ctstate RELATED,ESTABLISHED -j ACCEPT", _ia))
+
+# 17c. run fanout_apply for real against a fake iptables
+import subprocess as _sp, tempfile as _tf
+def _fo_exec(fail_on=None, enable=1, existing_jumps=0):
+    fn = _fo_block(_inst)
+    with _tf.TemporaryDirectory() as d:
+        log = os.path.join(d, "log")
+        sh = f"""set -euo pipefail
+LOG={log!r}; FAIL={fail_on or ""!r}; JUMPS={existing_jumps}
+fakeipt() {{
+    echo "$*" >> "$LOG"
+    if [ "$1" = -S ]; then i=0; while [ $i -lt $JUMPS ]; do echo "-A $2 -j NYM-FANOUT"; i=$((i+1)); done; return 0; fi
+    if [ "$1" = -D ]; then JUMPS=$((JUMPS-1)); return 0; fi
+    if [ -n "$FAIL" ] && [[ "$*" == *"$FAIL"* ]]; then return 1; fi
+    return 0
+}}
+{fn}
+FO_ENABLE={enable}
+fanout_apply fakeipt NYM-EXIT 4 || echo "fan-out limiter FAILED (v4), continuing" >&2
+echo REST-RAN
+"""
+        r = _sp.run(["bash", "-c", sh], capture_output=True, text=True, timeout=20)
+        calls = open(log).read().splitlines() if os.path.exists(log) else []
+        return r, calls
+_r, _c = _fo_exec()
+check("fanout_apply: hooks the jump after building both stages",
+      _r.returncode == 0 and _c and _c[-1] == "-I NYM-EXIT -j NYM-FANOUT"
+      and any("fo_pair4" in c for c in _c) and any("tcp-reset" in c for c in _c))
+_r, _c = _fo_exec(fail_on="tcp-reset")
+check("fanout_apply: failed stage 2 => no jump, warning, script continues",
+      "REST-RAN" in _r.stdout and "FAILED (v4)" in _r.stderr
+      and "-I NYM-EXIT -j NYM-FANOUT" not in _c)
+_r, _c = _fo_exec(existing_jumps=2)
+check("fanout_apply: re-run removes old jumps, inserts exactly one",
+      sum(c == "-D NYM-EXIT -j NYM-FANOUT" for c in _c) == 2
+      and sum(c == "-I NYM-EXIT -j NYM-FANOUT" for c in _c) == 1)
+_r, _c = _fo_exec(enable=0, existing_jumps=1)
+check("fanout_apply: kill switch unhooks + deletes chains, adds nothing",
+      "-X NYM-FANOUT" in _c and "-X NYM-FANOUT-NEWDST" in _c
+      and not any(c.startswith(("-I", "-A")) for c in _c))
+
 check("installer chain names match the agent's fan-out reader",
       f'FO_CHAIN="{agent.EB_FO_CHAIN}"' in _fo and f'FO_CHAIN_NEW="{agent.EB_FO_CHAIN_NEW}"' in _fo)
 

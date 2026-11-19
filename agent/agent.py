@@ -41,7 +41,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-AGENT_VERSION = "0.12.5"
+AGENT_VERSION = "0.12.7"
 
 try:
     with open(os.path.abspath(__file__), "rb") as _sf:
@@ -696,7 +696,23 @@ def build_status():
         "traffic_dir": read_traffic_dir(),
         "throughput_dir": read_throughput_dir(),
         "disk": read_disk(),
+        "os": read_os(),
     }
+
+
+def read_os():
+    """Current distro from /etc/os-release for the fleet table (cheap: one
+    small file read per poll). None if unreadable."""
+    try:
+        osr = parse_os_release(_read_text("/etc/os-release") or "")
+    except Exception:
+        return None
+    if not osr:
+        return None
+    return {"id": (osr.get("ID") or "").lower() or None,
+            "version_id": osr.get("VERSION_ID"),
+            "codename": (osr.get("VERSION_CODENAME") or "").lower() or None,
+            "pretty": osr.get("PRETTY_NAME")}
 
 
 # --- ExecStart flag editing (pure; unit-tested) ----------------------------
@@ -1968,6 +1984,56 @@ CHAIN6="__CHAIN6__"
 IP_RE='^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$'
 IP6_RE='^[0-9a-fA-F:]*:[0-9a-fA-F:]+(/[0-9]{1,3})?$'
 
+# Fan-out limiter (netscan protection, Hetzner 2610:3I8XTEPNAC40): caps how many
+# NEW DISTINCT destinations one tunnel client may open. Stage 1 lets only the
+# first SYN per (client, dst) pair within ~1h through to stage 2; stage 2 counts
+# those per client and RSTs above FO_RATE/FO_BURST. Repeat connections to known
+# destinations are never counted. No LOG target: nothing about clients is stored.
+# FO_ENABLE=0 + "Run installer" removes the limiter again (kill switch).
+FO_ENABLE=1
+FO_RATE="20/minute"
+FO_BURST="150"
+FO_CHAIN="NYM-FANOUT"
+FO_CHAIN_NEW="NYM-FANOUT-NEWDST"
+
+# Apply (or with FO_ENABLE=0 remove) the fan-out limiter for one family.
+# Rules live in our own sub-chains, so the per-source rate parser on NYM-EXIT and
+# nym-node's exit policy are untouched; only one jump rule sits in NYM-EXIT.
+# nym-node flushes NYM-EXIT on restart (jump gone) -> this oneshot re-adds it.
+fanout_apply() {
+    local ipt="$1" chain="$2" fam="$3" n
+    # drop every existing jump (count-based, exact spec — never line numbers)
+    n=$("$ipt" -S "$chain" 2>/dev/null | grep -Fxc -- "-A $chain -j $FO_CHAIN" || true)
+    while [ "${n:-0}" -gt 0 ]; do
+        "$ipt" -D "$chain" -j "$FO_CHAIN" 2>/dev/null || break
+        n=$("$ipt" -S "$chain" 2>/dev/null | grep -Fxc -- "-A $chain -j $FO_CHAIN" || true)
+    done
+    if [ "$FO_ENABLE" != 1 ]; then
+        "$ipt" -F "$FO_CHAIN" 2>/dev/null || true; "$ipt" -X "$FO_CHAIN" 2>/dev/null || true
+        "$ipt" -F "$FO_CHAIN_NEW" 2>/dev/null || true; "$ipt" -X "$FO_CHAIN_NEW" 2>/dev/null || true
+        echo "fan-out limiter removed (v$fam)"
+        return 0
+    fi
+    "$ipt" -N "$FO_CHAIN" 2>/dev/null || "$ipt" -F "$FO_CHAIN"
+    "$ipt" -N "$FO_CHAIN_NEW" 2>/dev/null || "$ipt" -F "$FO_CHAIN_NEW"
+    # stage 1: first SYN to a (client, destination) pair not seen within ~1h
+    "$ipt" -A "$FO_CHAIN" -p tcp --syn -m conntrack --ctstate NEW -m hashlimit \
+        --hashlimit-mode srcip,dstip --hashlimit-upto 1/hour --hashlimit-burst 1 \
+        --hashlimit-htable-size 131072 --hashlimit-htable-max 524288 \
+        --hashlimit-htable-expire 3600000 --hashlimit-name "fo_pair$fam" -j "$FO_CHAIN_NEW" || return 1
+    "$ipt" -A "$FO_CHAIN" -j RETURN
+    # stage 2: cap new distinct destinations per client, fast-fail with RST
+    "$ipt" -A "$FO_CHAIN_NEW" -p tcp -m hashlimit --hashlimit-mode srcip \
+        --hashlimit-above "$FO_RATE" --hashlimit-burst "$FO_BURST" \
+        --hashlimit-htable-expire 600000 --hashlimit-name "fo_src$fam" \
+        -j REJECT --reject-with tcp-reset || return 1
+    "$ipt" -A "$FO_CHAIN_NEW" -j RETURN
+    # matches only NEW SYNs, falls through otherwise -> never bypasses the exit policy.
+    # Hooked last, so a failed rule above leaves no half-built limiter in NYM-EXIT.
+    "$ipt" -I "$chain" -j "$FO_CHAIN" || return 1
+    echo "applied fan-out limiter (v$fam): reject above $FO_RATE new destinations, burst $FO_BURST"
+}
+
 mkdir -p "$(dirname "$CACHE")"
 
 # Fetch; only overwrite cache on a clean download, else keep last-known-good.
@@ -2015,8 +2081,13 @@ if [ "$have4" = 1 ]; then
     iptables -I "$CHAIN" -p tcp -m conntrack --ctstate NEW -m hashlimit \
         --hashlimit-mode srcip --hashlimit-above 200/sec --hashlimit-burst 1000 \
         --hashlimit-name nym_scan_v2 -j DROP
+    fanout_apply iptables "$CHAIN" 4 || echo "fan-out limiter FAILED (v4), continuing" >&2
     iptables -I "$CHAIN" -p tcp -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
     echo "applied rate-limit rules to $CHAIN"
+fi
+
+if [ "$have6" = 1 ]; then
+    fanout_apply ip6tables "$CHAIN6" 6 || echo "fan-out limiter FAILED (v6), continuing" >&2
 fi
 
 c4=0; c6=0
