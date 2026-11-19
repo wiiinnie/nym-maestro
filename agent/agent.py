@@ -41,7 +41,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-AGENT_VERSION = "0.12.7"
+AGENT_VERSION = "0.12.8"
 
 try:
     with open(os.path.abspath(__file__), "rb") as _sf:
@@ -690,6 +690,7 @@ def build_status():
         "throughput": read_throughput(),
         "nym": read_nym(),
         "extra_blocks": _extra_blocks_state(),
+        "concurrency": _nc_state(),
         "nym_node_since": nym_node_since(svc),
         "uplink_device": UPLINK_DEVICE,
         "boot_since": _proc_btime(),
@@ -2669,6 +2670,445 @@ def act_extra_blocks_restart_service(params):
     }
 
 
+# --- nym_concurrency (anti-BitTorrent) ------------------------------------
+# Per-client cap on CONCURRENT connections to high ports, enforced with connlimit
+# in our own mangle chain NYM-CONCURRENCY, hooked from PREROUTING for the tunnel
+# interfaces only. Separate from the extra-blocks unit (different table, no shared
+# rules): nym_scan / the fan-out limiter cap how FAST a client opens connections,
+# this caps how MANY it holds at once. BitTorrent (incl. encrypted MSE) holds
+# hundreds; calibration on 3 exits: legit <= 26, torrent clients 279-670.
+# A oneshot unit PartOf/WantedBy nym-node re-applies it on every nym-node start.
+
+NC_SH = "/usr/local/sbin/nym-concurrency.sh"
+NC_UNIT_NAME = "nym-concurrency.service"
+NC_UNIT = "/etc/systemd/system/" + NC_UNIT_NAME
+NC_STATE_DIR = "/var/lib/nym-concurrency"
+NC_LIMIT_FILE = NC_STATE_DIR + "/limit"
+NC_CHAIN = "NYM-CONCURRENCY"
+NC_TABLE = "mangle"
+NC_IFACES = ("nymwg", "nymtun0")      # must match IFACES in NC_SCRIPT
+NC_DEFAULT_LIMIT = 50
+NC_LIMIT_MIN = 10
+NC_LIMIT_MAX = 10000
+
+# Runtime script. Must stay word-identical to the heredoc in
+# install-nym-concurrency.sh (test_concurrency.py checks it).
+NC_SCRIPT = r"""#!/usr/bin/env bash
+# nym-maestro-managed — do not edit by hand; reinstall via maestro instead.
+# nym_concurrency: per-client cap on CONCURRENT new connections to high ports
+# (anti-BitTorrent, incl. encrypted MSE). Own chain in mangle, hooked from
+# PREROUTING for the tunnel interfaces only. Usage: nym-concurrency.sh [apply|stop]
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+
+STATE_DIR=/var/lib/nym-concurrency
+DEFAULT_LIMIT=50
+LIMIT_MIN=10
+LIMIT_MAX=10000
+PORT_LO=12000
+PORT_HI=65535
+WG_PORT=51822                 # WireGuard gateway, exempt
+STEAM_LO=27000
+STEAM_HI=27050                # Steam, exempt
+IFACES="nymwg nymtun0"        # client traffic enters the exit only here
+CHAIN=NYM-CONCURRENCY
+TABLE=mangle
+COMMENT=nym_concurrency
+
+# Limit comes from a file (set by maestro), never from the script text.
+LIMIT="$(cat "$STATE_DIR/limit" 2>/dev/null || true)"
+LIMIT="${LIMIT//[[:space:]]/}"
+if [[ "$LIMIT" =~ ^[0-9]{1,6}$ ]] && [ $((10#$LIMIT)) -ge $LIMIT_MIN ] && [ $((10#$LIMIT)) -le $LIMIT_MAX ]; then
+    LIMIT=$((10#$LIMIT))
+else
+    [ -z "$LIMIT" ] || echo "invalid limit '$LIMIT' in $STATE_DIR/limit, using $DEFAULT_LIMIT" >&2
+    LIMIT=$DEFAULT_LIMIT
+fi
+
+# Remove every PREROUTING jump to our chain (with or without -i), by exact spec —
+# never by line number (fails silently on the nf_tables backend). Loops until
+# none is left, so duplicates from earlier runs are drained.
+unhook() {
+    local ipt="$1" line n=0
+    local -a spec
+    while :; do
+        line=$("$ipt" -t "$TABLE" -S PREROUTING 2>/dev/null \
+            | grep -E -- "^-A PREROUTING( -i [A-Za-z0-9_.+-]+)? -j $CHAIN\$" | head -n1 || true)
+        [ -n "$line" ] || return 0
+        read -r -a spec <<< "${line#-A PREROUTING }"
+        "$ipt" -t "$TABLE" -D PREROUTING "${spec[@]}" || return 1
+        n=$((n+1)); [ "$n" -lt 100 ] || return 1
+    done
+}
+
+teardown() {
+    local ipt="$1"
+    unhook "$ipt" || true
+    "$ipt" -t "$TABLE" -F "$CHAIN" 2>/dev/null || true
+    "$ipt" -t "$TABLE" -X "$CHAIN" 2>/dev/null || true
+}
+
+# Build the chain, THEN hook it, so a failed rule never leaves a live half-limiter.
+nc_apply() {
+    local ipt="$1" mask="$2" fam="$3" proto ifc
+    "$ipt" -t "$TABLE" -N "$CHAIN" 2>/dev/null || "$ipt" -t "$TABLE" -F "$CHAIN" || return 1
+    # exemptions first (first match wins)
+    "$ipt" -t "$TABLE" -A "$CHAIN" -m addrtype --dst-type LOCAL -j RETURN || return 1
+    "$ipt" -t "$TABLE" -A "$CHAIN" -p udp --dport "$WG_PORT" -j RETURN || return 1
+    for proto in tcp udp; do
+        "$ipt" -t "$TABLE" -A "$CHAIN" -p "$proto" --dport "$STEAM_LO:$STEAM_HI" -j RETURN || return 1
+    done
+    # only NEW connections are checked: established flows are never touched and
+    # the per-packet path stays cheap
+    for proto in tcp udp; do
+        "$ipt" -t "$TABLE" -A "$CHAIN" -p "$proto" --dport "$PORT_LO:$PORT_HI" \
+            -m conntrack --ctstate NEW \
+            -m connlimit --connlimit-above "$LIMIT" --connlimit-mask "$mask" \
+            -m comment --comment "$COMMENT" -j DROP || return 1
+    done
+    unhook "$ipt" || return 1
+    for ifc in $IFACES; do
+        "$ipt" -t "$TABLE" -I PREROUTING -i "$ifc" -j "$CHAIN" || return 1
+    done
+    echo "applied nym_concurrency (v$fam): limit $LIMIT concurrent per client, ports $PORT_LO-$PORT_HI, ifaces $IFACES"
+}
+
+# IPv6 is best-effort: only when ip6tables and its mangle table are usable.
+IPT6=""
+if command -v ip6tables >/dev/null 2>&1 && ip6tables -t "$TABLE" -nL PREROUTING >/dev/null 2>&1; then
+    IPT6=ip6tables
+fi
+
+case "${1:-apply}" in
+    stop)
+        teardown iptables
+        if [ -n "$IPT6" ]; then teardown "$IPT6"; fi
+        echo "nym_concurrency removed"
+        exit 0 ;;
+    apply) ;;
+    *) echo "usage: $0 [apply|stop]" >&2; exit 2 ;;
+esac
+
+modprobe nf_conntrack 2>/dev/null || true
+
+if ! nc_apply iptables 32 4; then
+    teardown iptables
+    echo "nym_concurrency FAILED (v4) — rules removed, limiter NOT active" >&2
+    exit 1
+fi
+if [ -n "$IPT6" ]; then
+    if ! nc_apply "$IPT6" 128 6; then
+        teardown "$IPT6"
+        echo "nym_concurrency FAILED (v6) — v6 limiter not active, v4 unaffected" >&2
+    fi
+else
+    echo "ip6tables mangle not available; v6 limiter skipped" >&2
+fi
+"""
+
+NC_UNIT_TPL = """[Unit]
+Description=Per-client concurrent-connection limit on high ports (anti-BitTorrent, nym maestro managed)
+After=__NYM__
+PartOf=__NYM__
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 10
+ExecStart=/usr/local/sbin/nym-concurrency.sh apply
+ExecStop=/usr/local/sbin/nym-concurrency.sh stop
+RemainAfterExit=yes
+
+[Install]
+WantedBy=__NYM__
+"""
+
+_NC_HOOK_RE = re.compile(r"^-A PREROUTING(?: -i (\S+))? -j " + re.escape(NC_CHAIN) + r"$")
+# iptables -L -n -v -x line of a connlimit DROP rule, e.g.
+#   "  812  48720 DROP  6  --  *  *  0.0.0.0/0  0.0.0.0/0  tcp dpts:12000:65535
+#    ctstate NEW #conn src/32 > 50 /* nym_concurrency */"
+# prot is numeric (6/17) on iptables-nft, a name on legacy builds.
+_NC_DROP_RE = re.compile(r"^\s*(\d+)\s+\d+\s+DROP\s+(\S+)\s.*#conn\s+src/(\d+)\s*>\s*(\d+)")
+_NC_PROTO = {"6": "tcp", "17": "udp", "tcp": "tcp", "udp": "udp"}
+
+
+def nc_parse_limit(v):
+    """Validated limit (int) or None. Accepts ints and digit strings; bools rejected."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, str):
+        v = v.strip()
+        if not v.isdigit() or len(v) > 6:
+            return None
+        v = int(v)
+    if not isinstance(v, int) or not (NC_LIMIT_MIN <= v <= NC_LIMIT_MAX):
+        return None
+    return v
+
+
+def _nc_installed():
+    return os.path.exists(NC_SH) and os.path.exists(NC_UNIT)
+
+
+def _nc_is(state_cmd):
+    _, out, _ = _run(["systemctl", state_cmd, NC_UNIT_NAME])
+    return out.strip()
+
+
+def _nc_configured_limit():
+    """The limit maestro wrote (what the script will apply), default if unset."""
+    txt = _read_file(NC_LIMIT_FILE)
+    if txt is None or not txt.strip():
+        return NC_DEFAULT_LIMIT
+    return nc_parse_limit(txt)        # None = file present but invalid
+
+
+def _nc_family(ipt):
+    """Live view of one family: hooks, chain presence, limit and drop counters
+    straight from iptables (the UI shows the node's truth, not a config value)."""
+    fam = {"hooked_ifaces": [], "chain_present": False, "limit": None, "mask": None,
+           "drops": None, "drops_tcp": None, "drops_udp": None, "rules": 0}
+    rc, out, _ = _run([ipt, "-t", NC_TABLE, "-S", "PREROUTING"], timeout=10)
+    if rc == 0:
+        for line in out.splitlines():
+            m = _NC_HOOK_RE.match(line.strip())
+            if m:
+                fam["hooked_ifaces"].append(m.group(1) or "*")
+    # -x: exact counters (no K/M suffixes)
+    rc, out, _ = _run([ipt, "-t", NC_TABLE, "-L", NC_CHAIN, "-n", "-v", "-x"], timeout=10)
+    if rc != 0:
+        return fam
+    fam["chain_present"] = True
+    for line in out.splitlines():
+        m = _NC_DROP_RE.match(line)
+        if not m:
+            continue
+        pkts, proto = int(m.group(1)), _NC_PROTO.get(m.group(2).lower())
+        fam["rules"] += 1
+        fam["drops"] = (fam["drops"] or 0) + pkts
+        if proto:
+            k = "drops_" + proto
+            fam[k] = (fam[k] or 0) + pkts
+        if fam["limit"] is None:
+            fam["limit"], fam["mask"] = int(m.group(4)), int(m.group(3))
+    return fam
+
+
+def _nc_live():
+    v4 = _nc_family("iptables")
+    v6 = _nc_family("ip6tables") if _eb_v6_supported() else None
+    v6_active = bool(v6 and v6["chain_present"] and v6["rules"] and v6["hooked_ifaces"])
+
+    def _sum(k):
+        vals = [f[k] for f in (v4, v6) if f and f[k] is not None]
+        return sum(vals) if vals else None
+    return {
+        "chain_present": v4["chain_present"],
+        "hooked": bool(v4["hooked_ifaces"]) and v4["rules"] > 0,
+        "hooked_ifaces": v4["hooked_ifaces"],
+        "limit": v4["limit"] if v4["limit"] is not None else (v6 or {}).get("limit"),
+        "rules": v4["rules"],
+        "drops": _sum("drops"),
+        "drops_tcp": _sum("drops_tcp"),
+        "drops_udp": _sum("drops_udp"),
+        "v6_supported": v6 is not None,
+        "v6_active": v6_active,
+        "v6_limit": (v6 or {}).get("limit"),
+        "v6_drops": (v6 or {}).get("drops"),
+    }
+
+
+def _nc_state():
+    """State for the fleet column + modal. The drop counters reset whenever the
+    oneshot re-applies (install, limit change, nym-node restart); `since` is the
+    unit's ActiveEnterTimestamp."""
+    if not _nc_installed():
+        live = _nc_live()
+        st = {"installed": False, "enabled": False, "active": False, "state": "missing"}
+        # rules without our unit (e.g. a hand-run test install) are worth knowing
+        if live["chain_present"] or live["hooked_ifaces"]:
+            st.update(live)
+            st["state"] = "unmanaged"
+        return st
+    active = _nc_is("is-active") == "active"
+    enabled = _nc_is("is-enabled") in ("enabled", "enabled-runtime", "static", "alias")
+    st = {"installed": True, "enabled": enabled, "active": active,
+          "state": "active" if active else "inactive",
+          "configured_limit": _nc_configured_limit(),
+          "ifaces": list(NC_IFACES)}
+    st.update(_nc_live())
+    st["since"] = nym_node_since(NC_UNIT_NAME) if st["chain_present"] else None
+    return st
+
+
+def _nc_verify():
+    """Authoritative check after install/restart. Each check is (name, ok, detail)."""
+    st = _nc_state()
+    checks = []
+
+    def add(name, ok, detail=""):
+        checks.append({"name": name, "ok": bool(ok), "detail": detail})
+    add("unit installed + enabled", st.get("installed") and st.get("enabled"))
+    add("unit active", st.get("active"), _nc_is("is-active") if st.get("installed") else "")
+    add(NC_CHAIN + " chain present (v4)", st.get("chain_present"))
+    add("TCP + UDP limit rules (v4)", st.get("rules", 0) >= 2, f"{st.get('rules', 0)} rule(s)")
+    hooked = set(st.get("hooked_ifaces") or [])
+    add("hooked from PREROUTING on " + ", ".join(NC_IFACES), hooked >= set(NC_IFACES),
+        ", ".join(sorted(hooked)) or "no hook")
+    add("no unscoped PREROUTING hook", "*" not in hooked)
+    cfg = st.get("configured_limit")
+    add("live limit = configured limit", st.get("limit") is not None and st.get("limit") == cfg,
+        f"live {st.get('limit')} · configured {cfg}")
+    if st.get("v6_supported"):
+        add("v6 limiter active (best-effort)", st.get("v6_active"),
+            f"v6 limit {st.get('v6_limit')}")
+    gate = [c for c in checks if not c["name"].startswith("v6")]
+    return st, checks, all(c["ok"] for c in gate)
+
+
+def _nc_journal(n=15):
+    rc, out, _ = _run(["journalctl", "-u", NC_UNIT_NAME, "-n", str(n), "--no-pager", "-o", "cat"],
+                      timeout=10)
+    return (out or "").strip() if rc == 0 else ""
+
+
+def _nc_write_files(limit=None):
+    nym = resolve_service()
+    try:
+        os.makedirs(NC_STATE_DIR, exist_ok=True)
+        os.makedirs(os.path.dirname(NC_SH), exist_ok=True)
+        # limit file first, so a concurrently-triggered oneshot already reads it
+        if limit is not None or not os.path.exists(NC_LIMIT_FILE):
+            _write_file(NC_LIMIT_FILE, f"{limit if limit is not None else NC_DEFAULT_LIMIT}\n")
+        tmp = NC_SH + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(NC_SCRIPT)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, NC_SH)
+        with open(NC_UNIT, "w") as f:
+            f.write(NC_UNIT_TPL.replace("__NYM__", nym))
+    except Exception as e:
+        return False, f"could not write files: {e}"
+    _run(["systemctl", "daemon-reload"], timeout=20)
+    _run(["systemctl", "enable", NC_UNIT_NAME], timeout=20)
+    return True, None
+
+
+def _nc_apply_and_report(log, mode):
+    # restart, not start: on an active oneshot (RemainAfterExit) start is a no-op
+    rc, out, errx = _run(["systemctl", "restart", NC_UNIT_NAME], timeout=90)
+    log.append(f"restarted {NC_UNIT_NAME}: " + ("ok" if rc == 0 else "FAILED " + (errx or out).strip()))
+    j = _nc_journal()
+    if j:
+        log.append(j)
+    st, checks, ok = _nc_verify()
+    failed = [c["name"] for c in checks if not c["ok"] and not c["name"].startswith("v6")]
+    return {"ok": rc == 0 and ok, "kind": "concurrency", "mode": mode, "state": st,
+            "checks": checks, "output": "\n".join(log),
+            "error": None if (rc == 0 and ok) else
+                     ("checks failed: " + ", ".join(failed) if failed else "service restart failed")}
+
+
+def act_concurrency_status(params):
+    st = _nc_state()
+    st["ok"] = True
+    st["kind"] = "concurrency"
+    st["chain"] = NC_CHAIN
+    st["table"] = NC_TABLE
+    return st
+
+
+def act_concurrency_install(params):
+    """Write script + unit from the built-in template (+ optional limit) and apply.
+    Re-running it is the update path: the script is always rewritten."""
+    limit = None
+    if params.get("limit") is not None:
+        limit = nc_parse_limit(params.get("limit"))
+        if limit is None:
+            return {"ok": False, "kind": "concurrency",
+                    "error": f"limit must be an integer {NC_LIMIT_MIN}..{NC_LIMIT_MAX}"}
+    ok, err = _nc_write_files(limit)
+    if not ok:
+        return {"ok": False, "kind": "concurrency", "error": err}
+    log = [f"wrote {NC_SH} + {NC_UNIT_NAME} (enabled, PartOf {resolve_service()}), "
+           f"limit {_nc_configured_limit()}"]
+    return _nc_apply_and_report(log, "install")
+
+
+def act_concurrency_set_limit(params):
+    """Change the limit on a running install: rewrite the limit file, re-apply."""
+    limit = nc_parse_limit(params.get("limit"))
+    if limit is None:
+        return {"ok": False, "kind": "concurrency",
+                "error": f"limit must be an integer {NC_LIMIT_MIN}..{NC_LIMIT_MAX}"}
+    if not _nc_installed():
+        return {"ok": False, "kind": "concurrency", "error": "nym-concurrency is not installed"}
+    old = _nc_configured_limit()
+    try:
+        os.makedirs(NC_STATE_DIR, exist_ok=True)
+        _write_file(NC_LIMIT_FILE, f"{limit}\n")
+    except Exception as e:
+        return {"ok": False, "kind": "concurrency", "error": f"could not write limit: {e}"}
+    return _nc_apply_and_report([f"limit {old} -> {limit}"], "set_limit")
+
+
+def act_concurrency_restart(params):
+    if not _nc_installed():
+        return {"ok": False, "kind": "concurrency", "error": "nym-concurrency is not installed"}
+    return _nc_apply_and_report([], "restart")
+
+
+def act_concurrency_verify(params):
+    st, checks, ok = _nc_verify()
+    failed = [c["name"] for c in checks if not c["ok"] and not c["name"].startswith("v6")]
+    return {"ok": ok, "kind": "concurrency", "mode": "verify", "state": st, "checks": checks,
+            "error": None if ok else "checks failed: " + ", ".join(failed)}
+
+
+def _nc_teardown(ipt):
+    """Python-side removal for one family (same semantics as the script's
+    `stop`): every PREROUTING jump by exact spec, then flush + delete our chain."""
+    removed = 0
+    for _ in range(100):
+        rc, out, _ = _run([ipt, "-t", NC_TABLE, "-S", "PREROUTING"], timeout=10)
+        if rc != 0:
+            break
+        hit = next((l.strip() for l in out.splitlines() if _NC_HOOK_RE.match(l.strip())), None)
+        if not hit:
+            break
+        spec = hit.split()[2:]          # drop "-A PREROUTING"
+        if _run([ipt, "-t", NC_TABLE, "-D", "PREROUTING"] + spec, timeout=10)[0] != 0:
+            break
+        removed += 1
+    _run([ipt, "-t", NC_TABLE, "-F", NC_CHAIN], timeout=10)
+    _run([ipt, "-t", NC_TABLE, "-X", NC_CHAIN], timeout=10)
+    return removed
+
+
+def act_concurrency_remove(params):
+    """Kill switch: stop + disable the unit, remove hooks/chain (v4+v6), delete files."""
+    log = []
+    if os.path.exists(NC_SH):
+        rc, out, errx = _run([NC_SH, "stop"], timeout=30)
+        log.append("script stop: " + ("ok" if rc == 0 else "FAILED " + (errx or out).strip()))
+    _run(["systemctl", "disable", "--now", NC_UNIT_NAME], timeout=60)
+    hooks = _nc_teardown("iptables")
+    if _eb_v6_supported():
+        hooks += _nc_teardown("ip6tables")
+    for p in (NC_SH, NC_UNIT, NC_LIMIT_FILE):
+        with contextlib.suppress(Exception):
+            if os.path.exists(p):
+                os.remove(p)
+    _run(["systemctl", "daemon-reload"], timeout=20)
+    live = _nc_live()
+    gone = not live["chain_present"] and not live["hooked_ifaces"]
+    log.append(f"unit disabled + files removed; {hooks} leftover hook(s) deleted; "
+               f"{NC_CHAIN} " + ("gone" if gone else "STILL PRESENT"))
+    return {"ok": gone, "kind": "concurrency", "mode": "remove", "state": _nc_state(),
+            "output": "\n".join(log),
+            "error": None if gone else f"{NC_CHAIN} chain or hook still present after removal"}
+
+
 # ---------------------------------------------------------------- landing page
 # The node serves a public notice page at /var/www/<hostname>/index.html listing
 # every exit gateway the operator runs. Maestro renders that page centrally and
@@ -3696,6 +4136,12 @@ EXEC_ACTIONS = {
     "extra_blocks_upgrade": act_extra_blocks_upgrade,
     "extra_blocks_verify": act_extra_blocks_verify,
     "extra_blocks_remove": act_extra_blocks_remove,
+    "concurrency_status": act_concurrency_status,
+    "concurrency_install": act_concurrency_install,
+    "concurrency_set_limit": act_concurrency_set_limit,
+    "concurrency_restart": act_concurrency_restart,
+    "concurrency_verify": act_concurrency_verify,
+    "concurrency_remove": act_concurrency_remove,
     "landing_status": act_landing_status,
     "landing_deploy": act_landing_deploy,
     "landing_revert": act_landing_revert,
