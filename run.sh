@@ -19,7 +19,7 @@ fi
 # Linux: just check python3 exists
 if [[ "$(uname)" == "Linux" ]]; then
   if ! command -v python3 &>/dev/null; then
-    echo "ERROR: python3 not found. Install it with: sudo apt install python3 python3-venv" >&2
+    echo "ERROR: python3 not found. Install it with: sudo dnf install python3 (Fedora) or sudo apt install python3 python3-venv (Debian/Ubuntu)" >&2
     exit 1
   fi
 fi
