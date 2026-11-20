@@ -60,6 +60,22 @@ check("non-dict is unknown", nyx.parse_balances("oops") is None)
 check("unym_to_nym", nyx.unym_to_nym(19997588) == 19.997588)
 check("unym_to_nym None", nyx.unym_to_nym(None) is None)
 
+# --- routing score ---------------------------------------------------------------
+print("routing score")
+RS = ({"node_id": 42, "annotation": {"detailed_performance": {
+    "performance_score": 1.0, "routing_score": {"score": 0.93},
+    "config_score": {"score": 1.0}}}})
+pr = nyx.parse_annotation(RS)
+check("routing + config parsed", pr["routing"] == 0.93 and pr["config"] == 1.0)
+check("bool score is not a number", nyx.parse_annotation({"annotation": {"detailed_performance":
+      {"routing_score": {"score": True}}}})["routing"] is None)
+check("below threshold is routing_low", nyx.annotate({"net": pr}, routing_threshold=0.95)["routing_low"] is True)
+check("at threshold is fine", nyx.annotate({"net": {"routing": 0.95}}, routing_threshold=0.95)["routing_low"] is False)
+check("zero routing is low", nyx.annotate({"net": {"routing": 0.0}}, routing_threshold=0.95)["routing_low"] is True)
+check("unknown routing is no warning", nyx.annotate({"net": {"routing": None}})["routing_low"] is False
+      and nyx.annotate({"balance_nym": 9})["routing_low"] is False)
+check("default routing threshold", nyx.annotate({"net": {}})["routing_threshold"] == nyx.MIN_ROUTING)
+
 # --- nym-api annotation --------------------------------------------------------
 print("parse_annotation")
 ANN = {"node_id": 42, "annotation": {
@@ -67,16 +83,19 @@ ANN = {"node_id": 42, "annotation": {
     "chain_interaction_capabilities": {"on_chain_balance": {"denom": "unym", "amount": "21305731"},
                                        "is_feegrant_grantee": False},
     "detailed_performance": {"performance_score": 0.9798924922943115,
+                             "routing_score": {"score": 0.9798924922943115},
                              "config_score": {"score": 1.0, "chain_interaction_capabilities": {
                                  "has_sufficient_tokens": True, "is_fee_grant_grantee": False}}}}}
 check("annotation url", nyx.annotation_url(42).endswith("/nym-nodes/annotation/42"))
 check("annotation url casts", nyx.annotation_url("42").endswith("/42"))
 pa = nyx.parse_annotation(ANN)
 check("real payload", pa == {"node_id": 42, "balance_unym": 21305731, "sufficient": True, "feegrant": False,
-                              "role": "entryGateway", "performance": 0.9798924922943115})
+                              "role": "entryGateway", "performance": 0.9798924922943115,
+                              "routing": 0.9798924922943115, "config": 1.0})
 check("non-annotation is None", nyx.parse_annotation({"node_id": 42}) is None and nyx.parse_annotation("x") is None)
 check("empty annotation → all None", nyx.parse_annotation({"annotation": {}}) ==
-      {"node_id": None, "balance_unym": None, "sufficient": None, "feegrant": None, "role": None, "performance": None})
+      {"node_id": None, "balance_unym": None, "sufficient": None, "feegrant": None, "role": None, "performance": None,
+       "routing": None, "config": None})
 import copy
 bad = copy.deepcopy(ANN); bad["annotation"]["chain_interaction_capabilities"]["on_chain_balance"]["amount"] = "x"
 check("bad amount → balance None, flags kept", nyx.parse_annotation(bad)["balance_unym"] is None

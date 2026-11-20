@@ -25,6 +25,8 @@ MIN_NYM = float(os.environ.get("MAESTRO_NYX_MIN_NYM", "5"))
 ANNOTATION_URL = os.environ.get(
     "MAESTRO_NYM_ANNOTATION_URL",
     "https://validator.nymtech.net/api/v2/nym-nodes/annotation/")
+# warn when nym-api's routing score (0..1) drops below this
+MIN_ROUTING = float(os.environ.get("MAESTRO_MIN_ROUTING_SCORE", "0.95"))
 
 
 def aux_details_url(ip: str, port: int = None) -> str:
@@ -76,8 +78,8 @@ def annotation_url(node_id) -> str:
 def parse_annotation(data) -> dict | None:
     """Reduce a nym-api annotation payload to what the fleet table needs.
 
-    Returns {node_id, balance_unym, sufficient, feegrant, role, performance}
-    (each None when absent) or None if the payload is not an annotation.
+    Returns {node_id, balance_unym, sufficient, feegrant, role, performance,
+    routing, config} (each None when absent) or None if the payload is not an annotation.
     """
     if not isinstance(data, dict) or not isinstance(data.get("annotation"), dict):
         return None
@@ -97,6 +99,10 @@ def parse_annotation(data) -> dict | None:
     if fee is None:
         fee = cic.get("is_feegrant_grantee")
     score = perf.get("performance_score")
+
+    def _sub(key):
+        v = (perf.get(key) or {}).get("score")
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
     return {
         "node_id": data.get("node_id"),
         "balance_unym": bal,
@@ -104,6 +110,8 @@ def parse_annotation(data) -> dict | None:
         "feegrant": (bool(fee) if fee is not None else None),
         "role": ann.get("current_role"),
         "performance": (float(score) if isinstance(score, (int, float)) else None),
+        "routing": _sub("routing_score"),
+        "config": _sub("config_score"),
     }
 
 
@@ -113,7 +121,8 @@ def unym_to_nym(unym) -> float | None:
     return round(int(unym) / UNYM, 6)
 
 
-def annotate(rec: dict | None, threshold: float = None) -> dict | None:
+def annotate(rec: dict | None, threshold: float = None,
+             routing_threshold: float = None) -> dict | None:
     """Attach the warning verdict to a stored nyx record for the API/UI.
 
     `low` is True only when a balance is known and below the threshold; an
@@ -123,10 +132,13 @@ def annotate(rec: dict | None, threshold: float = None) -> dict | None:
     with a fee grant never counts as low: someone else pays its fees.
     `insufficient` is the network's own verdict (has_sufficient_tokens false),
     which costs the node config score regardless of our threshold.
+    `routing_low` is True only when nym-api reported a routing score and it is
+    below `routing_threshold` (MIN_ROUTING); an unknown score is no warning.
     """
     if not rec:
         return None
     threshold = MIN_NYM if threshold is None else float(threshold)
+    rthr = MIN_ROUTING if routing_threshold is None else float(routing_threshold)
     out = dict(rec)
     net = out.get("net") or None
     bal = out.get("balance_nym")
@@ -141,4 +153,8 @@ def annotate(rec: dict | None, threshold: float = None) -> dict | None:
     out["feegrant"] = feegrant
     out["insufficient"] = bool(net and net.get("sufficient") is False)
     out["low"] = (bal is not None) and (bal < threshold) and not feegrant
+    routing = net.get("routing") if net else None
+    out["routing"] = routing
+    out["routing_threshold"] = rthr
+    out["routing_low"] = routing is not None and routing < rthr
     return out

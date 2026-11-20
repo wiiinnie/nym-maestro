@@ -2505,6 +2505,23 @@ function sortHeader(label, key){
   return th;
 }
 
+// Routing score from nym-api's per-node annotation (fetched with the NYX check).
+// Below MAESTRO_MIN_ROUTING_SCORE (default 0.95) the node gets a red pill: it is
+// failing the network's routing probes and loses rewards / gets picked less.
+function fmtPct(v){ return (Math.floor(v * 1000) / 10).toFixed(1) + '%'; }   // floor: 94.99 never shows as 95.0
+function routingPill(x){
+  if(!x || !x.routing_low) return null;
+  const p = el('span', 'pill bad', 'routing ' + fmtPct(x.routing));
+  p.style.whiteSpace = 'nowrap';
+  const net = x.net || {};
+  const tip = ['nym-api routing score ' + fmtPct(x.routing) + ' — below ' + fmtPct(x.routing_threshold)];
+  if(net.performance != null) tip.push('performance score ' + fmtPct(net.performance));
+  if(net.config != null) tip.push('config score ' + fmtPct(net.config));
+  if(x.checked_at) tip.push('checked ' + x.checked_at + ' UTC');
+  p.title = tip.join('\n');
+  return p;
+}
+
 // fleet-wide totals above the table — ALWAYS over all nodes, never the selection
 function renderFleetSummary(){
   const box = document.getElementById('fleet-summary');
@@ -2513,9 +2530,11 @@ function renderFleetSummary(){
   if(nodes.length === 0){ box.style.display = 'none'; return; }
   box.style.display = '';
   let stake = null, traffic = null, tput = null, nyxLow = 0, nyxKnown = 0, nyxThr = null;
+  let rtLow = 0, rtKnown = 0, rtThr = null;
   nodes.forEach(n => {
     const s = n.status;
     if(n.stake && n.stake.total_stake != null) stake = (stake || 0) + n.stake.total_stake;
+    if(n.nyx && n.nyx.routing != null){ rtKnown++; if(n.nyx.routing_low) rtLow++; rtThr = n.nyx.routing_threshold; }
     if(n.nyx && n.nyx.shown_balance_nym != null){ nyxKnown++; if(n.nyx.low || n.nyx.insufficient) nyxLow++; nyxThr = n.nyx.threshold; }
     const tv = trafficVal(s);
     if(tv != null) traffic = (traffic || 0) + tv;
@@ -2542,6 +2561,12 @@ function renderFleetSummary(){
       : 'Nyx balances not checked yet');
   if(nyxLow > 0) nx.querySelector('.fs-val').style.color = 'var(--danger)';
   box.append(nx);
+  const rt = item('Routing low', rtKnown ? String(rtLow) : '—',
+    rtKnown
+      ? rtLow + ' of ' + rtKnown + ' nodes have a nym-api routing score below ' + fmtPct(rtThr)
+      : 'Routing scores not checked yet');
+  if(rtLow > 0) rt.querySelector('.fs-val').style.color = 'var(--danger)';
+  box.append(rt);
 }
 
 function renderTable(){
@@ -2632,6 +2657,8 @@ function renderTable(){
         (s.local_agent_version || '?') + '). Select this node and click Update agent.';
       nrow.append(sp);
     }
+    const rp = routingPill(n.nyx);
+    if(rp) nrow.append(rp);
     nameWrap.append(nrow);
     const sub = [n.ip, n.hostname].filter(Boolean).join(' · ');
     nameWrap.append(el('div','sub', sub || n.node_id));

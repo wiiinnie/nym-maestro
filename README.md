@@ -233,6 +233,7 @@ charts stay gap-free even when the orchestrator is offline or moved to another h
 | `MAESTRO_HISTORY_MAX_PAGES` | `8` | Max `/v1/history` pages pulled per node per sync |
 | `MAESTRO_NYX_POLL` | `900` | Nyx balance check interval in seconds (0 = disable) |
 | `MAESTRO_NYX_MIN_NYM` | `5` | Warn when a node's Nyx account holds less NYM than this |
+| `MAESTRO_MIN_ROUTING_SCORE` | `0.95` | Red "routing N%" warning on a node whose nym-api routing score is below this (0..1) |
 | `MAESTRO_NODE_API_PORT` | `8080` | nym-node public HTTP API port (Nyx address lookup) |
 | `MAESTRO_NYM_ANNOTATION_URL` | `validator.nymtech.net/api/v2/nym-nodes/annotation/` | nym-api per-node annotation base (network verdict) |
 
@@ -331,6 +332,11 @@ Beyond version, roles, WG, and service state, each row shows:
   and `N unmarked` while pre-0.12.9 rules await migration. The blocklist itself is
   edited in the modal (maestro is the source of truth, no GitHub fetch) and rolled
   out per selection; a rollout reconciles, so removed entries leave the nodes too.
+- **Routing score** — nym-api's `routing_score` from the per-node annotation (fetched
+  together with the NYX check, so same interval and **Refresh**). Below
+  `MAESTRO_MIN_ROUTING_SCORE` (default 0.95) the node's name gets a red `routing N%`
+  pill (performance/config score in the tooltip) and the fleet summary counts it
+  under **Routing low**. An unknown score is no warning.
 - **NYX** — balance of the node's own Nyx account, the one that pays for ticket
   redemptions. The address comes from the node's public HTTP API
   (`http://<ip>:8080/api/v2/auxiliary-details`), the balance from the Nyx LCDs
